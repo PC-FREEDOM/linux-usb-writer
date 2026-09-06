@@ -1,6 +1,11 @@
 #[derive(Debug)]
 pub struct DeviceSnapshot {
     pub device: String,
+    pub block_path: String,
+    pub drive_path: String,
+    pub major: u32,
+    pub minor: u32,
+    pub diskseq: Option<u64>,
     pub size: u64,
     pub read_only: bool,
     pub media_available: bool,

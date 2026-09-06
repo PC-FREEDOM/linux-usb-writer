@@ -16,6 +16,30 @@ fn bytes_to_string(bytes: &[u8]) -> String {
         .to_string()
 }
 
+// Decodes a Linux dev_t (as reported by UDisks2's Block.DeviceNumber) into
+// (major, minor) using the same encoding as glibc's gnu_dev_major/gnu_dev_minor.
+fn decode_device_number(device_number: u64) -> (u32, u32) {
+    let major = (((device_number >> 8) & 0xfff) as u32)
+        | ((device_number >> 32) as u32 & !0xfff);
+
+    let minor = ((device_number & 0xff) as u32)
+        | ((device_number >> 12) as u32 & !0xff);
+
+    (major, minor)
+}
+
+// Reads the kernel's block device generation counter from sysfs
+// (/sys/block/<name>/diskseq). Works for any whole-disk device node
+// (sdX, nvme0n1, mmcblk0, ...) since the sysfs name is just the device
+// node's basename. Returns None if unavailable rather than guessing a
+// sentinel value, since 0 is not a reserved "unknown" diskseq.
+fn read_diskseq(device_node: &str) -> Option<u64> {
+    let device_name = device_node.strip_prefix("/dev/")?;
+    let path = format!("/sys/block/{device_name}/diskseq");
+
+    fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 fn get_partition_paths(
     connection: &Connection,
     disk_path: &OwnedObjectPath,
@@ -246,6 +270,9 @@ pub fn collect_device_snapshots() -> zbus::Result<Vec<DeviceSnapshot>> {
         let read_only: bool = block.get_property("ReadOnly")?;
         let drive_path: OwnedObjectPath =
             block.get_property("Drive")?;
+        let device_number: u64 =
+            block.get_property("DeviceNumber")?;
+        let (major, minor) = decode_device_number(device_number);
 
         let hint_system: bool =
             block.get_property("HintSystem")?;
@@ -255,6 +282,7 @@ pub fn collect_device_snapshots() -> zbus::Result<Vec<DeviceSnapshot>> {
             block.get_property("HintPartitionable")?;
 
         let device_name = bytes_to_string(&device);
+        let diskseq = read_diskseq(&device_name);
 
         let partition = Proxy::new(
             &connection,
@@ -314,6 +342,11 @@ pub fn collect_device_snapshots() -> zbus::Result<Vec<DeviceSnapshot>> {
 
         snapshots.push(DeviceSnapshot {
             device: device_name,
+            block_path: device_path.as_str().to_string(),
+            drive_path: drive_path.as_str().to_string(),
+            major,
+            minor,
+            diskseq,
             size,
             read_only,
             media_available,

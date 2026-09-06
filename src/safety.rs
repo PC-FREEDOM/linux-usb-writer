@@ -166,6 +166,14 @@ mod tests {
     fn base_device() -> DeviceSnapshot {
         DeviceSnapshot {
             device: "/dev/sdx".to_string(),
+            block_path: "/org/freedesktop/UDisks2/block_devices/sdx"
+                .to_string(),
+            drive_path:
+                "/org/freedesktop/UDisks2/drives/Test_Model_TEST-SERIAL-0001"
+                    .to_string(),
+            major: 8,
+            minor: 0,
+            diskseq: Some(12),
             size: 8_000_000_000,
             read_only: false,
             media_available: true,

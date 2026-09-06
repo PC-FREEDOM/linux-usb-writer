@@ -1,0 +1,20 @@
+#[derive(Debug)]
+pub struct DeviceSnapshot {
+    pub device: String,
+    pub size: u64,
+    pub read_only: bool,
+    pub media_available: bool,
+    pub model: String,
+    pub vendor: String,
+    pub serial: String,
+    pub connection_bus: String,
+    pub removable: bool,
+    pub hint_system: bool,
+    pub hint_ignore: bool,
+    pub hint_partitionable: bool,
+    pub mount_points: Vec<String>,
+    pub active_swap: bool,
+    pub swap_devices: Vec<String>,
+    pub complex_storage: bool,
+    pub complex_storage_details: Vec<String>,
+}

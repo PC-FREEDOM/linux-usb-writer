@@ -5,6 +5,7 @@ mod linux_access;
 mod linux_backend;
 mod linux_monitor;
 mod safety;
+mod writer;
 
 use device::SnapshotFetchOutcome;
 use identity::{compare_identity, compare_instance};
@@ -33,6 +34,7 @@ fn main() -> zbus::Result<()> {
 
             return run_open_test(target);
         }
+        Some("writer-test") => return run_writer_test(),
         _ => {}
     }
 
@@ -335,6 +337,93 @@ fn run_open_test(block_path: String) -> zbus::Result<()> {
 
     linux_access::close_without_writing(handle);
     println!("FD closed: yes");
+
+    Ok(())
+}
+
+// PoC mode: Writer self-test (`cargo run -- writer-test`). Exercises the
+// Writer Core (src/writer.rs) end to end against a throwaway *regular file*
+// only — never a block device. The target path is always chosen by this
+// function itself (under the OS temp directory, named with this process's
+// PID), never taken from a CLI argument, specifically so this mode cannot be
+// pointed at /dev/* by accident or by a caller's mistake. The temporary file
+// is removed before returning, whether the test passes or fails.
+fn run_writer_test() -> zbus::Result<()> {
+    let temp_path = std::env::temp_dir().join(format!(
+        "linux-usb-writer-selftest-{}.bin",
+        std::process::id()
+    ));
+
+    let result = run_writer_test_inner(&temp_path);
+    let cleanup_result = std::fs::remove_file(&temp_path);
+
+    match &result {
+        Ok(()) => println!("\nwriter-test: PASSED"),
+        Err(message) => println!("\nwriter-test: FAILED -- {message}"),
+    }
+
+    match cleanup_result {
+        Ok(()) => println!("Temporary file removed: {}", temp_path.display()),
+        Err(error) => println!(
+            "Temporary file cleanup failed for {}: {error}",
+            temp_path.display()
+        ),
+    }
+
+    Ok(())
+}
+
+fn run_writer_test_inner(temp_path: &std::path::Path) -> Result<(), String> {
+    const PATTERN_SIZE: usize = 4 * 1024 * 1024; // 4 MiB known pattern, regular file only.
+
+    let data: Vec<u8> = (0..PATTERN_SIZE).map(|i| (i % 256) as u8).collect();
+
+    let plan = writer::WritePlan::new(
+        data.len() as u64,
+        data.len() as u64,
+        writer::DEFAULT_CHUNK_SIZE,
+    )
+    .map_err(|error| format!("plan rejected: {error:?}"))?;
+
+    println!("writer-test: temporary target file: {}", temp_path.display());
+    println!(
+        "writer-test: image size = {} bytes, chunk size = {} bytes",
+        data.len(),
+        plan.chunk_size
+    );
+
+    let target_file = std::fs::File::create(temp_path)
+        .map_err(|error| format!("failed to create temp file: {error}"))?;
+
+    let source = std::io::Cursor::new(data.clone());
+
+    let written = writer::write(
+        &plan,
+        source,
+        target_file,
+        |progress| {
+            println!(
+                "writer-test: progress {}/{} bytes",
+                progress.bytes_written, progress.total_bytes
+            );
+        },
+        || false,
+    )
+    .map_err(|error| format!("write failed: {error:?}"))?;
+
+    println!("writer-test: wrote and flushed {written} bytes");
+
+    let written_file = std::fs::File::open(temp_path)
+        .map_err(|error| format!("failed to reopen temp file for read-back: {error}"))?;
+
+    let matches = writer::verify_equal(std::io::Cursor::new(data), written_file)
+        .map_err(|error| format!("read-back comparison failed: {error}"))?;
+
+    if !matches {
+        return Err("read-back data did not match the original pattern".to_string());
+    }
+
+    println!("writer-test: read-back verified byte-for-byte identical to the original pattern");
 
     Ok(())
 }

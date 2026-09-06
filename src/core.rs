@@ -10,6 +10,7 @@ use crate::identity::{compare_identity, compare_instance, IdentityComparison, In
 use crate::linux_access::FdMetadata;
 use crate::linux_monitor::DeviceEvent;
 use crate::safety::{assess_device, RiskLevel, SafetyAssessment};
+use crate::writer::{WriteError as WriterError, WritePlan, DEFAULT_CHUNK_SIZE};
 
 #[derive(Debug)]
 pub enum InvalidationReason {
@@ -131,6 +132,43 @@ pub fn apply_event(state: SelectionState, event: &DeviceEvent) -> SelectionState
     }
 }
 
+// Shared by `revalidate()` (continuous Selection Continuity monitoring) and
+// the write gate (`prepare_for_open`, a point-in-time pre-open check): given
+// a baseline and a freshly re-fetched current snapshot, confirms Identity is
+// still the same physical drive, Instance is still the same block-device
+// generation, and the Safety Engine still allows writing to it. Re-running
+// `assess_device` here (rather than reusing `baseline`'s old assessment)
+// matters because the verdict can change independently of Identity/Instance
+// — e.g. the target got mounted, or an active swap appeared.
+fn check_identity_instance_safety(
+    baseline: &DeviceSnapshot,
+    current: &DeviceSnapshot,
+) -> Result<(), InvalidationReason> {
+    match compare_identity(baseline, current) {
+        IdentityComparison::Changed => return Err(InvalidationReason::IdentityChanged),
+        IdentityComparison::InsufficientIdentity => {
+            return Err(InvalidationReason::IdentityInsufficient);
+        }
+        IdentityComparison::Same => {}
+    }
+
+    match compare_instance(baseline, current) {
+        InstanceComparison::Recreated => return Err(InvalidationReason::InstanceRecreated),
+        InstanceComparison::InsufficientInformation => {
+            return Err(InvalidationReason::InstanceInformationInsufficient);
+        }
+        InstanceComparison::SameInstance => {}
+    }
+
+    let assessment = assess_device(current);
+
+    if !assessment.writable || !matches!(assessment.risk_level, RiskLevel::Normal) {
+        return Err(InvalidationReason::SafetyChanged);
+    }
+
+    Ok(())
+}
+
 // Re-verifies the current Selection against a freshly re-fetched
 // DeviceSnapshot for the same target (see
 // `linux_backend::collect_device_snapshot`). Like `apply_event`, this only
@@ -163,53 +201,11 @@ pub fn revalidate(state: SelectionState, outcome: SnapshotFetchOutcome) -> Selec
         }
     };
 
-    match compare_identity(&baseline, &current) {
-        IdentityComparison::Changed => {
-            return SelectionState::Invalidated {
-                baseline,
-                baseline_assessment,
-                reason: InvalidationReason::IdentityChanged,
-            };
-        }
-        IdentityComparison::InsufficientIdentity => {
-            return SelectionState::Invalidated {
-                baseline,
-                baseline_assessment,
-                reason: InvalidationReason::IdentityInsufficient,
-            };
-        }
-        IdentityComparison::Same => {}
-    }
-
-    match compare_instance(&baseline, &current) {
-        InstanceComparison::Recreated => {
-            return SelectionState::Invalidated {
-                baseline,
-                baseline_assessment,
-                reason: InvalidationReason::InstanceRecreated,
-            };
-        }
-        InstanceComparison::InsufficientInformation => {
-            return SelectionState::Invalidated {
-                baseline,
-                baseline_assessment,
-                reason: InvalidationReason::InstanceInformationInsufficient,
-            };
-        }
-        InstanceComparison::SameInstance => {}
-    }
-
-    // Baseline was safe, but the Safety Engine's verdict can change
-    // independently of Identity/Instance (e.g. the target got mounted, or an
-    // active swap appeared) — so it must be re-run on `current`, not assumed.
-    let current_assessment = assess_device(&current);
-
-    if !current_assessment.writable || !matches!(current_assessment.risk_level, RiskLevel::Normal)
-    {
+    if let Err(reason) = check_identity_instance_safety(&baseline, &current) {
         return SelectionState::Invalidated {
             baseline,
             baseline_assessment,
-            reason: InvalidationReason::SafetyChanged,
+            reason,
         };
     }
 
@@ -255,6 +251,201 @@ pub fn check_fd_binding(current: &DeviceSnapshot, fd_metadata: Option<&FdMetadat
         Some(_) => FdBindingCheck::Match,
         None => FdBindingCheck::InsufficientInformation,
     }
+}
+
+// ---------------------------------------------------------------------
+// Write Gate / Write Preparation
+//
+// Everything below answers one question: "is it safe to hand a write-mode
+// FD to the Writer right now?" It never opens a device, never touches D-Bus,
+// and never calls `writer::write()` — it only combines results the caller
+// already obtained from the Linux Backend / `linux_access` / the user, and
+// decides whether every one of the required conditions holds. There is no
+// code path anywhere in this module that reaches `writer::write()`;
+// connecting a `PreparedWrite` to the Writer is explicitly a later step.
+// ---------------------------------------------------------------------
+
+// Binds a single "yes, write this image to this target" confirmation to the
+// exact target (by block_path), its exact size, the exact image size, and
+// the target's block-device generation (diskseq) at confirmation time. A
+// token is data only — there is no UI in this codebase yet, so (for now) the
+// only way to obtain one is to construct it directly from the snapshot the
+// user was actually looking at when they confirmed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmationToken {
+    pub target_block_path: String,
+    pub target_size: u64,
+    pub image_size: u64,
+    pub target_diskseq: Option<u64>,
+}
+
+impl ConfirmationToken {
+    pub fn new(target: &DeviceSnapshot, image_size: u64) -> Self {
+        ConfirmationToken {
+            target_block_path: target.block_path.clone(),
+            target_size: target.size,
+            image_size,
+            target_diskseq: target.diskseq,
+        }
+    }
+}
+
+// A token only ever authorizes the exact (target, size, image_size,
+// generation) it was made for. Any difference — a different target, a
+// resized/different image, or the target having been replugged (a new
+// diskseq, whether via a plain reconnect or a full reselect) since the token
+// was made — is a mismatch, not a "close enough".
+fn confirmation_matches(
+    token: &ConfirmationToken,
+    current: &DeviceSnapshot,
+    image_size: u64,
+) -> bool {
+    token.target_block_path == current.block_path
+        && token.target_size == current.size
+        && token.image_size == image_size
+        && token.target_diskseq == current.diskseq
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum WriteGateError {
+    NoSelection,
+    SelectionInvalidated,
+    SnapshotRefreshFailed,
+    IdentityChanged,
+    IdentityInsufficient,
+    InstanceRecreated,
+    InstanceInsufficient,
+    SafetyRejected,
+    InvalidImageSize,
+    ImageTooLarge,
+    ConfirmationMissing,
+    ConfirmationMismatch,
+    OpenDeviceFailed,
+    FdBindingMismatch,
+    FdBindingInsufficient,
+}
+
+// Output of the pure, pre-OpenDevice half of the gate (`prepare_for_open`):
+// everything that can be checked without any Linux I/O has passed, and the
+// caller now has the freshly re-verified snapshot plus a valid WritePlan to
+// use when actually calling OpenDevice. Holding this value proves nothing
+// about the FD yet — that is `finalize_prepared_write`'s job.
+#[derive(Debug)]
+pub struct ReadyToOpen {
+    pub current: DeviceSnapshot,
+    pub plan: WritePlan,
+}
+
+// Proof that every gate condition (A through K, plus a matching
+// confirmation) held at the moment this value was constructed. Deliberately
+// does not hold the FD itself (see module docs) and has no method that could
+// perform a write — obtaining a `PreparedWrite` is not, by itself, capable
+// of writing anything. Connecting it to `writer::write()` is a distinct,
+// later step this module does not implement.
+#[derive(Debug)]
+pub struct PreparedWrite {
+    pub target_block_path: String,
+    pub target_size: u64,
+    pub image_size: u64,
+}
+
+// The pure half of the gate: conditions A-I plus the confirmation check.
+// Takes the current `SelectionState` (by reference — this does not mutate
+// ongoing Selection Continuity monitoring) and a target-specific re-fetch
+// the caller already performed (condition B). Reuses `writer::WritePlan` for
+// F/G/H/I instead of re-implementing size validation here.
+pub fn prepare_for_open(
+    state: &SelectionState,
+    refreshed: SnapshotFetchOutcome,
+    image_size: u64,
+    confirmation: Option<&ConfirmationToken>,
+) -> Result<ReadyToOpen, WriteGateError> {
+    let (baseline, _baseline_assessment) = match state {
+        SelectionState::NoSelection => return Err(WriteGateError::NoSelection),
+        SelectionState::Invalidated { .. } => return Err(WriteGateError::SelectionInvalidated),
+        SelectionState::Selected {
+            baseline,
+            baseline_assessment,
+        } => (baseline, baseline_assessment),
+    };
+
+    // B: the target-specific snapshot re-fetch must have actually succeeded.
+    let current = match refreshed {
+        SnapshotFetchOutcome::Found(snapshot) => snapshot,
+        SnapshotFetchOutcome::NotFound | SnapshotFetchOutcome::Error(_) => {
+            return Err(WriteGateError::SnapshotRefreshFailed);
+        }
+    };
+
+    // C, D, E: Identity, Instance, and a fresh Safety re-evaluation.
+    if let Err(reason) = check_identity_instance_safety(baseline, &current) {
+        return Err(match reason {
+            InvalidationReason::IdentityChanged => WriteGateError::IdentityChanged,
+            InvalidationReason::IdentityInsufficient => WriteGateError::IdentityInsufficient,
+            InvalidationReason::InstanceRecreated => WriteGateError::InstanceRecreated,
+            InvalidationReason::InstanceInformationInsufficient => {
+                WriteGateError::InstanceInsufficient
+            }
+            InvalidationReason::SafetyChanged => WriteGateError::SafetyRejected,
+            // TargetRemoved/MediaUnavailable/SnapshotRefreshFailed are not
+            // reachable from this helper (it never sees those cases) — kept
+            // exhaustive rather than panicking on a theoretical future variant.
+            _ => WriteGateError::SafetyRejected,
+        });
+    }
+
+    // F, G, H, I: image_size > 0, target_size > 0, image_size <= target_size,
+    // and a valid chunk size — all delegated to `WritePlan::new` rather than
+    // re-implemented here.
+    let plan = match WritePlan::new(image_size, current.size, DEFAULT_CHUNK_SIZE) {
+        Ok(plan) => plan,
+        Err(WriterError::ImageTooLarge) => return Err(WriteGateError::ImageTooLarge),
+        // InvalidSize covers both image_size == 0 and target_size == 0;
+        // InvalidChunkSize/SourceRead/TargetWrite/FlushFailed/SourceTooShort/
+        // Cancelled cannot occur here since DEFAULT_CHUNK_SIZE is a fixed,
+        // non-zero constant and no copying happens in this function.
+        Err(_) => return Err(WriteGateError::InvalidImageSize),
+    };
+
+    // Confirmation: required regardless of how clean everything else is, and
+    // must match this exact target/image/generation.
+    let token = confirmation.ok_or(WriteGateError::ConfirmationMissing)?;
+
+    if !confirmation_matches(token, &current, image_size) {
+        return Err(WriteGateError::ConfirmationMismatch);
+    }
+
+    Ok(ReadyToOpen { current, plan })
+}
+
+// The second half of the gate (conditions J and K), run after the caller has
+// used `ReadyToOpen` to actually call OpenDevice (Linux I/O, outside this
+// module) and read back the FD's metadata. Consumes `ReadyToOpen` and
+// produces a `PreparedWrite` only if OpenDevice succeeded and the resulting
+// FD is bound to the exact device node just re-verified.
+pub fn finalize_prepared_write(
+    ready: ReadyToOpen,
+    open_device_succeeded: bool,
+    fd_metadata: Option<&FdMetadata>,
+) -> Result<PreparedWrite, WriteGateError> {
+    if !open_device_succeeded {
+        return Err(WriteGateError::OpenDeviceFailed);
+    }
+
+    match check_fd_binding(&ready.current, fd_metadata) {
+        FdBindingCheck::Match => {}
+        FdBindingCheck::Mismatch => return Err(WriteGateError::FdBindingMismatch),
+        FdBindingCheck::InsufficientInformation => {
+            return Err(WriteGateError::FdBindingInsufficient);
+        }
+    }
+
+    Ok(PreparedWrite {
+        target_block_path: ready.current.block_path,
+        target_size: ready.current.size,
+        image_size: ready.plan.image_size,
+    })
 }
 
 #[cfg(test)]
@@ -645,5 +836,360 @@ mod tests {
 
         assert!(matches!(result, Err(SelectionError::NotSelectable)));
         assert!(!is_ready_to_open(&SelectionState::NoSelection));
+    }
+
+    fn matching_fd_metadata(snapshot: &DeviceSnapshot) -> FdMetadata {
+        fd_metadata(snapshot.major, snapshot.minor, Some(snapshot.size))
+    }
+
+    const TEST_IMAGE_SIZE: u64 = 1_000_000;
+
+    // Gate A / Confirmation success. Every condition holds and the
+    // confirmation matches exactly -> prepare_for_open succeeds, and
+    // finalize_prepared_write with a matching FD produces a PreparedWrite.
+    #[test]
+    fn prepare_for_open_succeeds_with_matching_confirmation() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let ready = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(base_device()),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        )
+        .unwrap();
+
+        let metadata = matching_fd_metadata(&snapshot);
+        let prepared = finalize_prepared_write(ready, true, Some(&metadata)).unwrap();
+
+        assert_eq!(prepared.target_block_path, snapshot.block_path);
+        assert_eq!(prepared.target_size, snapshot.size);
+        assert_eq!(prepared.image_size, TEST_IMAGE_SIZE);
+    }
+
+    // Gate: NoSelection can never reach OpenDevice.
+    #[test]
+    fn prepare_for_open_rejects_no_selection() {
+        let result = prepare_for_open(
+            &SelectionState::NoSelection,
+            SnapshotFetchOutcome::Found(base_device()),
+            TEST_IMAGE_SIZE,
+            None,
+        );
+
+        assert!(matches!(result, Err(WriteGateError::NoSelection)));
+    }
+
+    // Gate B. confirmationなし -> ConfirmationMissing, even though every
+    // other condition is satisfied.
+    #[test]
+    fn prepare_for_open_rejects_missing_confirmation() {
+        let state = select(base_device()).unwrap();
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(base_device()),
+            TEST_IMAGE_SIZE,
+            None,
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMissing)));
+    }
+
+    // Gate C / Confirmation-mismatch A. A confirmation made for target A
+    // must not authorize a write to a different target B.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_for_different_target() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+
+        let mut other_target = base_device();
+        other_target.block_path = "/org/freedesktop/UDisks2/block_devices/sdz".to_string();
+        let token = ConfirmationToken::new(&other_target, TEST_IMAGE_SIZE);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // Gate D / Confirmation-mismatch B. A confirmation made for one image
+    // size must not authorize writing a different-sized image.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_for_different_image_size() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            TEST_IMAGE_SIZE * 5,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // Gate E. An already-Invalidated Selection can never reach OpenDevice,
+    // confirmation or not.
+    #[test]
+    fn prepare_for_open_rejects_invalidated_selection() {
+        let snapshot = base_device();
+        let block_path = snapshot.block_path.clone();
+        let state = select(snapshot.clone()).unwrap();
+        let state = apply_event(state, &interfaces_removed(&block_path));
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::SelectionInvalidated)));
+    }
+
+    // Gate: the target-specific re-fetch itself failing (or reporting the
+    // target gone) must block the gate.
+    #[test]
+    fn prepare_for_open_rejects_snapshot_refresh_failure() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Error("simulated D-Bus failure".to_string()),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::SnapshotRefreshFailed)));
+    }
+
+    // Gate F. Identity Changed on the re-fetched current -> IdentityChanged.
+    #[test]
+    fn prepare_for_open_rejects_identity_changed() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let mut current = snapshot;
+        current.serial = "OTHER-SERIAL-0002".to_string();
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(current),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::IdentityChanged)));
+    }
+
+    // Gate: Identity InsufficientIdentity -> IdentityInsufficient.
+    #[test]
+    fn prepare_for_open_rejects_identity_insufficient() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let mut current = snapshot;
+        current.serial = String::new();
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(current),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::IdentityInsufficient)));
+    }
+
+    // Gate G. Instance Recreated (diskseq changed) -> InstanceRecreated.
+    #[test]
+    fn prepare_for_open_rejects_instance_recreated() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let mut current = snapshot;
+        current.diskseq = Some(19);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(current),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::InstanceRecreated)));
+    }
+
+    // Gate: Instance InsufficientInformation -> InstanceInsufficient.
+    #[test]
+    fn prepare_for_open_rejects_instance_insufficient() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let mut current = snapshot;
+        current.diskseq = None;
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(current),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::InstanceInsufficient)));
+    }
+
+    // Gate H. Safety re-evaluation on current now Blocked -> SafetyRejected.
+    #[test]
+    fn prepare_for_open_rejects_safety_blocked() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+
+        let mut current = snapshot;
+        current.hint_system = true;
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(current),
+            TEST_IMAGE_SIZE,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::SafetyRejected)));
+    }
+
+    // Gate I. image_size > target_size -> ImageTooLarge.
+    #[test]
+    fn prepare_for_open_rejects_image_larger_than_target() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let too_large = snapshot.size + 1;
+        let token = ConfirmationToken::new(&snapshot, too_large);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            too_large,
+            Some(&token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ImageTooLarge)));
+    }
+
+    // finalize J. OpenDevice itself failing -> OpenDeviceFailed, regardless
+    // of FD metadata (there is none to check yet).
+    #[test]
+    fn finalize_prepared_write_rejects_open_device_failure() {
+        let snapshot = base_device();
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot,
+        };
+
+        let result = finalize_prepared_write(ready, false, None);
+
+        assert!(matches!(result, Err(WriteGateError::OpenDeviceFailed)));
+    }
+
+    // finalize K (Mismatch). OpenDevice succeeded but the FD's own
+    // major/minor don't match the just-verified snapshot -> FdBindingMismatch.
+    #[test]
+    fn finalize_prepared_write_rejects_fd_binding_mismatch() {
+        let snapshot = base_device();
+        let metadata = fd_metadata(snapshot.major + 1, snapshot.minor, Some(snapshot.size));
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot,
+        };
+
+        let result = finalize_prepared_write(ready, true, Some(&metadata));
+
+        assert!(matches!(result, Err(WriteGateError::FdBindingMismatch)));
+    }
+
+    // finalize K (InsufficientInformation). OpenDevice succeeded but FD
+    // metadata could not be obtained -> FdBindingInsufficient, never assumed
+    // to be a Match.
+    #[test]
+    fn finalize_prepared_write_rejects_fd_binding_insufficient_information() {
+        let snapshot = base_device();
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot,
+        };
+
+        let result = finalize_prepared_write(ready, true, None);
+
+        assert!(matches!(result, Err(WriteGateError::FdBindingInsufficient)));
+    }
+
+    // Gate L / Confirmation-mismatch C. A confirmation captured against an
+    // earlier generation (diskseq) of the target must not authorize a write
+    // once the target's current diskseq has moved on — even though Identity
+    // and Instance both still agree the *baseline* and *current* are the
+    // same generation. This is exactly the case a plain Identity/Instance
+    // re-check cannot catch on its own: it takes the confirmation's own
+    // remembered diskseq to detect it.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_with_stale_diskseq() {
+        let old_snapshot = base_device(); // diskseq = Some(12)
+        let stale_token = ConfirmationToken::new(&old_snapshot, TEST_IMAGE_SIZE);
+
+        let mut new_snapshot = base_device();
+        new_snapshot.diskseq = Some(99);
+        let state = select(new_snapshot.clone()).unwrap();
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(new_snapshot),
+            TEST_IMAGE_SIZE,
+            Some(&stale_token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // Gate M / Confirmation-mismatch D. After a Selection is Invalidated and
+    // the user explicitly re-selects (a fresh baseline, new diskseq), a
+    // confirmation obtained before that re-selection must not carry over.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_after_reselect() {
+        let original = base_device();
+        let block_path = original.block_path.clone();
+        let old_token = ConfirmationToken::new(&original, TEST_IMAGE_SIZE);
+
+        let state = select(original).unwrap();
+        let state = apply_event(state, &interfaces_removed(&block_path));
+        assert!(matches!(state, SelectionState::Invalidated { .. }));
+
+        let mut reselected_snapshot = base_device();
+        reselected_snapshot.diskseq = Some(99);
+        let state = select(reselected_snapshot.clone()).unwrap();
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(reselected_snapshot),
+            TEST_IMAGE_SIZE,
+            Some(&old_token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
     }
 }

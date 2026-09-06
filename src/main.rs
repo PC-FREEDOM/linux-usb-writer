@@ -34,6 +34,14 @@ fn main() -> zbus::Result<()> {
 
             return run_open_test(target);
         }
+        Some("prepare-test") => {
+            let Some(target) = args.next() else {
+                eprintln!("usage: cargo run -- prepare-test <udisks2-block-object-path>");
+                return Ok(());
+            };
+
+            return run_prepare_test(target);
+        }
         Some("writer-test") => return run_writer_test(),
         _ => {}
     }
@@ -337,6 +345,123 @@ fn run_open_test(block_path: String) -> zbus::Result<()> {
 
     linux_access::close_without_writing(handle);
     println!("FD closed: yes");
+
+    Ok(())
+}
+
+// The image size this PoC pretends to be about to write. Never actually read
+// or written — only used to exercise WritePlan validation and the
+// confirmation token. 4 MiB, matching writer-test's own pattern size.
+const PREPARE_TEST_IMAGE_SIZE: u64 = 4 * 1024 * 1024;
+
+// PoC mode: Write Gate (`cargo run -- prepare-test <block_path>`). Exercises
+// the full pre-write gate (Selection -> final re-verification -> WritePlan ->
+// OpenDevice -> FD binding -> confirmation -> PreparedWrite) end to end.
+// `writer::write()` is never called and is not reachable from this function
+// — establishing a `PreparedWrite` here proves the gate passed, nothing more.
+// If OpenDevice needs polkit authentication, this program does nothing but
+// wait for the reply; it never falls back to sudo or any other bypass.
+fn run_prepare_test(block_path: String) -> zbus::Result<()> {
+    let mut state = attempt_select(&block_path);
+
+    if let core::SelectionState::Selected { baseline, .. } = &state {
+        let outcome = collect_device_snapshot(&baseline.block_path);
+        state = core::revalidate(state, outcome);
+    }
+
+    print_selection_state(&state);
+
+    if !core::is_ready_to_open(&state) {
+        println!("\nprepare-test: Selection invalid -- stopping before the Write Gate.");
+        return Ok(());
+    }
+
+    let core::SelectionState::Selected { baseline, .. } = &state else {
+        unreachable!("is_ready_to_open just confirmed Selected");
+    };
+
+    // A second, independent target-specific re-fetch: one copy is used to
+    // build the confirmation token (as the — currently nonexistent — GUI
+    // would, from what it just showed the user), the other is fed to
+    // `prepare_for_open` as its own required re-verification (condition B).
+    let refreshed_for_token = collect_device_snapshot(&baseline.block_path);
+    let SnapshotFetchOutcome::Found(current_for_token) = refreshed_for_token else {
+        println!("\nprepare-test: target-specific refresh failed -- stopping before the Write Gate.");
+        return Ok(());
+    };
+
+    let confirmation = core::ConfirmationToken::new(&current_for_token, PREPARE_TEST_IMAGE_SIZE);
+    println!(
+        "\nprepare-test: confirmation created for {} (image_size={} bytes)",
+        confirmation.target_block_path, confirmation.image_size
+    );
+
+    let refreshed_for_gate = collect_device_snapshot(&baseline.block_path);
+
+    let ready = match core::prepare_for_open(
+        &state,
+        refreshed_for_gate,
+        PREPARE_TEST_IMAGE_SIZE,
+        Some(&confirmation),
+    ) {
+        Ok(ready) => ready,
+        Err(error) => {
+            println!("prepare-test: Write Gate rejected before OpenDevice: {error:?}");
+            return Ok(());
+        }
+    };
+
+    println!(
+        "prepare-test: Write Gate (pre-open) passed. WritePlan: image_size={} target_size={} chunk_size={}",
+        ready.plan.image_size, ready.plan.target_size, ready.plan.chunk_size
+    );
+
+    println!(
+        "prepare-test: requesting OpenDevice(mode=\"rw\") on {}.",
+        ready.current.block_path
+    );
+    println!(
+        "If a polkit authentication prompt appears, please complete it yourself -- \
+         this program will not use sudo or any other privilege bypass."
+    );
+
+    let open_result = linux_access::open_device(&ready.current.block_path, "rw");
+
+    let (open_succeeded, metadata) = match &open_result {
+        Ok(handle) => {
+            println!("prepare-test: OpenDevice: success");
+            (true, handle.metadata())
+        }
+        Err(error) => {
+            println!("prepare-test: OpenDevice: failed ({error:?})");
+            (false, None)
+        }
+    };
+
+    if let Some(meta) = &metadata {
+        println!(
+            "prepare-test: FD major:minor={}:{} size={:?}",
+            meta.major, meta.minor, meta.size
+        );
+    }
+
+    match core::finalize_prepared_write(ready, open_succeeded, metadata.as_ref()) {
+        Ok(prepared) => {
+            println!(
+                "prepare-test: PreparedWrite established for {} (target_size={} image_size={})",
+                prepared.target_block_path, prepared.target_size, prepared.image_size
+            );
+            println!("prepare-test: WRITE NOT PERFORMED (writer::write() is not called by this PoC)");
+        }
+        Err(error) => {
+            println!("prepare-test: Write Gate rejected after OpenDevice: {error:?}");
+        }
+    }
+
+    if let Ok(handle) = open_result {
+        linux_access::close_without_writing(handle);
+        println!("prepare-test: FD closed: yes");
+    }
 
     Ok(())
 }

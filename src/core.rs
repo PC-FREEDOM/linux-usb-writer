@@ -7,7 +7,7 @@
 
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
 use crate::identity::{compare_identity, compare_instance, IdentityComparison, InstanceComparison};
-use crate::linux_access::FdMetadata;
+use crate::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle};
 use crate::linux_monitor::DeviceEvent;
 use crate::safety::{assess_device, RiskLevel, SafetyAssessment};
 use crate::writer::{WriteError as WriterError, WritePlan, DEFAULT_CHUNK_SIZE};
@@ -262,7 +262,39 @@ pub fn check_fd_binding(current: &DeviceSnapshot, fd_metadata: Option<&FdMetadat
 // already obtained from the Linux Backend / `linux_access` / the user, and
 // decides whether every one of the required conditions holds. There is no
 // code path anywhere in this module that reaches `writer::write()`;
-// connecting a `PreparedWrite` to the Writer is explicitly a later step.
+// connecting a `PreparedWrite`/`ActiveWrite` to the Writer is explicitly a
+// later step.
+//
+// The full state progression this module implements so far (each arrow is a
+// consuming transition — the value on the left cannot be used again once the
+// value on the right has been produced):
+//
+//   SelectionState::Selected
+//       |  (prepare_for_open: Identity/Instance/Safety re-check + WritePlan)
+//       v
+//   ReadyToOpen
+//       |  (caller calls OpenDevice, outside this module; finalize_prepared_write:
+//       |   FD binding check)
+//       v
+//   PreparedWrite            -- owns the Gate-passed OpenedDeviceHandle
+//       |  (PreparedWrite::begin(self), a one-way consuming move)
+//       v
+//   ActiveWrite               -- same handle, moved (never duplicated)
+//       |  (future work, not implemented here)
+//       v
+//   WrittenTarget / Failed / Cancelled   -- NOT YET IMPLEMENTED
+//
+// This revision implements up to and including `ActiveWrite`, and adds one
+// capability on top of it: `ActiveWrite::writer_target()` can now produce a
+// genuine `std::io::Write` (`linux_access::ActiveWriteTarget`) borrowed from
+// the handle it owns. Critically, this is a type-level *capability*, not a
+// *connection* — nothing anywhere in this crate calls `writer::write()` with
+// it. `PreparedWrite` still exposes no such method at all (only `begin()`,
+// which consumes it), and `OpenedDeviceHandle` on its own (before it becomes
+// part of an `ActiveWrite`) exposes no public way to reach
+// `ActiveWriteTarget` either. Wiring `ActiveWrite`'s write capability into an
+// actual call to `writer::write()`, and the WrittenTarget/Failed/Cancelled
+// outcomes such a call would produce, remain future, separate steps.
 // ---------------------------------------------------------------------
 
 // Binds a single "yes, write this image to this target" confirmation to the
@@ -338,16 +370,22 @@ pub struct ReadyToOpen {
 }
 
 // Proof that every gate condition (A through K, plus a matching
-// confirmation) held at the moment this value was constructed. Deliberately
-// does not hold the FD itself (see module docs) and has no method that could
-// perform a write — obtaining a `PreparedWrite` is not, by itself, capable
-// of writing anything. Connecting it to `writer::write()` is a distinct,
-// later step this module does not implement.
-#[derive(Debug)]
+// confirmation) held at the moment this value was constructed. As of this
+// revision it *does* own the Gate-passed `OpenedDeviceHandle` — the whole
+// point being that "a PreparedWrite exists" and "we are holding the exact FD
+// that was just re-verified" become the same fact, instead of two values (a
+// bool/metadata here, a handle held separately by the caller) that a caller
+// could mismatch. `handle` is deliberately private: this struct still
+// exposes no method that could perform a write, since nothing in this module
+// (or anywhere else, today) can turn that private field into a `Write` for
+// an outside caller. Connecting it to `writer::write()` is a distinct, later
+// step this module does not implement.
 pub struct PreparedWrite {
     pub target_block_path: String,
     pub target_size: u64,
     pub image_size: u64,
+    #[allow(dead_code)]
+    handle: OpenedDeviceHandle,
 }
 
 // The pure half of the gate: conditions A-I plus the confirmation check.
@@ -421,17 +459,31 @@ pub fn prepare_for_open(
 
 // The second half of the gate (conditions J and K), run after the caller has
 // used `ReadyToOpen` to actually call OpenDevice (Linux I/O, outside this
-// module) and read back the FD's metadata. Consumes `ReadyToOpen` and
-// produces a `PreparedWrite` only if OpenDevice succeeded and the resulting
-// FD is bound to the exact device node just re-verified.
+// module). Consumes `ReadyToOpen` and, if OpenDevice succeeded, the resulting
+// `OpenedDeviceHandle` itself (by value) plus its already-collected metadata,
+// and produces a `PreparedWrite` — now the sole owner of that handle — only
+// if OpenDevice succeeded and the FD is bound to the exact device node just
+// re-verified.
+//
+// `opened_handle` is `None` when the caller's OpenDevice call itself failed
+// (there is no handle to hand over in that case) and `Some(handle)` when it
+// succeeded. This function never calls any method on `opened_handle` besides
+// taking ownership of it — in particular it never calls `.metadata()` itself;
+// `fd_metadata` must already have been read (by the caller, via
+// `linux_access`) from that same handle before calling this function. That
+// keeps this module free of Linux I/O: it only moves an opaque value it was
+// handed, it never performs a syscall on it.
+//
+// On any rejection (OpenDeviceFailed / FdBindingMismatch /
+// FdBindingInsufficient) `opened_handle` is simply dropped at the end of this
+// function's scope — ordinary RAII closes the underlying fd via `File`'s own
+// `Drop` impl. No explicit close call is needed here.
 pub fn finalize_prepared_write(
     ready: ReadyToOpen,
-    open_device_succeeded: bool,
+    opened_handle: Option<OpenedDeviceHandle>,
     fd_metadata: Option<&FdMetadata>,
 ) -> Result<PreparedWrite, WriteGateError> {
-    if !open_device_succeeded {
-        return Err(WriteGateError::OpenDeviceFailed);
-    }
+    let handle = opened_handle.ok_or(WriteGateError::OpenDeviceFailed)?;
 
     match check_fd_binding(&ready.current, fd_metadata) {
         FdBindingCheck::Match => {}
@@ -445,13 +497,82 @@ pub fn finalize_prepared_write(
         target_block_path: ready.current.block_path,
         target_size: ready.current.size,
         image_size: ready.plan.image_size,
+        handle,
     })
+}
+
+// A single write attempt's execution state: the result of choosing to start
+// the one write `PreparedWrite` was proof-of-readiness for. Deliberately not
+// `Clone`/`Copy` (nor is `PreparedWrite`) — the whole point of `begin()`
+// consuming `self` is that at most one `ActiveWrite` can ever exist per
+// `PreparedWrite`, and once it exists, the `PreparedWrite` it came from is
+// gone. `handle` is the exact same `OpenedDeviceHandle` `PreparedWrite` held,
+// moved here without ever being duplicated (no `dup()`/`try_clone()` — a
+// single fd travels a single, one-way path through these types).
+//
+// `ActiveWrite` is deliberately the *only* type in this crate with a method
+// that can produce a `std::io::Write` (see `writer_target()` below).
+// `PreparedWrite` has no such method, and `OpenedDeviceHandle` on its own
+// exposes no *public* way to reach one either. This struct itself still does
+// not implement `Write` — the capability lives entirely in the short-lived
+// `ActiveWriteTarget` borrow `writer_target()` hands out, never in
+// `ActiveWrite` directly. Connecting that capability to an actual call to
+// `writer::write()`, and the WrittenTarget/Failed/Cancelled outcomes a real
+// write attempt would produce, remain distinct, later steps this module does
+// not implement.
+pub struct ActiveWrite {
+    pub target_block_path: String,
+    pub target_size: u64,
+    pub image_size: u64,
+    handle: OpenedDeviceHandle,
+}
+
+impl PreparedWrite {
+    // The one and only way to reach an `ActiveWrite`. Takes `self` by value
+    // (not `&self`/`&mut self`), so calling this is the last thing that can
+    // ever be done with a given `PreparedWrite` — the Rust compiler refuses
+    // any further use of the variable that was passed in, which is exactly
+    // the "consumed exactly once" guarantee this type exists to provide.
+    pub fn begin(self) -> ActiveWrite {
+        ActiveWrite {
+            target_block_path: self.target_block_path,
+            target_size: self.target_size,
+            image_size: self.image_size,
+            handle: self.handle,
+        }
+    }
+}
+
+impl ActiveWrite {
+    // The sole source, anywhere in this crate, of a `std::io::Write` backed
+    // by a Gate-passed FD. Returns a short-lived `ActiveWriteTarget` that
+    // borrows `self` mutably: while the returned value is alive, `self`
+    // cannot be read, written, dropped, or handed to anything else (Rust's
+    // ordinary exclusive-borrow rules), and once it goes out of scope `self`
+    // is fully usable again. No FD is duplicated to produce it — this is a
+    // plain `&mut` borrow of the handle `ActiveWrite` already owns, nothing
+    // more.
+    //
+    // `pub(crate)` rather than `pub`: this stays reachable only from within
+    // this crate (irrelevant in practice, since this is a binary crate with
+    // no external consumers), and — by documented convention, not something
+    // Rust's visibility system can enforce across sibling modules — nothing
+    // in `main.rs` calls this yet. Wiring an `ActiveWriteTarget` obtained
+    // here into an actual `writer::write()` call is a distinct, later step;
+    // this method only proves the capability can be obtained, not that it is
+    // ever used to write anything.
+    #[allow(dead_code)] // exercised by this module's own tests today; not yet called from main.rs.
+    pub(crate) fn writer_target(&mut self) -> ActiveWriteTarget<'_> {
+        self.handle.writer_target()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::linux_monitor::PropertyChange;
+    use crate::writer;
+    use std::io::Write;
 
     fn base_device() -> DeviceSnapshot {
         DeviceSnapshot {
@@ -749,6 +870,54 @@ mod tests {
         }
     }
 
+    // Opens a plain, throwaway regular file under the OS temp directory --
+    // never a block device -- and wraps it via the test-only constructor, so
+    // Write Gate tests can exercise real handle-ownership transfer without
+    // any D-Bus call. `tag` plus a process-global counter keep the path
+    // unique across concurrently-running tests. The directory entry is
+    // removed immediately (the open fd stays perfectly valid on Linux after
+    // unlinking), so no leftover file survives a test, including a panicking
+    // one. Returns the path anyway, purely as a diagnostic label a test can
+    // grep for in `/proc/self/fd/<n>` while the fd is still open.
+    fn test_handle_with_temp_file(tag: &str) -> (std::path::PathBuf, OpenedDeviceHandle) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-core-test-{tag}-{}-{id}.tmp",
+            std::process::id()
+        ));
+
+        let file = std::fs::File::create(&path).expect("create temp file for core.rs test");
+        std::fs::remove_file(&path).expect("unlink temp file for core.rs test");
+
+        (path, OpenedDeviceHandle::from_file_for_test(file))
+    }
+
+    // Same as `test_handle_with_temp_file`, but the directory entry is left
+    // in place instead of being unlinked immediately. Only needed by tests
+    // that must reopen the file *by path* afterward (to check what was
+    // actually written to it) -- every other test uses the unlink-immediately
+    // variant above. The caller is responsible for removing the returned
+    // path once done with it.
+    fn test_handle_with_persistent_temp_file(tag: &str) -> (std::path::PathBuf, OpenedDeviceHandle) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        let path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-core-test-{tag}-{}-{id}.persistent.tmp",
+            std::process::id()
+        ));
+
+        let file = std::fs::File::create(&path).expect("create temp file for core.rs test");
+
+        (path, OpenedDeviceHandle::from_file_for_test(file))
+    }
+
     // FD-binding A. FD major/minor and size all match the current snapshot -> Match.
     #[test]
     fn fd_binding_matching_major_minor_and_size_is_match() {
@@ -862,7 +1031,8 @@ mod tests {
         .unwrap();
 
         let metadata = matching_fd_metadata(&snapshot);
-        let prepared = finalize_prepared_write(ready, true, Some(&metadata)).unwrap();
+        let (_path, handle) = test_handle_with_temp_file("succeeds");
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
 
         assert_eq!(prepared.target_block_path, snapshot.block_path);
         assert_eq!(prepared.target_size, snapshot.size);
@@ -1093,8 +1263,9 @@ mod tests {
         assert!(matches!(result, Err(WriteGateError::ImageTooLarge)));
     }
 
-    // finalize J. OpenDevice itself failing -> OpenDeviceFailed, regardless
-    // of FD metadata (there is none to check yet).
+    // finalize J. OpenDevice itself failing (represented as `None` — there is
+    // no handle to hand over) -> OpenDeviceFailed, regardless of FD metadata
+    // (there is none to check yet).
     #[test]
     fn finalize_prepared_write_rejects_open_device_failure() {
         let snapshot = base_device();
@@ -1103,13 +1274,15 @@ mod tests {
             current: snapshot,
         };
 
-        let result = finalize_prepared_write(ready, false, None);
+        let result = finalize_prepared_write(ready, None, None);
 
         assert!(matches!(result, Err(WriteGateError::OpenDeviceFailed)));
     }
 
-    // finalize K (Mismatch). OpenDevice succeeded but the FD's own
-    // major/minor don't match the just-verified snapshot -> FdBindingMismatch.
+    // finalize K (Mismatch). OpenDevice succeeded (a real, owned test handle
+    // is handed over) but the FD's own major/minor don't match the
+    // just-verified snapshot -> FdBindingMismatch, and no PreparedWrite is
+    // produced (the handle is simply dropped/closed inside the rejected call).
     #[test]
     fn finalize_prepared_write_rejects_fd_binding_mismatch() {
         let snapshot = base_device();
@@ -1118,15 +1291,17 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
         };
+        let (_path, handle) = test_handle_with_temp_file("mismatch");
 
-        let result = finalize_prepared_write(ready, true, Some(&metadata));
+        let result = finalize_prepared_write(ready, Some(handle), Some(&metadata));
 
         assert!(matches!(result, Err(WriteGateError::FdBindingMismatch)));
     }
 
-    // finalize K (InsufficientInformation). OpenDevice succeeded but FD
-    // metadata could not be obtained -> FdBindingInsufficient, never assumed
-    // to be a Match.
+    // finalize K (InsufficientInformation). OpenDevice succeeded (a real
+    // handle is handed over) but FD metadata could not be obtained ->
+    // FdBindingInsufficient, never assumed to be a Match, and no
+    // PreparedWrite is produced.
     #[test]
     fn finalize_prepared_write_rejects_fd_binding_insufficient_information() {
         let snapshot = base_device();
@@ -1134,10 +1309,434 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
         };
+        let (_path, handle) = test_handle_with_temp_file("insufficient");
 
-        let result = finalize_prepared_write(ready, true, None);
+        let result = finalize_prepared_write(ready, Some(handle), None);
 
         assert!(matches!(result, Err(WriteGateError::FdBindingInsufficient)));
+    }
+
+    // finalize (ownership). On success, PreparedWrite is now the sole owner
+    // of the handle that was handed to finalize_prepared_write: dropping the
+    // PreparedWrite must close the underlying fd via ordinary RAII, with no
+    // explicit close call anywhere in this module. Verified by checking
+    // `/proc/self/fd/<n>` for the handle's own raw fd (read only via the
+    // test-only `raw_fd_for_test`, never a production API) before and after
+    // the drop. This also doubles as ActiveWrite test E: a PreparedWrite that
+    // is dropped *without* ever calling `begin()` still closes its fd.
+    #[test]
+    fn finalize_prepared_write_success_owns_handle_and_drop_closes_it() {
+        let snapshot = base_device();
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot.clone(),
+        };
+        let metadata = matching_fd_metadata(&snapshot);
+        let (_path, handle) = test_handle_with_temp_file("drop-closes-fd");
+        let raw_fd = handle.raw_fd_for_test();
+        let fd_proc_path = format!("/proc/self/fd/{raw_fd}");
+
+        assert!(
+            std::path::Path::new(&fd_proc_path).exists(),
+            "fd should still be open before finalize_prepared_write"
+        );
+
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+
+        assert!(
+            std::path::Path::new(&fd_proc_path).exists(),
+            "fd should still be open while PreparedWrite is alive"
+        );
+
+        drop(prepared);
+
+        assert!(
+            !std::path::Path::new(&fd_proc_path).exists(),
+            "fd should be closed once PreparedWrite is dropped"
+        );
+    }
+
+    // ActiveWrite A/B. `begin()` consumes a PreparedWrite and carries its
+    // target/image identification over unchanged into the new ActiveWrite.
+    // (The PreparedWrite value itself is gone after this -- there is no way
+    // to re-read its fields afterward, which is why they are captured first.)
+    #[test]
+    fn prepared_write_begin_consumes_into_active_write_with_matching_fields() {
+        let snapshot = base_device();
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot.clone(),
+        };
+        let metadata = matching_fd_metadata(&snapshot);
+        let (_path, handle) = test_handle_with_temp_file("begin-fields");
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+
+        let expected_block_path = prepared.target_block_path.clone();
+        let expected_target_size = prepared.target_size;
+        let expected_image_size = prepared.image_size;
+
+        let active = prepared.begin();
+
+        assert_eq!(active.target_block_path, expected_block_path);
+        assert_eq!(active.target_size, expected_target_size);
+        assert_eq!(active.image_size, expected_image_size);
+    }
+
+    // ActiveWrite C/D. The fd moves from PreparedWrite to ActiveWrite with no
+    // duplication anywhere (no dup()/try_clone()): it stays open for the
+    // entire lifetime of the ActiveWrite, and closes via ordinary RAII
+    // exactly when the ActiveWrite itself is dropped -- not before, not
+    // after.
+    #[test]
+    fn active_write_holds_moved_fd_until_dropped() {
+        let snapshot = base_device();
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot.clone(),
+        };
+        let metadata = matching_fd_metadata(&snapshot);
+        let (_path, handle) = test_handle_with_temp_file("active-drop-closes-fd");
+        let raw_fd = handle.raw_fd_for_test();
+        let fd_proc_path = format!("/proc/self/fd/{raw_fd}");
+
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        assert!(
+            std::path::Path::new(&fd_proc_path).exists(),
+            "fd should still be open right after finalize_prepared_write"
+        );
+
+        let active = prepared.begin();
+        assert!(
+            std::path::Path::new(&fd_proc_path).exists(),
+            "fd should still be open once ownership has moved into ActiveWrite"
+        );
+
+        drop(active);
+        assert!(
+            !std::path::Path::new(&fd_proc_path).exists(),
+            "fd should be closed once ActiveWrite is dropped"
+        );
+    }
+
+    // ActiveWrite C/D/E/F. `writer_target()` yields a genuine `std::io::Write`
+    // borrowed from the FD `ActiveWrite` owns: a known, small pattern written
+    // through it round-trips exactly when the (regular, never a block
+    // device) temp file is reopened by path afterward. The borrow itself is
+    // scoped -- once it ends, `active`'s own plain data fields are still
+    // readable, proving `writer_target()` did not consume or otherwise
+    // invalidate `active`.
+    #[test]
+    fn active_write_target_writes_known_data_to_regular_file() {
+        let snapshot = base_device();
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot.clone(),
+        };
+        let metadata = matching_fd_metadata(&snapshot);
+        let (path, handle) = test_handle_with_persistent_temp_file("write-known-data");
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let mut active = prepared.begin();
+
+        const PATTERN: &[u8] = b"linux-usb-writer ActiveWriteTarget self-test pattern";
+
+        {
+            // C: obtained only via ActiveWrite. D: a genuine Write.
+            let mut target = active.writer_target();
+            target
+                .write_all(PATTERN)
+                .expect("write_all through ActiveWriteTarget");
+            target.flush().expect("flush through ActiveWriteTarget");
+        }
+
+        // F: the exclusive borrow above has ended; `active` is still alive
+        // and its own fields are still readable.
+        assert_eq!(active.target_block_path, snapshot.block_path);
+
+        drop(active);
+
+        // E: the regular file's content matches exactly what was written.
+        let written = std::fs::read(&path).expect("reopen temp file for read-back");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(written, PATTERN);
+    }
+
+    // Requirement 9 (Writer Core type compatibility). `ActiveWriteTarget`
+    // must be usable anywhere a bare `W: std::io::Write` is expected -- e.g.
+    // a future `writer::write(&plan, source, active.writer_target(), ...)`
+    // call -- checked here purely at the type level. `writer::write()` itself
+    // is never called; this only proves the type would fit its `W` parameter.
+    fn accepts_write<T: std::io::Write>(_: &mut T) {}
+
+    #[test]
+    fn active_write_target_is_compatible_with_generic_write_bound() {
+        let snapshot = base_device();
+        let ready = ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot.clone(),
+        };
+        let metadata = matching_fd_metadata(&snapshot);
+        let (_path, handle) = test_handle_with_temp_file("type-compat");
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let mut active = prepared.begin();
+
+        let mut target = active.writer_target();
+        accepts_write(&mut target);
+    }
+
+    // ---------------------------------------------------------------------
+    // Integration: ActiveWrite -> ActiveWriteTarget -> writer::write()
+    // (regular files only)
+    //
+    // Everything below drives the *entire* production sequence --
+    // select -> ConfirmationToken -> prepare_for_open -> (simulated
+    // OpenDevice via the test-only `from_file_for_test`) ->
+    // finalize_prepared_write -> PreparedWrite -> begin() -> ActiveWrite ->
+    // writer_target() -- and then, for the first time anywhere in this
+    // crate, actually calls `writer::write()` with the resulting
+    // `ActiveWriteTarget` as its `W: Write` target. `writer.rs` itself is
+    // untouched: every call below uses its existing, unmodified `WritePlan`,
+    // `write()`, `WriteError`, and the Gate's own `DEFAULT_CHUNK_SIZE`-based
+    // plan (nothing here fabricates a bespoke plan the real Gate wouldn't
+    // produce).
+    //
+    // This connection is reachable ONLY from this `#[cfg(test)]` module: the
+    // real path (`linux_access::open_device` -> a real `OpenedDeviceHandle`)
+    // never appears here, `from_file_for_test` is `#[cfg(test)]`-only and
+    // unreachable from any production build, and `main.rs` calls none of
+    // this. No `/dev/*` path, no real USB/SD/NVMe device, and no
+    // `linux_access::open_device` call appears anywhere below.
+    // ---------------------------------------------------------------------
+
+    // Drives the full Gate sequence above against a plain, throwaway regular
+    // file and returns the resulting `ActiveWrite` together with the exact
+    // `WritePlan` `prepare_for_open` produced for it (the same plan a real
+    // caller would pass to `writer::write()`). `image_size` doubles as the
+    // DeviceSnapshot's declared size floor and the ConfirmationToken's bound
+    // value, exactly as a real Write Gate pass requires them to agree.
+    // `persistent` selects between the unlink-immediately temp file helper
+    // (when the test never needs to reopen it by path) and the
+    // path-preserving one (when it does, e.g. to check written content).
+    fn gate_pass_active_write(
+        tag: &str,
+        image_size: u64,
+        target_size: u64,
+        persistent: bool,
+    ) -> (Option<std::path::PathBuf>, ActiveWrite, WritePlan) {
+        let mut snapshot = base_device();
+        snapshot.size = target_size;
+
+        let state = select(snapshot.clone()).unwrap();
+        let confirmation = ConfirmationToken::new(&snapshot, image_size);
+
+        let ready = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot.clone()),
+            image_size,
+            Some(&confirmation),
+        )
+        .expect("prepare_for_open should succeed for a freshly matching snapshot/confirmation");
+
+        let plan = ready.plan;
+        let metadata = matching_fd_metadata(&snapshot);
+
+        let (path, handle) = if persistent {
+            let (path, handle) = test_handle_with_persistent_temp_file(tag);
+            (Some(path), handle)
+        } else {
+            let (_path, handle) = test_handle_with_temp_file(tag);
+            (None, handle)
+        };
+
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata))
+            .expect("finalize_prepared_write should succeed with matching FD metadata");
+
+        (path, prepared.begin(), plan)
+    }
+
+    // Integration A (normal case). The full chain connects end to end for
+    // the first time: a known, small source writes completely through
+    // `writer::write()` into an `ActiveWriteTarget`. The written byte count
+    // matches `image_size`, the regular file's content matches the source
+    // exactly, and `active` itself is still usable (its own fields are still
+    // readable) once the `write()` call -- and the borrow it took via
+    // `writer_target()` -- has returned.
+    #[test]
+    fn integration_writes_small_known_source_through_full_gate_chain() {
+        const SOURCE: &[u8] = b"linux-usb-writer integration test: small known source";
+        let image_size = SOURCE.len() as u64;
+        let target_size = image_size + 1024;
+
+        let (path, mut active, plan) =
+            gate_pass_active_write("integration-small", image_size, target_size, true);
+        let path = path.expect("persistent temp file path");
+
+        let written = writer::write(
+            &plan,
+            std::io::Cursor::new(SOURCE.to_vec()),
+            active.writer_target(),
+            |_| {},
+            || false,
+        )
+        .expect("write through the full gate chain should succeed");
+
+        assert_eq!(written, image_size);
+        assert_eq!(active.target_block_path, base_device().block_path);
+
+        drop(active);
+
+        let on_disk = std::fs::read(&path).expect("reopen temp file for read-back");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(on_disk, SOURCE);
+    }
+
+    // Integration B/C (multiple chunks + progress). The Gate's `WritePlan`
+    // always uses `DEFAULT_CHUNK_SIZE`, so an image over 1 MiB forces more
+    // than one chunk. Confirms the reconstructed file is byte-for-byte
+    // correct AND that the existing progress callback still reports a
+    // monotonically increasing `bytes_written` ending exactly at
+    // `image_size` when the target is an `ActiveWriteTarget`.
+    #[test]
+    fn integration_multiple_chunks_and_monotonic_progress_through_full_gate_chain() {
+        let image_size = 2 * DEFAULT_CHUNK_SIZE as u64;
+        let target_size = image_size;
+        let data: Vec<u8> = (0..image_size).map(|i| (i % 256) as u8).collect();
+
+        let (path, mut active, plan) =
+            gate_pass_active_write("integration-multi-chunk", image_size, target_size, true);
+        let path = path.expect("persistent temp file path");
+
+        let mut progress_log = Vec::new();
+        let written = writer::write(
+            &plan,
+            std::io::Cursor::new(data.clone()),
+            active.writer_target(),
+            |progress| progress_log.push(progress.bytes_written),
+            || false,
+        )
+        .expect("multi-chunk write through the full gate chain should succeed");
+
+        assert_eq!(written, image_size);
+        assert!(!progress_log.is_empty());
+        assert!(progress_log.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(*progress_log.last().unwrap(), image_size);
+
+        drop(active);
+
+        let on_disk = std::fs::read(&path).expect("reopen temp file for read-back");
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(on_disk, data);
+    }
+
+    // Integration D (cancellation). `is_cancelled` -- the same closure
+    // parameter `writer::write()` has always had -- still works when the
+    // target is an `ActiveWriteTarget`: the write stops partway through,
+    // leaving the target only partially written and reporting exactly how
+    // far it got, never silently completing.
+    #[test]
+    fn integration_cancellation_stops_partway_through_full_gate_chain() {
+        let image_size = 3 * DEFAULT_CHUNK_SIZE as u64;
+        let target_size = image_size;
+        let data = vec![9u8; image_size as usize];
+
+        let (_path, mut active, plan) =
+            gate_pass_active_write("integration-cancel", image_size, target_size, false);
+
+        let mut checks = 0;
+        let result = writer::write(
+            &plan,
+            std::io::Cursor::new(data),
+            active.writer_target(),
+            |_| {},
+            || {
+                checks += 1;
+                checks > 1
+            },
+        );
+
+        match result {
+            Err(writer::WriteError::Cancelled { bytes_written }) => {
+                assert!(bytes_written > 0);
+                assert!(bytes_written < image_size);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+    }
+
+    // Integration E (source shorter than planned). A source shorter than
+    // the Gate-approved `image_size` must still be reported as
+    // `SourceTooShort` through the full gate chain, never as a silently
+    // short "successful" write.
+    #[test]
+    fn integration_source_too_short_through_full_gate_chain() {
+        let image_size = 1000u64;
+        let target_size = 2000u64;
+        let short_source = vec![1u8; 400];
+
+        let (_path, mut active, plan) =
+            gate_pass_active_write("integration-short-source", image_size, target_size, false);
+
+        let result = writer::write(
+            &plan,
+            std::io::Cursor::new(short_source),
+            active.writer_target(),
+            |_| {},
+            || false,
+        );
+
+        match result {
+            Err(writer::WriteError::SourceTooShort { bytes_written }) => {
+                assert_eq!(bytes_written, 400);
+            }
+            other => panic!("expected SourceTooShort, got {other:?}"),
+        }
+    }
+
+    // Integration F (target write error). A genuine `write()` syscall
+    // failure (EBADF, from writing to an fd opened read-only) surfaces as
+    // `WriteError::TargetWrite` through the full gate chain. Reopening the
+    // *same* regular file read-only is enough to make real writes fail at
+    // the OS level, so this needs no change to `ActiveWriteTarget`'s own
+    // design to inject the failure.
+    #[test]
+    fn integration_target_write_error_through_full_gate_chain() {
+        let image_size = 64u64;
+        let target_size = 128u64;
+
+        let mut snapshot = base_device();
+        snapshot.size = target_size;
+        let state = select(snapshot.clone()).unwrap();
+        let confirmation = ConfirmationToken::new(&snapshot, image_size);
+        let ready = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot.clone()),
+            image_size,
+            Some(&confirmation),
+        )
+        .unwrap();
+        let plan = ready.plan;
+        let metadata = matching_fd_metadata(&snapshot);
+
+        let path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-core-test-target-write-error-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::File::create(&path).expect("create temp file for read-only test");
+        let read_only_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .expect("reopen temp file read-only");
+        let handle = OpenedDeviceHandle::from_file_for_test(read_only_file);
+
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let mut active = prepared.begin();
+
+        let source = std::io::Cursor::new(vec![7u8; image_size as usize]);
+        let result = writer::write(&plan, source, active.writer_target(), |_| {}, || false);
+
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(result, Err(writer::WriteError::TargetWrite(_))));
     }
 
     // Gate L / Confirmation-mismatch C. A confirmation captured against an

@@ -427,14 +427,20 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
 
     let open_result = linux_access::open_device(&ready.current.block_path, "rw");
 
-    let (open_succeeded, metadata) = match &open_result {
+    // Metadata must be read from the handle (a genuine, if tiny, bit of
+    // Linux I/O -- fstat/ioctl) *before* the handle's ownership moves into
+    // `finalize_prepared_write`, since that function must never call
+    // `.metadata()` itself (core.rs stays free of Linux I/O calls; it only
+    // ever receives already-collected data plus an opaque value to move).
+    let (handle_opt, metadata) = match open_result {
         Ok(handle) => {
             println!("prepare-test: OpenDevice: success");
-            (true, handle.metadata())
+            let metadata = handle.metadata();
+            (Some(handle), metadata)
         }
         Err(error) => {
             println!("prepare-test: OpenDevice: failed ({error:?})");
-            (false, None)
+            (None, None)
         }
     };
 
@@ -445,22 +451,40 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
         );
     }
 
-    match core::finalize_prepared_write(ready, open_succeeded, metadata.as_ref()) {
+    // `handle_opt` moves into `finalize_prepared_write` here. On success, the
+    // returned `PreparedWrite` is now the sole owner of that handle -- this
+    // function never sees it again. On rejection, the handle was already
+    // dropped (closed via RAII) inside `finalize_prepared_write` itself, so
+    // there is nothing left here to close explicitly either way.
+    match core::finalize_prepared_write(ready, handle_opt, metadata.as_ref()) {
         Ok(prepared) => {
             println!(
                 "prepare-test: PreparedWrite established for {} (target_size={} image_size={})",
                 prepared.target_block_path, prepared.target_size, prepared.image_size
             );
             println!("prepare-test: WRITE NOT PERFORMED (writer::write() is not called by this PoC)");
+
+            // Demonstrate the next ownership stage: PreparedWrite -> ActiveWrite.
+            // `begin()` consumes `prepared` by value -- the fd moves once,
+            // with no dup()/try_clone(), into the new ActiveWrite. `prepared`
+            // cannot be referred to again after this line; the compiler
+            // enforces that, not a runtime check.
+            let active = prepared.begin();
+            println!(
+                "prepare-test: WRITE SESSION CREATED for {} (target_size={} image_size={})",
+                active.target_block_path, active.target_size, active.image_size
+            );
+            println!(
+                "prepare-test: WRITE NOT PERFORMED (ActiveWrite exposes no writer::write() connection yet)"
+            );
+
+            drop(active);
+            println!("prepare-test: ActiveWrite dropped -- FD closed via RAII");
         }
         Err(error) => {
             println!("prepare-test: Write Gate rejected after OpenDevice: {error:?}");
+            println!("prepare-test: FD (if any was opened) was already closed via RAII inside the Write Gate");
         }
-    }
-
-    if let Ok(handle) = open_result {
-        linux_access::close_without_writing(handle);
-        println!("prepare-test: FD closed: yes");
     }
 
     Ok(())

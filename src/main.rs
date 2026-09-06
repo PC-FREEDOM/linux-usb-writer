@@ -1,17 +1,39 @@
+mod core;
 mod device;
 mod identity;
+mod linux_access;
 mod linux_backend;
 mod linux_monitor;
 mod safety;
 
+use device::SnapshotFetchOutcome;
 use identity::{compare_identity, compare_instance};
-use linux_backend::collect_device_snapshots;
+use linux_backend::{collect_device_snapshot, collect_device_snapshots};
 use linux_monitor::{start_monitoring, DeviceEvent};
 use safety::assess_device;
 
 fn main() -> zbus::Result<()> {
-    if std::env::args().nth(1).as_deref() == Some("monitor") {
-        return run_monitor();
+    let mut args = std::env::args().skip(1);
+
+    match args.next().as_deref() {
+        Some("monitor") => return run_monitor(),
+        Some("select") => {
+            let Some(target) = args.next() else {
+                eprintln!("usage: cargo run -- select <udisks2-block-object-path>");
+                return Ok(());
+            };
+
+            return run_select(target);
+        }
+        Some("open-test") => {
+            let Some(target) = args.next() else {
+                eprintln!("usage: cargo run -- open-test <udisks2-block-object-path>");
+                return Ok(());
+            };
+
+            return run_open_test(target);
+        }
+        _ => {}
     }
 
     let snapshots = collect_device_snapshots()?;
@@ -148,6 +170,171 @@ fn run_monitor() -> zbus::Result<()> {
             Err(error) => eprintln!("  snapshot refresh failed: {error}"),
         }
     }
+
+    Ok(())
+}
+
+// PoC mode: Selection Continuity (`cargo run -- select <block_path>`).
+// Performs one explicit selection, then watches UDisks2 signals and, on
+// every event, both (a) folds the event into the SelectionState and (b)
+// re-fetches just this one target and re-verifies Identity/Instance/Safety
+// against it. Read-only throughout; never opens the device or writes to it.
+// To demonstrate re-selection, stop this process (Ctrl+C) and run it again
+// with `select` — a fresh process always starts from SelectionState::NoSelection,
+// so the only way back to Selected is this explicit action, never automatic.
+fn run_select(block_path: String) -> zbus::Result<()> {
+    let mut state = attempt_select(&block_path);
+    print_selection_state(&state);
+
+    let events = start_monitoring()?;
+
+    for event in events {
+        state = core::apply_event(state, &event);
+
+        if let core::SelectionState::Selected { baseline, .. } = &state {
+            let outcome = collect_device_snapshot(&baseline.block_path);
+            state = core::revalidate(state, outcome);
+        }
+
+        print_selection_state(&state);
+    }
+
+    Ok(())
+}
+
+fn attempt_select(block_path: &str) -> core::SelectionState {
+    match collect_device_snapshot(block_path) {
+        SnapshotFetchOutcome::Found(snapshot) => match core::select(snapshot) {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("select rejected: {error:?}");
+                core::SelectionState::NoSelection
+            }
+        },
+        SnapshotFetchOutcome::NotFound => {
+            eprintln!("select failed: no such target: {block_path}");
+            core::SelectionState::NoSelection
+        }
+        SnapshotFetchOutcome::Error(reason) => {
+            eprintln!("select failed: {reason}");
+            core::SelectionState::NoSelection
+        }
+    }
+}
+
+fn print_selection_state(state: &core::SelectionState) {
+    match state {
+        core::SelectionState::NoSelection => {
+            println!("\n[Selection] NoSelection");
+        }
+        core::SelectionState::Selected {
+            baseline,
+            baseline_assessment,
+        } => {
+            println!(
+                "\n[Selection] Selected  device={} risk={:?} writable={} diskseq={:?}",
+                baseline.device,
+                baseline_assessment.risk_level,
+                baseline_assessment.writable,
+                baseline.diskseq
+            );
+        }
+        core::SelectionState::Invalidated {
+            baseline,
+            baseline_assessment,
+            reason,
+        } => {
+            println!(
+                "\n[Selection] Invalidated  device={} reason={reason:?} (baseline was risk={:?} writable={})",
+                baseline.device, baseline_assessment.risk_level, baseline_assessment.writable
+            );
+        }
+    }
+}
+
+// PoC mode: OpenDevice safety check (`cargo run -- open-test <block_path>`).
+// Runs the full pre-write safety pipeline up to — and only up to — holding an
+// open file descriptor: select, one final targeted re-verification
+// (Identity/Instance/Safety), OpenDevice, FD metadata inspection, an FD
+// binding check against the just-re-verified snapshot, then close.
+// No bytes are ever written, seeked-then-written, truncated, or otherwise
+// modified through the returned descriptor — this function has no code path
+// that could do so. If OpenDevice needs polkit authentication, this program
+// does nothing but wait for the reply; it never falls back to sudo or any
+// other bypass.
+fn run_open_test(block_path: String) -> zbus::Result<()> {
+    let mut state = attempt_select(&block_path);
+
+    if let core::SelectionState::Selected { baseline, .. } = &state {
+        let outcome = collect_device_snapshot(&baseline.block_path);
+        state = core::revalidate(state, outcome);
+    }
+
+    print_selection_state(&state);
+
+    if !core::is_ready_to_open(&state) {
+        println!("\nSelection: invalid -- refusing to call OpenDevice.");
+        return Ok(());
+    }
+
+    println!("\nSelection: valid");
+
+    let core::SelectionState::Selected { baseline, .. } = &state else {
+        unreachable!("is_ready_to_open just confirmed Selected");
+    };
+
+    println!(
+        "Requesting OpenDevice(mode=\"rw\") on {}.",
+        baseline.block_path
+    );
+    println!(
+        "If a polkit authentication prompt appears, please complete it yourself -- \
+         this program will not use sudo or any other privilege bypass."
+    );
+
+    let handle = match linux_access::open_device(&baseline.block_path, "rw") {
+        Ok(handle) => handle,
+        Err(error) => {
+            println!("OpenDevice: failed ({error:?})");
+            return Ok(());
+        }
+    };
+
+    println!("OpenDevice: success");
+
+    let metadata = handle.metadata();
+
+    match &metadata {
+        Some(meta) => {
+            println!("FD major:minor: {}:{}", meta.major, meta.minor);
+            println!(
+                "Expected major:minor: {}:{}",
+                baseline.major, baseline.minor
+            );
+            println!("FD size (BLKGETSIZE64): {:?}", meta.size);
+            println!("Expected size: {}", baseline.size);
+
+            if let Some(target) = &meta.proc_fd_target {
+                println!("/proc/self/fd target: {target}");
+            }
+        }
+        None => println!("FD metadata: unavailable"),
+    }
+
+    match core::check_fd_binding(baseline, metadata.as_ref()) {
+        core::FdBindingCheck::Match => println!("FD binding: Match"),
+        core::FdBindingCheck::Mismatch => {
+            println!("FD binding: Mismatch -- would abort before any write")
+        }
+        core::FdBindingCheck::InsufficientInformation => {
+            println!("FD binding: InsufficientInformation -- would abort before any write")
+        }
+    }
+
+    println!("Write performed: NO (0 bytes)");
+
+    linux_access::close_without_writing(handle);
+    println!("FD closed: yes");
 
     Ok(())
 }

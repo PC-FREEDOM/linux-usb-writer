@@ -8,7 +8,7 @@ use zbus::{
     zvariant::{OwnedObjectPath, OwnedValue},
 };
 
-use crate::device::DeviceSnapshot;
+use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
 
 fn bytes_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes)
@@ -16,9 +16,11 @@ fn bytes_to_string(bytes: &[u8]) -> String {
         .to_string()
 }
 
-// Decodes a Linux dev_t (as reported by UDisks2's Block.DeviceNumber) into
-// (major, minor) using the same encoding as glibc's gnu_dev_major/gnu_dev_minor.
-fn decode_device_number(device_number: u64) -> (u32, u32) {
+// Decodes a Linux dev_t into (major, minor) using the same encoding as
+// glibc's gnu_dev_major/gnu_dev_minor. Used both for UDisks2's
+// Block.DeviceNumber and for a raw fstat() st_rdev value (linux_access.rs) —
+// both are the same dev_t encoding.
+pub(crate) fn decode_device_number(device_number: u64) -> (u32, u32) {
     let major = (((device_number >> 8) & 0xfff) as u32)
         | ((device_number >> 32) as u32 & !0xfff);
 
@@ -239,6 +241,140 @@ fn collect_complex_storage_details(
     details
 }
 
+// Builds a single DeviceSnapshot for one Block object path, or Ok(None) if
+// that object is a partition (not a whole disk) or has no Drive. Shared by
+// both the full-fleet collection and the single-target refresh so the two
+// never drift apart.
+fn build_snapshot_for_path(
+    connection: &Connection,
+    device_path: &OwnedObjectPath,
+    active_swaps: &[String],
+) -> zbus::Result<Option<DeviceSnapshot>> {
+    let block = Proxy::new(
+        connection,
+        "org.freedesktop.UDisks2",
+        device_path.as_str(),
+        "org.freedesktop.UDisks2.Block",
+    )?;
+
+    let device: Vec<u8> = block.get_property("Device")?;
+    let size: u64 = block.get_property("Size")?;
+    let read_only: bool = block.get_property("ReadOnly")?;
+    let drive_path: OwnedObjectPath =
+        block.get_property("Drive")?;
+    let device_number: u64 =
+        block.get_property("DeviceNumber")?;
+    let (major, minor) = decode_device_number(device_number);
+
+    let hint_system: bool =
+        block.get_property("HintSystem")?;
+    let hint_ignore: bool =
+        block.get_property("HintIgnore")?;
+    let hint_partitionable: bool =
+        block.get_property("HintPartitionable")?;
+
+    let device_name = bytes_to_string(&device);
+    let diskseq = read_diskseq(&device_name);
+
+    let partition = Proxy::new(
+        connection,
+        "org.freedesktop.UDisks2",
+        device_path.as_str(),
+        "org.freedesktop.UDisks2.Partition",
+    )?;
+
+    let partition_number: Option<u32> =
+        partition.get_property("Number").ok();
+
+    if partition_number.is_some() || drive_path.as_str() == "/" {
+        return Ok(None);
+    }
+
+    let drive = Proxy::new(
+        connection,
+        "org.freedesktop.UDisks2",
+        drive_path.as_str(),
+        "org.freedesktop.UDisks2.Drive",
+    )?;
+
+    let model: String = drive.get_property("Model")?;
+    let vendor: String = drive.get_property("Vendor")?;
+    let serial: String = drive.get_property("Serial")?;
+    let connection_bus: String =
+        drive.get_property("ConnectionBus")?;
+    let removable: bool =
+        drive.get_property("Removable")?;
+    let media_available: bool =
+        drive.get_property("MediaAvailable")?;
+
+    let partition_paths =
+        get_partition_paths(connection, device_path);
+
+    let mount_points =
+        collect_mount_points(connection, &partition_paths);
+
+    let swap_devices = collect_swap_devices(
+        connection,
+        &device_name,
+        &partition_paths,
+        active_swaps,
+    );
+
+    let active_swap = !swap_devices.is_empty();
+
+    let complex_storage_details =
+        collect_complex_storage_details(
+            connection,
+            device_path,
+            &partition_paths,
+        );
+
+    let complex_storage =
+        !complex_storage_details.is_empty();
+
+    Ok(Some(DeviceSnapshot {
+        device: device_name,
+        block_path: device_path.as_str().to_string(),
+        drive_path: drive_path.as_str().to_string(),
+        major,
+        minor,
+        diskseq,
+        size,
+        read_only,
+        media_available,
+        model,
+        vendor,
+        serial,
+        connection_bus,
+        removable,
+        hint_system,
+        hint_ignore,
+        hint_partitionable,
+        mount_points,
+        active_swap,
+        swap_devices,
+        complex_storage,
+        complex_storage_details,
+    }))
+}
+
+// Returns true if a zbus error indicates the D-Bus object simply doesn't
+// exist (rather than some other, unexpected failure). UDisks2's GDBus-based
+// service has been observed (see reports/latest.md) to report a missing
+// object as `org.freedesktop.DBus.Error.UnknownMethod` with a "does not
+// exist" description, in addition to the more conventional UnknownObject.
+fn is_object_missing_error(error: &zbus::Error) -> bool {
+    let zbus::Error::MethodError(name, description, _) = error else {
+        return false;
+    };
+
+    let description = description.as_deref().unwrap_or("");
+
+    name.as_str() == "org.freedesktop.DBus.Error.UnknownObject"
+        || (name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod"
+            && description.contains("does not exist"))
+}
+
 pub fn collect_device_snapshots() -> zbus::Result<Vec<DeviceSnapshot>> {
     let connection = Connection::system()?;
 
@@ -258,113 +394,41 @@ pub fn collect_device_snapshots() -> zbus::Result<Vec<DeviceSnapshot>> {
     let mut snapshots = Vec::new();
 
     for device_path in devices {
-        let block = Proxy::new(
-            &connection,
-            "org.freedesktop.UDisks2",
-            device_path.as_str(),
-            "org.freedesktop.UDisks2.Block",
-        )?;
-
-        let device: Vec<u8> = block.get_property("Device")?;
-        let size: u64 = block.get_property("Size")?;
-        let read_only: bool = block.get_property("ReadOnly")?;
-        let drive_path: OwnedObjectPath =
-            block.get_property("Drive")?;
-        let device_number: u64 =
-            block.get_property("DeviceNumber")?;
-        let (major, minor) = decode_device_number(device_number);
-
-        let hint_system: bool =
-            block.get_property("HintSystem")?;
-        let hint_ignore: bool =
-            block.get_property("HintIgnore")?;
-        let hint_partitionable: bool =
-            block.get_property("HintPartitionable")?;
-
-        let device_name = bytes_to_string(&device);
-        let diskseq = read_diskseq(&device_name);
-
-        let partition = Proxy::new(
-            &connection,
-            "org.freedesktop.UDisks2",
-            device_path.as_str(),
-            "org.freedesktop.UDisks2.Partition",
-        )?;
-
-        let partition_number: Option<u32> =
-            partition.get_property("Number").ok();
-
-        if partition_number.is_some() || drive_path.as_str() == "/" {
-            continue;
+        if let Some(snapshot) =
+            build_snapshot_for_path(&connection, &device_path, &active_swaps)?
+        {
+            snapshots.push(snapshot);
         }
-
-        let drive = Proxy::new(
-            &connection,
-            "org.freedesktop.UDisks2",
-            drive_path.as_str(),
-            "org.freedesktop.UDisks2.Drive",
-        )?;
-
-        let model: String = drive.get_property("Model")?;
-        let vendor: String = drive.get_property("Vendor")?;
-        let serial: String = drive.get_property("Serial")?;
-        let connection_bus: String =
-            drive.get_property("ConnectionBus")?;
-        let removable: bool =
-            drive.get_property("Removable")?;
-        let media_available: bool =
-            drive.get_property("MediaAvailable")?;
-
-        let partition_paths =
-            get_partition_paths(&connection, &device_path);
-
-        let mount_points =
-            collect_mount_points(&connection, &partition_paths);
-
-        let swap_devices = collect_swap_devices(
-            &connection,
-            &device_name,
-            &partition_paths,
-            &active_swaps,
-        );
-
-        let active_swap = !swap_devices.is_empty();
-
-        let complex_storage_details =
-            collect_complex_storage_details(
-                &connection,
-                &device_path,
-                &partition_paths,
-            );
-
-        let complex_storage =
-            !complex_storage_details.is_empty();
-
-        snapshots.push(DeviceSnapshot {
-            device: device_name,
-            block_path: device_path.as_str().to_string(),
-            drive_path: drive_path.as_str().to_string(),
-            major,
-            minor,
-            diskseq,
-            size,
-            read_only,
-            media_available,
-            model,
-            vendor,
-            serial,
-            connection_bus,
-            removable,
-            hint_system,
-            hint_ignore,
-            hint_partitionable,
-            mount_points,
-            active_swap,
-            swap_devices,
-            complex_storage,
-            complex_storage_details,
-        });
     }
 
     Ok(snapshots)
+}
+
+// Re-fetches exactly one target's DeviceSnapshot by its UDisks2 Block object
+// path, without touching or being affected by any other device. Intended for
+// Selection Continuity's targeted re-verification (Core layer), so a race or
+// failure on an unrelated device can never disturb the selected target's
+// re-check. Collection only: this function makes no Selection judgement — it
+// just reports whether the target was found, is gone, or the query failed.
+pub fn collect_device_snapshot(block_path: &str) -> SnapshotFetchOutcome {
+    let connection = match Connection::system() {
+        Ok(connection) => connection,
+        Err(error) => return SnapshotFetchOutcome::Error(error.to_string()),
+    };
+
+    let device_path = match OwnedObjectPath::try_from(block_path) {
+        Ok(path) => path,
+        Err(error) => return SnapshotFetchOutcome::Error(error.to_string()),
+    };
+
+    let active_swaps = read_active_swaps();
+
+    match build_snapshot_for_path(&connection, &device_path, &active_swaps) {
+        Ok(Some(snapshot)) => SnapshotFetchOutcome::Found(snapshot),
+        Ok(None) => SnapshotFetchOutcome::NotFound,
+        Err(error) if is_object_missing_error(&error) => {
+            SnapshotFetchOutcome::NotFound
+        }
+        Err(error) => SnapshotFetchOutcome::Error(error.to_string()),
+    }
 }

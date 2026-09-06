@@ -23,3 +23,13 @@ pub struct DeviceSnapshot {
     pub complex_storage: bool,
     pub complex_storage_details: Vec<String>,
 }
+
+// Outcome of a targeted, single-device re-fetch (see
+// `linux_backend::collect_device_snapshot`). Kept here as a plain data type so
+// the Core layer can consume it without depending on how it was collected.
+#[derive(Debug)]
+pub enum SnapshotFetchOutcome {
+    Found(DeviceSnapshot),
+    NotFound,
+    Error(String),
+}

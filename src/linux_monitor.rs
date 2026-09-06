@@ -15,6 +15,7 @@ use crate::linux_backend::collect_device_snapshots;
 pub struct PropertyChange {
     pub name: String,
     pub value: String,
+    pub as_bool: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,14 +40,32 @@ pub enum DeviceEvent {
     },
 }
 
+impl DeviceEvent {
+    // The UDisks2 object path this event is about. Used by the Core layer to
+    // decide whether an event is relevant to the currently selected target.
+    pub fn object_path(&self) -> &str {
+        match self {
+            DeviceEvent::InterfacesAdded { object_path, .. }
+            | DeviceEvent::InterfacesRemoved { object_path, .. }
+            | DeviceEvent::PropertiesChanged { object_path, .. }
+            | DeviceEvent::WatcherFailed { object_path, .. } => object_path,
+        }
+    }
+}
+
 fn build_property_changes(
     changed_properties: HashMap<String, OwnedValue>,
 ) -> Vec<PropertyChange> {
     changed_properties
         .into_iter()
-        .map(|(name, value)| PropertyChange {
-            name,
-            value: format!("{value:?}"),
+        .map(|(name, value)| {
+            let as_bool = bool::try_from(&*value).ok();
+
+            PropertyChange {
+                name,
+                value: format!("{value:?}"),
+                as_bool,
+            }
         })
         .collect()
 }
@@ -232,8 +251,10 @@ mod tests {
         assert_eq!(changes.len(), 2);
         assert_eq!(changes[0].name, "MediaAvailable");
         assert_eq!(changes[0].value, "OwnedValue(Bool(false))");
+        assert_eq!(changes[0].as_bool, Some(false));
         assert_eq!(changes[1].name, "Size");
         assert_eq!(changes[1].value, "OwnedValue(U64(0))");
+        assert_eq!(changes[1].as_bool, None);
     }
 
     #[test]

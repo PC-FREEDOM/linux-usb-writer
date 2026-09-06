@@ -6,6 +6,7 @@ mod linux_backend;
 mod linux_monitor;
 mod safety;
 mod writer;
+mod write_job;
 
 use device::SnapshotFetchOutcome;
 use identity::{compare_identity, compare_instance};

@@ -7,7 +7,7 @@
 
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
 use crate::identity::{compare_identity, compare_instance, IdentityComparison, InstanceComparison};
-use crate::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle};
+use crate::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle, SyncTarget};
 use crate::linux_monitor::DeviceEvent;
 use crate::safety::{assess_device, RiskLevel, SafetyAssessment};
 use crate::writer::{WriteError as WriterError, WritePlan, DEFAULT_CHUNK_SIZE};
@@ -565,11 +565,30 @@ impl ActiveWrite {
     pub(crate) fn writer_target(&mut self) -> ActiveWriteTarget<'_> {
         self.handle.writer_target()
     }
+
+    // The sole source, anywhere in this crate, of a durability-sync
+    // capability backed by a Gate-passed FD -- the sync-only counterpart to
+    // `writer_target()`. Returns a short-lived `SyncTarget` borrowing `self`
+    // *shared* (`&self`, not `&mut self`): `File::sync_all()` needs no
+    // exclusive access, unlike `Write`. This module never calls
+    // `sync_all()` itself -- it only delegates the capability, exactly like
+    // `writer_target()` delegates write capability; the actual call happens
+    // in `write_job.rs`'s `Syncing::sync()`. See `linux_access::SyncTarget`'s
+    // doc comment for the block-device durability caveat: a successful sync
+    // is not, by itself, a confirmed guarantee of physical media durability.
+    //
+    // `pub(crate)` rather than `pub`, for the same convention (and the same
+    // Rust visibility limitation across sibling modules) as `writer_target()`.
+    #[allow(dead_code)] // exercised by this module's/write_job.rs's tests today; not yet called from main.rs.
+    pub(crate) fn sync_target(&self) -> SyncTarget<'_> {
+        self.handle.sync_target()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linux_access;
     use crate::linux_monitor::PropertyChange;
     use crate::writer;
     use std::io::Write;
@@ -1319,11 +1338,14 @@ mod tests {
     // finalize (ownership). On success, PreparedWrite is now the sole owner
     // of the handle that was handed to finalize_prepared_write: dropping the
     // PreparedWrite must close the underlying fd via ordinary RAII, with no
-    // explicit close call anywhere in this module. Verified by checking
-    // `/proc/self/fd/<n>` for the handle's own raw fd (read only via the
-    // test-only `raw_fd_for_test`, never a production API) before and after
-    // the drop. This also doubles as ActiveWrite test E: a PreparedWrite that
-    // is dropped *without* ever calling `begin()` still closes its fd.
+    // explicit close call anywhere in this module. Verified via
+    // `linux_access::{fd_proc_target_for_test, assert_fd_closed_for_test}`
+    // (fd-number-reuse-proof; see their doc comments -- a naive "does
+    // /proc/self/fd/<n> still exist" check previously caused a real,
+    // observed flaky failure here, since a concurrently-running test can
+    // have the OS hand the same fd number to an unrelated fd before the
+    // check runs). This also doubles as ActiveWrite test E: a PreparedWrite
+    // that is dropped *without* ever calling `begin()` still closes its fd.
     #[test]
     fn finalize_prepared_write_success_owns_handle_and_drop_closes_it() {
         let snapshot = base_device();
@@ -1334,26 +1356,23 @@ mod tests {
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("drop-closes-fd");
         let raw_fd = handle.raw_fd_for_test();
-        let fd_proc_path = format!("/proc/self/fd/{raw_fd}");
 
         assert!(
-            std::path::Path::new(&fd_proc_path).exists(),
+            std::path::Path::new(&format!("/proc/self/fd/{raw_fd}")).exists(),
             "fd should still be open before finalize_prepared_write"
         );
 
         let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
 
+        let target_before_drop = linux_access::fd_proc_target_for_test(raw_fd);
         assert!(
-            std::path::Path::new(&fd_proc_path).exists(),
+            target_before_drop.is_some(),
             "fd should still be open while PreparedWrite is alive"
         );
 
         drop(prepared);
 
-        assert!(
-            !std::path::Path::new(&fd_proc_path).exists(),
-            "fd should be closed once PreparedWrite is dropped"
-        );
+        linux_access::assert_fd_closed_for_test(raw_fd, target_before_drop.as_deref());
     }
 
     // ActiveWrite A/B. `begin()` consumes a PreparedWrite and carries its
@@ -1386,7 +1405,12 @@ mod tests {
     // duplication anywhere (no dup()/try_clone()): it stays open for the
     // entire lifetime of the ActiveWrite, and closes via ordinary RAII
     // exactly when the ActiveWrite itself is dropped -- not before, not
-    // after.
+    // after. Uses the fd-number-reuse-proof close check (see
+    // `linux_access::assert_fd_closed_for_test`'s doc comment): this exact
+    // test previously failed once under `cargo test`'s parallel execution
+    // because a naive "does /proc/self/fd/<n> still exist" check was fooled
+    // by the OS reusing the just-closed fd number for an unrelated fd before
+    // the check ran.
     #[test]
     fn active_write_holds_moved_fd_until_dropped() {
         let snapshot = base_device();
@@ -1397,25 +1421,22 @@ mod tests {
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("active-drop-closes-fd");
         let raw_fd = handle.raw_fd_for_test();
-        let fd_proc_path = format!("/proc/self/fd/{raw_fd}");
 
         let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
         assert!(
-            std::path::Path::new(&fd_proc_path).exists(),
+            std::path::Path::new(&format!("/proc/self/fd/{raw_fd}")).exists(),
             "fd should still be open right after finalize_prepared_write"
         );
 
         let active = prepared.begin();
+        let target_before_drop = linux_access::fd_proc_target_for_test(raw_fd);
         assert!(
-            std::path::Path::new(&fd_proc_path).exists(),
+            target_before_drop.is_some(),
             "fd should still be open once ownership has moved into ActiveWrite"
         );
 
         drop(active);
-        assert!(
-            !std::path::Path::new(&fd_proc_path).exists(),
-            "fd should be closed once ActiveWrite is dropped"
-        );
+        linux_access::assert_fd_closed_for_test(raw_fd, target_before_drop.as_deref());
     }
 
     // ActiveWrite C/D/E/F. `writer_target()` yields a genuine `std::io::Write`

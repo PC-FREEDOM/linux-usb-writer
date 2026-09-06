@@ -71,6 +71,43 @@ impl Write for ActiveWriteTarget<'_> {
     }
 }
 
+// A narrow, single-purpose borrow of the underlying `File` for durability
+// operations only: the only thing in this crate that can ask the OS to
+// flush a Gate-passed handle's data toward physical storage. Exposes
+// exactly `sync_all()` and nothing else -- no `Read`, no `Write`, no `Seek`,
+// no way to recover the raw fd or a plain `File`. Unlike `ActiveWriteTarget`
+// (which needs `&mut File` because `Write` requires exclusive access),
+// `File::sync_all()` only needs `&File` -- this borrows shared, not
+// exclusive.
+//
+// `pub(crate)`, not `pub`, for the same reason as `ActiveWriteTarget`: the
+// intended (and, as of this revision, only actual) caller is
+// `core::ActiveWrite::sync_target()`. See `ActiveWriteTarget`'s doc comment
+// for why "only core::ActiveWrite calls this" is a documented convention
+// rather than something Rust's visibility system can enforce across sibling
+// modules -- the same limitation applies here.
+//
+// IMPORTANT CAVEAT: `File::sync_all()` (which calls `fsync()` on Linux) is a
+// *candidate* durability primitive, not a confirmed final answer for block
+// device durability. Whether it is sufficient to guarantee data has reached
+// physical USB/SD/NVMe media -- accounting for drive-side write caches,
+// firmware behavior, and any block-device-specific kernel/UDisks2 semantics
+// -- has not been verified against official documentation; that
+// verification is separate, future work. Nothing in this crate should be
+// read as claiming that `sync_all()` returning `Ok` means a write is
+// physically durable on real media.
+#[allow(dead_code)] // exercised by core.rs's/write_job.rs's tests today; not yet called from any non-test code path.
+pub(crate) struct SyncTarget<'a> {
+    file: &'a File,
+}
+
+impl SyncTarget<'_> {
+    #[allow(dead_code)] // exercised by core.rs's/write_job.rs's tests today; not yet called from any non-test code path.
+    pub(crate) fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
 #[derive(Debug)]
 pub struct FdMetadata {
     pub major: u32,
@@ -185,6 +222,19 @@ impl OpenedDeviceHandle {
         }
     }
 
+    // Hands out a short-lived, sync-only borrow of the underlying File --
+    // the one and only place in this crate where a durability-sync
+    // capability for a Gate-passed FD can be created. Takes `&self`
+    // (shared), not `&mut self`: unlike `writer_target()` (exclusive,
+    // because `Write` mutates), `File::sync_all()` only needs a shared
+    // reference. `pub(crate)` keeps it from ever being reachable outside
+    // this crate; see `SyncTarget`'s doc comment for the caller convention
+    // and the block-device durability caveat.
+    #[allow(dead_code)] // exercised by core.rs's/write_job.rs's tests today; not yet called from any non-test code path.
+    pub(crate) fn sync_target(&self) -> SyncTarget<'_> {
+        SyncTarget { file: &self.file }
+    }
+
     // Read-only metadata about the FD itself: no reads or writes of device
     // *contents* are performed, only kernel bookkeeping (fstat, ioctl,
     // /proc/self/fd).
@@ -211,4 +261,44 @@ impl OpenedDeviceHandle {
 // visible instead of relying on an implicit Drop.
 pub fn close_without_writing(handle: OpenedDeviceHandle) {
     drop(handle.file);
+}
+
+// Test-only fd-closure observation helpers, shared by every test module in
+// this crate that needs to confirm a Gate-passed fd was actually closed
+// (`core.rs`'s and `write_job.rs`'s tests both use these). `cfg(test)` +
+// `pub(crate)` keep them out of any real build, same as `from_file_for_test`
+// and `raw_fd_for_test` above.
+//
+// A naive "does /proc/self/fd/<n> still exist" check after a drop is
+// flaky: if the OS hands that same fd number to an unrelated fd before the
+// check runs (a real possibility under `cargo test`'s parallel execution --
+// this was observed at least once in practice), the path exists again and a
+// naive check wrongly concludes "still open" even though the original fd
+// was genuinely closed. Comparing the symlink's *target*, not just its
+// existence, distinguishes the two cases:
+//   A. the symlink is gone entirely -> closed, unambiguously.
+//   B. the symlink exists but now resolves to a different target than
+//      before the drop -> the number was reused by an unrelated fd, which
+//      can only happen once the original was actually closed -> closed.
+//   C. the symlink exists and still resolves to the exact same target as
+//      before the drop -> the fd was never actually closed.
+#[cfg(test)]
+pub(crate) fn fd_proc_target_for_test(raw_fd: RawFd) -> Option<String> {
+    std::fs::read_link(format!("/proc/self/fd/{raw_fd}"))
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+// Call after dropping whatever owned `raw_fd`, passing the target captured
+// (via `fd_proc_target_for_test`) *before* the drop. Panics only for case C
+// above -- the one case that actually proves the fd was never closed.
+#[cfg(test)]
+pub(crate) fn assert_fd_closed_for_test(raw_fd: RawFd, target_before_drop: Option<&str>) {
+    if let Some(after) = fd_proc_target_for_test(raw_fd) {
+        assert_ne!(
+            target_before_drop,
+            Some(after.as_str()),
+            "fd {raw_fd} still resolves to the same target ({after}) after drop -- it was not closed"
+        );
+    }
 }

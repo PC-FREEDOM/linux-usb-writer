@@ -1,6 +1,7 @@
 mod core;
 mod device;
 mod identity;
+mod image_source;
 mod linux_access;
 mod linux_backend;
 mod linux_monitor;

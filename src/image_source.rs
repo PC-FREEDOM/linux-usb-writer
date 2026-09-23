@@ -14,32 +14,40 @@
 // I/O involved) -- `ImageSource` answers "given that choice, how do I
 // actually read its bytes?" `ImageGeneration` minting and Selection-event
 // bookkeeping stay entirely on the `ImageSelection` side; nothing here
-// mints a generation or tracks a selection event. (A future type that
-// binds a confirmed `ImageSelection` to the specific `ImageSource` it was
-// computed from -- so the two can't be mismatched the way a caller could
-// otherwise pair one image's `ImageSelection` with a different image's
-// `ImageSource` -- is a plausible future need; see `reports/latest.md`.)
+// mints a generation or tracks a selection event. `SelectedImage` (below)
+// is the type that binds a confirmed `ImageSelection` to the specific
+// `ImageSource` it was computed from, so the two can't be mismatched the
+// way a caller could otherwise pair one image's `ImageSelection` with a
+// different image's `ImageSource` -- see its own doc comment. Whether a
+// specific `SelectedImage` matches what a Gate-authorized write actually
+// confirmed is a further check `write_job.rs`'s `AuthorizedExecution::
+// bind()` performs, immediately before a write starts; that binding
+// capability lives in `write_job.rs`, not here (see "Not implemented here"
+// below).
 //
 // The central capability this module exists to provide: **fresh readers
-// over a fixed file identity**. Today's write path (`write_job::start()`)
-// takes a single, already-owned `R: Read` and consumes it once. A future
-// Full Verify needs to read the same logical image a second time (write
-// once, then read-back-compare against the target) -- which a single,
-// already-consumed `Read` cannot do. `ImageSource::open_reader()` can be
-// called any number of times, and each call returns an independent reader
-// that starts at the image's beginning, unaffected by how far any
-// previously returned reader was read -- and, critically, every reader
-// reads the exact same underlying file description `FileImageSource::new`
-// originally opened, never a fresh `File::open()` of whatever the path
-// currently resolves to. See `FileImageSource`'s doc comment for why this
-// matters and exactly what it does/doesn't guarantee.
+// over a fixed file identity**. `write_job::AuthorizedExecution::
+// begin_write()` (the only production caller of `open_reader()` this
+// revision has) takes a single, already-owned reader and consumes it once
+// per write attempt. A future Full Verify needs to read the same logical
+// image a second time (write once, then read-back-compare against the
+// target) -- which a single, already-consumed `Read` cannot do.
+// `ImageSource::open_reader()` can be called any number of times, and each
+// call returns an independent reader that starts at the image's beginning,
+// unaffected by how far any previously returned reader was read -- and,
+// critically, every reader reads the exact same underlying file description
+// `FileImageSource::new` originally opened, never a fresh `File::open()` of
+// whatever the path currently resolves to. See `FileImageSource`'s doc
+// comment for why this matters and exactly what it does/doesn't guarantee.
 //
 // Not implemented here (deliberately out of scope this revision): wiring
-// this trait into `write_job::start()`'s production call sites, a
-// compressed (gzip/xz) `ImageSource` implementation, a URL/network
-// `ImageSource` implementation, and any `Verifying`/Quick-Verify/Full-Verify
-// logic that would consume a second `open_reader()` call. Only the
-// abstraction itself, plus a single plain-file implementation, exist below.
+// `write_job::AuthorizedExecution`/`WritingExecution` into any real
+// Controller/`main.rs` production call site, a compressed (gzip/xz)
+// `ImageSource` implementation, a URL/network `ImageSource` implementation,
+// and any `Verifying`/Quick-Verify/Full-Verify logic that would consume a
+// second `open_reader()` call. Only the abstraction itself, plus a single
+// plain-file implementation and the `SelectedImage` binding type, exist
+// below.
 //
 // This whole module is therefore unreachable from any production code path
 // today (`main.rs` only declares `mod image_source;`, it never names
@@ -57,6 +65,8 @@ use std::io::{self, Read};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+use crate::core::ImageSelection;
 
 // Why `FileImageSource::new` refused to construct a source. Deliberately
 // small and specific to construction-time failures -- `open_reader()`
@@ -321,6 +331,75 @@ impl Read for FileImageReader {
         self.position += n as u64;
 
         Ok(n)
+    }
+}
+
+// Binds a single "which image, and how do I read it" choice into one value:
+// the `ImageSelection` (what/when the user chose) and the `ImageSource` (how
+// to read it) that were computed from the *same* selection event. This
+// closes the same class of gap `WriteIntent::from_selection` closes on the
+// target side: without `SelectedImage`, a caller holding an `ImageSelection`
+// and an `ImageSource` separately could freely pair them with a *different*
+// selection's counterpart (e.g. an `ImageSelection` confirmed for image A
+// alongside an `ImageSource` that actually reads image B). `SelectedImage`
+// makes that impossible to express -- the only way to ever have one is via
+// `new()`, which mints the `ImageSelection` itself, from the `ImageSource`
+// already in hand, in the same call.
+//
+// Fields are private, there is no setter, and no `Clone`/`Copy` impl: the
+// `source` is a linearly-owned `Box<dyn ImageSource>` (not `Clone`-able even
+// if we wanted to), and duplicating a `SelectedImage` would raise exactly
+// the "which copy is the real one" question this type exists to avoid. A
+// `source()` getter is deliberately not provided either -- the only
+// capabilities exposed are the ones a caller legitimately needs
+// (`selection()`/`logical_size()`/`access()`/`open_reader()`), never the raw
+// `ImageSource` itself, which would let a caller extract it and pair it with
+// a *different* `ImageSelection` by hand.
+pub struct SelectedImage {
+    selection: ImageSelection,
+    source: Box<dyn ImageSource>,
+}
+
+impl SelectedImage {
+    // The only way to construct one. Mints the `ImageSelection` (a fresh
+    // `image_generation`, unconditionally -- see `ImageSelection::new`'s own
+    // doc comment) from `source.logical_size()` in this same call, so the
+    // two can never be supplied independently by the caller. Explicitly
+    // reselecting the same path/file/size still produces a new
+    // `SelectedImage` with a new `image_generation`, because it requires a
+    // new `ImageSource` (a fresh `FileImageSource::new()` call, itself
+    // reopening the file) to call this constructor with in the first place.
+    pub fn new(source: Box<dyn ImageSource>) -> Self {
+        let selection = ImageSelection::new(source.logical_size());
+
+        SelectedImage { selection, source }
+    }
+
+    // `ImageSelection` is `Copy`; returning it by value lets a caller pass
+    // it into `WriteIntent::from_selection`/`prepare_for_open` without
+    // borrowing this `SelectedImage`. A copied-out `ImageSelection` alone
+    // cannot be used to obtain a reader -- that capability stays behind
+    // `open_reader()` below, reachable only through this `SelectedImage` (or
+    // the `source` it still owns).
+    pub fn selection(&self) -> ImageSelection {
+        self.selection
+    }
+
+    pub fn logical_size(&self) -> u64 {
+        self.selection.image_size()
+    }
+
+    pub fn access(&self) -> ImageSourceAccess {
+        self.source.access()
+    }
+
+    // Delegates to `self.source.open_reader()`. Every call returns an
+    // independent, fresh reader (see `ImageSource::open_reader`'s contract);
+    // callers needing a write-time reader and a later verify-time reader
+    // call this twice on the same `SelectedImage`, never through two
+    // different `SelectedImage`/`ImageSource` values.
+    pub fn open_reader(&self) -> io::Result<Box<dyn Read>> {
+        self.source.open_reader()
     }
 }
 
@@ -602,6 +681,98 @@ mod tests {
 
         assert!((read_back.len() as u64) < source.logical_size());
         assert_eq!(read_back, original[..shrink_to as usize]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // SelectedImage
+    // ---------------------------------------------------------------------
+
+    // SelectedImage A. logical_size() matches the source's own logical_size.
+    #[test]
+    fn selected_image_logical_size_matches_source_logical_size() {
+        let data = vec![3u8; 9_000];
+        let path = write_temp_file("selected-logical-size", &data);
+        let source = FileImageSource::new(&path).unwrap();
+        let source_logical_size = source.logical_size();
+
+        let selected = SelectedImage::new(Box::new(source));
+
+        assert_eq!(selected.logical_size(), source_logical_size);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // SelectedImage B. The minted ImageSelection's image_size matches the
+    // source's logical_size exactly (they are minted together in `new()`,
+    // never supplied independently).
+    #[test]
+    fn selected_image_selection_image_size_matches_source_logical_size() {
+        let data = vec![4u8; 6_500];
+        let path = write_temp_file("selected-selection-size", &data);
+        let source = FileImageSource::new(&path).unwrap();
+        let source_logical_size = source.logical_size();
+
+        let selected = SelectedImage::new(Box::new(source));
+
+        assert_eq!(selected.selection().image_size(), source_logical_size);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // SelectedImage C. open_reader() called twice on the same SelectedImage
+    // each produce an independent, fresh reader (delegates straight through
+    // to the underlying ImageSource, whose own fresh-reader contract is
+    // already covered above).
+    #[test]
+    fn selected_image_open_reader_called_twice_reads_full_content_each_time() {
+        let data: Vec<u8> = (0..3300u32).map(|i| (i % 211) as u8).collect();
+        let path = write_temp_file("selected-fresh-reader", &data);
+        let source = FileImageSource::new(&path).unwrap();
+        let selected = SelectedImage::new(Box::new(source));
+
+        let first = read_all(selected.open_reader().unwrap());
+        let second = read_all(selected.open_reader().unwrap());
+
+        assert_eq!(first, data);
+        assert_eq!(second, data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // SelectedImage D. Explicitly reselecting the exact same file (a fresh
+    // FileImageSource::new() over the same path) and wrapping it in a new
+    // SelectedImage mints a new image_generation -- mirrors
+    // `ImageSelection::new`'s own "always mints, even for the identical
+    // choice" contract, now carried through `SelectedImage::new()`.
+    #[test]
+    fn selected_image_explicit_reselect_of_same_file_mints_a_new_generation() {
+        let data = vec![5u8; 2048];
+        let path = write_temp_file("selected-reselect", &data);
+
+        let source_a = FileImageSource::new(&path).unwrap();
+        let selected_a = SelectedImage::new(Box::new(source_a));
+
+        let source_b = FileImageSource::new(&path).unwrap();
+        let selected_b = SelectedImage::new(Box::new(source_b));
+
+        assert_ne!(
+            selected_a.selection().image_generation(),
+            selected_b.selection().image_generation()
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // SelectedImage E. A zero-byte source still produces a SelectedImage;
+    // rejecting it as unusable-for-writing is `writer::WritePlan::new`'s
+    // job, not `SelectedImage`'s or `FileImageSource`'s -- see
+    // `FileImageSource::new`'s doc comment for the same responsibility split.
+    #[test]
+    fn selected_image_accepts_zero_size_source() {
+        let path = write_temp_file("selected-zero-byte", &[]);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let selected = SelectedImage::new(Box::new(source));
+
+        assert_eq!(selected.logical_size(), 0);
+        assert_eq!(selected.selection().image_size(), 0);
         let _ = std::fs::remove_file(&path);
     }
 }

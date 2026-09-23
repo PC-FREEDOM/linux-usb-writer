@@ -6,12 +6,31 @@
 // relays its progress, and translates the outcome into a small state
 // machine.
 //
+// This module also owns the *execution binding* between a Gate-authorized
+// write (`core::AuthorizedWrite`) and a confirmed image input
+// (`image_source::SelectedImage`): `ImageBindingError`/`AuthorizedExecution`/
+// `WriteStart`/`WritingExecution` (below) exist so that starting a real
+// `Writing` is reachable only by first proving, via
+// `AuthorizedExecution::bind()`, that the `AuthorizedWrite` and the
+// `SelectedImage` come from the same confirmed selection event
+// (`image_generation` match) -- see those types' own doc comments for the
+// full reasoning. This is a one-directional dependency
+// (`write_job.rs -> image_source.rs`, for `SelectedImage`/`ImageSource`
+// only); `image_source.rs` never depends back on `write_job.rs`.
+//
 // State progression implemented in this revision (each arrow consumes the
 // value on its left -- there is no method anywhere in this module that goes
 // backwards):
 //
-//   ActiveWrite
-//       |  (start(): consumes ActiveWrite)
+//   core::AuthorizedWrite + image_source::SelectedImage
+//       |  (AuthorizedExecution::bind(): checks image_generation/image_size)
+//       v
+//   AuthorizedExecution
+//       |  (begin_write(self, cancel): opens a reader from the *same*
+//       |   SelectedImage, builds a private WriteStart, calls start_inner())
+//       v
+//   WritingExecution { writing: Writing<Box<dyn Read>>, image: SelectedImage }
+//       |  (holds `image` alive for a future write/verify; see doc comment)
 //       v
 //   Writing<R>
 //       |  (write(self): consumes Writing, calls writer::write() exactly once)
@@ -66,6 +85,7 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use crate::core::{ActiveWrite, AuthorizedWrite, VerifyMode};
+use crate::image_source::SelectedImage;
 use crate::writer::{self, WriteError, WritePlan, WriteProgress};
 
 const CANCEL_NONE: u8 = 0;
@@ -362,7 +382,17 @@ pub struct Writing<R: Read> {
 // is moved, never cloned (`ActiveWrite` is not `Clone`/`Copy`), and
 // `writer_target()` (called later, inside `Writing::write`) only ever
 // borrows it.
-pub fn start<R: Read>(authorized: AuthorizedWrite, source: R, cancel: CancelHandle) -> Writing<R> {
+//
+// Deliberately NOT `pub`/`pub(crate)`: `authorized` and `source` are still
+// two independent parameters here, which is exactly the shape
+// `AuthorizedExecution::bind()`/`WriteStart` (below) exist to make
+// unreachable from outside this module. This plain-private function is the
+// one place that shape is still allowed to exist -- reachable only from
+// `AuthorizedExecution::begin_write()` (same module, below) and this
+// module's own `#[cfg(test)]` tests (a plain-private `fn` is visible to a
+// module's descendants, and `mod tests` is one), never from any sibling
+// module such as `image_source.rs`.
+fn start_inner<R: Read>(authorized: AuthorizedWrite, source: R, cancel: CancelHandle) -> Writing<R> {
     let (active, plan, verify_mode) = authorized.into_parts();
 
     Writing {
@@ -372,6 +402,154 @@ pub fn start<R: Read>(authorized: AuthorizedWrite, source: R, cancel: CancelHand
         source,
         cancel,
     }
+}
+
+// Why `AuthorizedExecution::bind()` refused to bind an `AuthorizedWrite` to a
+// `SelectedImage`. Deliberately just 2 variants -- not a cryptographic
+// content check, and not meant to be: `GenerationMismatch` is the real,
+// reachable case (the image was reselected, or a stale `AuthorizedWrite`
+// from an earlier Gate pass is being reused against a newer selection).
+// `SizeMismatch` is defense-in-depth only: `image_generation` and
+// `image_size` are always minted together, atomically, by
+// `core::ImageSelection::new()` (see its own doc comment), so a matching
+// generation already implies a matching size by construction -- this
+// variant exists to fail loudly (an `Err`, not a silent proceed) if that
+// invariant is ever violated by a future bug, not because it is expected to
+// ever actually fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImageBindingError {
+    GenerationMismatch,
+    SizeMismatch,
+}
+
+// Proof that a Gate-authorized write (`AuthorizedWrite`) and a confirmed
+// image input (`SelectedImage`) come from the *same* confirmed selection
+// event, checked immediately before a write starts. Closes the gap
+// `SelectedImage` alone cannot: `SelectedImage` only guarantees its own
+// `ImageSelection` and `ImageSource` were minted together, but says nothing
+// about whether it is the *same* `SelectedImage` the Gate's confirmation was
+// made against -- a caller could still call `WriteIntent::from_selection`
+// with one `SelectedImage`'s `.selection()` and later try to start a write
+// with a *different* `SelectedImage`'s reader. `bind()` is the point where
+// an actual `SelectedImage` is first compared against the frozen,
+// Gate-carried `image_generation` (see `core::AuthorizedWrite::
+// image_generation()`'s doc comment).
+//
+// Fields are private, there is no setter, and no `Clone`/`Copy` impl (the
+// same reasoning as `SelectedImage`'s own doc comment: `authorized` owns an
+// FD, `image` owns a `Box<dyn ImageSource>`, and duplicating either would
+// raise the same "which copy is real" question). `bind()` is the only
+// public constructor; on success it holds both `authorized`/`image`
+// *whole*, never decomposed -- there is no public way to pull them back
+// apart and recombine them with something else (`begin_write()` below
+// consumes `self` entirely, it does not expose the pieces).
+pub struct AuthorizedExecution {
+    authorized: AuthorizedWrite,
+    image: SelectedImage,
+}
+
+impl AuthorizedExecution {
+    // Checks `image_generation` first (the real identity判定) and only then
+    // `image_size` (defense-in-depth, see `ImageBindingError`'s doc
+    // comment) -- not content hashing, and not a guarantee that the two
+    // values' underlying bytes are identical, only that they were minted
+    // from the same explicit selection event.
+    pub fn bind(authorized: AuthorizedWrite, image: SelectedImage) -> Result<Self, ImageBindingError> {
+        if authorized.image_generation() != image.selection().image_generation() {
+            return Err(ImageBindingError::GenerationMismatch);
+        }
+
+        if authorized.image_size() != image.logical_size() {
+            return Err(ImageBindingError::SizeMismatch);
+        }
+
+        Ok(AuthorizedExecution { authorized, image })
+    }
+
+    // Consumes this `AuthorizedExecution` to start the one write it was
+    // bound for. Opens a reader from `self.image` (the *same* `SelectedImage`
+    // that was proven, in `bind()`, to match `self.authorized`'s confirmed
+    // `image_generation`) -- the caller has no way to supply a different
+    // reader, since this method takes no reader parameter at all. Builds a
+    // private `WriteStart` purely to hand its two fields to `start_inner()`
+    // in one line; `WriteStart` is never returned or exposed outside this
+    // function.
+    //
+    // On success, `WritingExecution` keeps `self.image` alive alongside the
+    // resulting `Writing`, so a future write/verify orchestration can still
+    // reach the same `SelectedImage` for a second, verify-time
+    // `open_reader()` call once write/sync complete (see
+    // `WritingExecution`'s own doc comment).
+    //
+    // On failure (`self.image.open_reader()` returning an `io::Error`),
+    // `self` -- and everything it owns, including `self.authorized`'s FD --
+    // is dropped via the early `?` return; ordinary RAII closes the target
+    // FD exactly like every other Gate-rejection path in this crate. No
+    // write is attempted, 0 bytes reach the target, and (matching every
+    // other failure path in this module) a retry requires a fresh Gate pass
+    // and a fresh `SelectedImage`, since both `self.authorized` and
+    // `self.image` are gone.
+    pub fn begin_write(self, cancel: CancelHandle) -> io::Result<WritingExecution> {
+        let reader = self.image.open_reader()?;
+
+        let start = WriteStart {
+            authorized: self.authorized,
+            reader,
+        };
+
+        let writing = start_inner(start.authorized, start.reader, cancel);
+
+        Ok(WritingExecution {
+            writing,
+            image: self.image,
+        })
+    }
+}
+
+// A momentary, module-internal value: proof that an `AuthorizedWrite` and a
+// `Box<dyn Read>` were paired inside this module, immediately before being
+// handed to `start_inner()`. Carries no logic of its own -- the actual
+// generation/size check already happened in `AuthorizedExecution::bind()`;
+// this type exists only to give `authorized`+`reader` a single, private
+// struct-literal construction site.
+//
+// No `pub`, no constructor beyond the plain struct literal inside
+// `begin_write()` above (the only place in this file that writes
+// `WriteStart { ... }`), no getters, no `into_parts()`. Rust's field
+// visibility rule (private = visible within the defining module and its
+// descendants) means this struct literal can only ever be written inside
+// `write_job.rs` itself -- not `image_source.rs`, not `main.rs`, not any
+// other sibling module. This is a *module*-level guarantee, not a
+// function-level one: nothing about Rust's visibility system singles out
+// `begin_write()` specifically as the only permitted caller, only
+// `write_job.rs` as the only permitted module. `begin_write()` happens to be
+// the only code in this file that ever does construct one, which is what
+// actually makes it the sole creation path in practice.
+struct WriteStart {
+    authorized: AuthorizedWrite,
+    reader: Box<dyn Read>,
+}
+
+// The result of `AuthorizedExecution::begin_write()`: an in-progress
+// `Writing`, paired with the exact `SelectedImage` it was authorized
+// against. Deliberately minimal -- this revision does not implement
+// Verifying, so `WritingExecution` does not yet grow a full write/sync/
+// verify orchestration API (a public `into_parts()`-style decomposition is
+// deliberately not added either, for the same reason `AuthorizedExecution`
+// does not expose one: pulling `writing`/`image` apart would let a caller
+// recombine either with something unrelated).
+//
+// `image` staying alive here (rather than being dropped once `writing`
+// starts) is the whole point: a future write/sync/verify orchestration
+// needs `image.open_reader()` a second time, once write and sync have
+// completed, to compare the target's content back against the *same*
+// confirmed image -- not a freshly supplied, potentially different one.
+// Neither field is exposed publicly in this revision; any access needed by
+// this module's own tests uses plain field access from within `write_job.rs`
+// itself.
+pub struct WritingExecution {
+    writing: Writing<Box<dyn Read>>,
+    image: SelectedImage,
 }
 
 impl<R: Read> Writing<R> {
@@ -492,7 +670,7 @@ impl WriteSucceeded {
     // the same "consumed exactly once" guarantee `PreparedWrite::begin()`
     // provides. No fd is duplicated: `active` moves straight from
     // `WriteSucceeded` into `Syncing`, unwrapped and un-dropped. A plain
-    // method (not a free function like `start()`) because, unlike
+    // method (not a free function like `start_inner()`) because, unlike
     // `Writing`, `Syncing` needs no additional caller-supplied input beyond
     // what `WriteSucceeded` already carries -- the same reasoning that makes
     // `PreparedWrite::begin(self) -> ActiveWrite` a method rather than a
@@ -599,6 +777,7 @@ mod tests {
     use super::*;
     use crate::core::{self, ConfirmationToken};
     use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
+    use crate::image_source::{FileImageSource, ImageSource, ImageSourceAccess};
     use crate::linux_access::{FdMetadata, OpenedDeviceHandle};
     use std::io::Cursor;
 
@@ -645,13 +824,31 @@ mod tests {
     // -- against a plain, throwaway regular file, never a block device,
     // never real D-Bus/OpenDevice. Returns the resulting `AuthorizedWrite`
     // (bundling the `ActiveWrite`, `WritePlan`, and `VerifyMode` the Gate
-    // verified) -- the exact value `write_job::start()` now requires.
+    // verified) -- the exact value `start_inner()` (via `AuthorizedExecution::begin_write()`) now requires.
     // `persistent` selects whether the temp file's directory entry survives
     // (needed only by tests that reopen it by path afterward to check
     // written content).
     fn gate_pass_active_write(
         tag: &str,
         image_size: u64,
+        target_size: u64,
+        persistent: bool,
+    ) -> (Option<std::path::PathBuf>, AuthorizedWrite) {
+        let image = core::ImageSelection::new(image_size);
+        gate_pass_active_write_for_image(tag, image, target_size, persistent)
+    }
+
+    // Like `gate_pass_active_write`, but threads a caller-supplied
+    // `ImageSelection` (typically obtained via an existing `SelectedImage`'s
+    // `.selection()`) through the same Gate sequence instead of minting a
+    // fresh one internally. Needed so `AuthorizedExecution::bind()` tests
+    // can produce an `AuthorizedWrite` whose confirmed `image_generation` is
+    // provably the *same* generation a specific `SelectedImage` already
+    // holds (for a successful bind), or provably a *different* one (for a
+    // mismatch).
+    fn gate_pass_active_write_for_image(
+        tag: &str,
+        image: core::ImageSelection,
         target_size: u64,
         persistent: bool,
     ) -> (Option<std::path::PathBuf>, AuthorizedWrite) {
@@ -662,7 +859,6 @@ mod tests {
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
-        let image = core::ImageSelection::new(image_size);
         let verify_mode = VerifyMode::None;
         let intent = core::write_intent_for_test(
             &snapshot,
@@ -713,7 +909,7 @@ mod tests {
     ) -> (Option<std::path::PathBuf>, WriteSucceeded) {
         let (path, authorized) = gate_pass_active_write(tag, image_size, target_size, persistent);
         let data = vec![6u8; image_size as usize];
-        let writing = start(authorized, Cursor::new(data), CancelHandle::new());
+        let writing = start_inner(authorized, Cursor::new(data), CancelHandle::new());
 
         let outcome = writing.write(|_| {});
         let succeeded = match outcome {
@@ -724,8 +920,8 @@ mod tests {
         (path, succeeded)
     }
 
-    // A. `start()` consumes `active` by value: this compiles only because
-    // `active` moves into `start`. There is no runtime assertion that could
+    // A. `start_inner()` consumes `active` by value: this compiles only because
+    // `active` moves into `start_inner`. There is no runtime assertion that could
     // prove "the original ActiveWrite cannot be reused" beyond the fact that
     // this test never refers to it again after this line -- the Rust
     // ownership/borrow checker is the actual enforcement mechanism.
@@ -735,7 +931,7 @@ mod tests {
         let source = Cursor::new(vec![0u8; 10]);
         let cancel = CancelHandle::new();
 
-        let _writing: Writing<Cursor<Vec<u8>>> = start(authorized, source, cancel);
+        let _writing: Writing<Cursor<Vec<u8>>> = start_inner(authorized, source, cancel);
         // `authorized` is not, and cannot be, referred to again here.
     }
 
@@ -752,7 +948,7 @@ mod tests {
             gate_pass_active_write("success", image_size, target_size, true);
         let path = path.expect("persistent temp file path");
 
-        let writing = start(authorized, Cursor::new(SOURCE.to_vec()), CancelHandle::new());
+        let writing = start_inner(authorized, Cursor::new(SOURCE.to_vec()), CancelHandle::new());
         let outcome = writing.write(|_| {});
 
         let succeeded = match outcome {
@@ -785,7 +981,7 @@ mod tests {
         let cancel = CancelHandle::new();
         cancel.request_cancel(CancelReason::UserRequested);
 
-        let writing = start(authorized, Cursor::new(vec![1u8; image_size as usize]), cancel);
+        let writing = start_inner(authorized, Cursor::new(vec![1u8; image_size as usize]), cancel);
         let outcome = writing.write(|_| {});
 
         let cancelled = match outcome {
@@ -810,7 +1006,7 @@ mod tests {
             gate_pass_active_write("cancel-partial", image_size, target_size, false);
 
         let cancel = CancelHandle::new();
-        let writing = start(
+        let writing = start_inner(
             authorized,
             Cursor::new(vec![2u8; image_size as usize]),
             cancel.clone(),
@@ -846,7 +1042,7 @@ mod tests {
             gate_pass_active_write("source-short", image_size, target_size, false);
 
         let short_source = vec![3u8; 400];
-        let writing = start(authorized, Cursor::new(short_source), CancelHandle::new());
+        let writing = start_inner(authorized, Cursor::new(short_source), CancelHandle::new());
         let outcome = writing.write(|_| {});
 
         let failed = match outcome {
@@ -913,7 +1109,7 @@ mod tests {
         let authorized = prepared.begin();
 
         let source = Cursor::new(vec![7u8; image_size as usize]);
-        let writing = start(authorized, source, CancelHandle::new());
+        let writing = start_inner(authorized, source, CancelHandle::new());
         let outcome = writing.write(|_| {});
 
         let _ = std::fs::remove_file(&path);
@@ -944,7 +1140,7 @@ mod tests {
             gate_pass_active_write("progress", image_size, target_size, false);
         let data = vec![5u8; image_size as usize];
 
-        let writing = start(authorized, Cursor::new(data), CancelHandle::new());
+        let writing = start_inner(authorized, Cursor::new(data), CancelHandle::new());
 
         let mut progress_log = Vec::new();
         let outcome = writing.write(|progress| progress_log.push(progress.bytes_written));
@@ -1071,7 +1267,7 @@ mod tests {
         let authorized = prepared.begin();
 
         let data = vec![8u8; image_size as usize];
-        let writing = start(authorized, Cursor::new(data), CancelHandle::new());
+        let writing = start_inner(authorized, Cursor::new(data), CancelHandle::new());
         let outcome = writing.write(|_| {});
         let succeeded = match outcome {
             WriteAttemptOutcome::Succeeded(s) => s,
@@ -1102,5 +1298,258 @@ mod tests {
 
         // J: closed once SyncSucceeded is dropped.
         crate::linux_access::assert_fd_closed_for_test(raw_fd, target_before_drop.as_deref());
+    }
+
+    // ---------------------------------------------------------------------
+    // AuthorizedExecution::bind() / begin_write()
+    // ---------------------------------------------------------------------
+
+    fn write_temp_image_file(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+
+        let path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-write-job-binding-test-{tag}-{}-{id}.tmp",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temp image file for binding test");
+        path
+    }
+
+    // A minimal `ImageSource` whose `open_reader()` always fails, used only
+    // to exercise `begin_write()`'s error path (test M below). No real
+    // `FileImageSource` can be made to fail here on demand: it deliberately
+    // never re-opens its path (see its own doc comment), so deleting or
+    // otherwise tampering with the file after construction does not make
+    // its `open_reader()` fail either.
+    struct FailingImageSource {
+        logical_size: u64,
+    }
+
+    impl ImageSource for FailingImageSource {
+        fn logical_size(&self) -> u64 {
+            self.logical_size
+        }
+
+        fn access(&self) -> ImageSourceAccess {
+            ImageSourceAccess::SequentialReplay
+        }
+
+        fn open_reader(&self) -> io::Result<Box<dyn Read>> {
+            Err(io::Error::other("simulated image open failure"))
+        }
+    }
+
+    // F. An AuthorizedWrite confirmed against a SelectedImage's own
+    // selection() binds successfully with that same SelectedImage.
+    #[test]
+    fn authorized_execution_bind_succeeds_for_matching_generation_and_size() {
+        let data = vec![1u8; 4096];
+        let path = write_temp_image_file("bind-success", &data);
+        let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+
+        let (_target_path, authorized) = gate_pass_active_write_for_image(
+            "bind-success-target",
+            selected.selection(),
+            data.len() as u64,
+            false,
+        );
+
+        let result = AuthorizedExecution::bind(authorized, selected);
+
+        assert!(result.is_ok());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // G / same-size different image (the core safety condition this
+    // session's design exists to close). Image A and Image B happen to be
+    // the exact same size but have different content and therefore
+    // different image_generations -- binding an AuthorizedWrite confirmed
+    // for A against SelectedImage B must be rejected.
+    #[test]
+    fn authorized_execution_bind_rejects_same_size_different_image() {
+        let data_a = vec![1u8; 4096];
+        let data_b = vec![2u8; 4096];
+        let path_a = write_temp_image_file("bind-diff-a", &data_a);
+        let path_b = write_temp_image_file("bind-diff-b", &data_b);
+
+        let selected_a = SelectedImage::new(Box::new(FileImageSource::new(&path_a).unwrap()));
+        let selected_b = SelectedImage::new(Box::new(FileImageSource::new(&path_b).unwrap()));
+
+        let (_target_path, authorized_for_a) = gate_pass_active_write_for_image(
+            "bind-diff-target",
+            selected_a.selection(),
+            data_a.len() as u64,
+            false,
+        );
+
+        let result = AuthorizedExecution::bind(authorized_for_a, selected_b);
+
+        assert!(matches!(result, Err(ImageBindingError::GenerationMismatch)));
+        let _ = std::fs::remove_file(&path_a);
+        let _ = std::fs::remove_file(&path_b);
+    }
+
+    // H. Explicitly reselecting the exact same file (a fresh
+    // FileImageSource::new() over the same path, hence a fresh
+    // SelectedImage) still mints a new image_generation -- binding an old
+    // AuthorizedWrite against the reselected SelectedImage is rejected.
+    #[test]
+    fn authorized_execution_bind_rejects_after_explicit_reselect_of_same_file() {
+        let data = vec![3u8; 2048];
+        let path = write_temp_image_file("bind-reselect", &data);
+
+        let selected_a = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+        let (_target_path, authorized_for_a) = gate_pass_active_write_for_image(
+            "bind-reselect-target",
+            selected_a.selection(),
+            data.len() as u64,
+            false,
+        );
+
+        let selected_b = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+
+        let result = AuthorizedExecution::bind(authorized_for_a, selected_b);
+
+        assert!(matches!(result, Err(ImageBindingError::GenerationMismatch)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // I. A stale AuthorizedWrite (confirmed against an old SelectedImage)
+    // must not bind against a completely new, later selection -- a
+    // different path, different content, different size. Generation is
+    // checked first (see `AuthorizedExecution::bind`'s doc comment), so this
+    // is rejected before size is ever compared.
+    #[test]
+    fn authorized_execution_bind_rejects_stale_authorized_write_against_new_selection() {
+        let old_data = vec![4u8; 1024];
+        let old_path = write_temp_image_file("bind-stale-old", &old_data);
+        let selected_old = SelectedImage::new(Box::new(FileImageSource::new(&old_path).unwrap()));
+
+        let (_target_path, authorized_for_old) = gate_pass_active_write_for_image(
+            "bind-stale-target",
+            selected_old.selection(),
+            old_data.len() as u64,
+            false,
+        );
+
+        // Time passes; the user selects a brand new image (different path,
+        // different size).
+        let new_data = vec![5u8; 5000];
+        let new_path = write_temp_image_file("bind-stale-new", &new_data);
+        let selected_new = SelectedImage::new(Box::new(FileImageSource::new(&new_path).unwrap()));
+
+        let result = AuthorizedExecution::bind(authorized_for_old, selected_new);
+
+        assert!(matches!(result, Err(ImageBindingError::GenerationMismatch)));
+        let _ = std::fs::remove_file(&old_path);
+        let _ = std::fs::remove_file(&new_path);
+    }
+
+    // J (size mismatch). Not implemented as a runtime test: `image_size`
+    // and `image_generation` are always minted together, atomically, by
+    // `core::ImageSelection::new()` (see `ImageBindingError`'s doc
+    // comment), so a matching generation already implies a matching size --
+    // there is no way to reach `ImageBindingError::SizeMismatch` through
+    // the real, production `SelectedImage`/`AuthorizedWrite` construction
+    // paths without adding a test-only backdoor constructor that weakens
+    // those types' own invariants. Per this session's instructions, no such
+    // backdoor is added; `SizeMismatch` remains a structurally-unreachable
+    // defense-in-depth check, documented as such rather than forced into a
+    // test.
+
+    // K / L. A successful bind followed by begin_write() produces a
+    // WritingExecution whose Writing, once run, writes exactly the source
+    // image's content to the target -- proving the reader begin_write()
+    // used came from the same SelectedImage bind() was given, not a
+    // separately supplied one (there is no reader parameter to supply one
+    // through in the first place).
+    #[test]
+    fn begin_write_uses_a_reader_from_the_same_selected_image() {
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 250) as u8).collect();
+        let path = write_temp_image_file("begin-write-reader", &data);
+        let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+
+        let (target_path, authorized) = gate_pass_active_write_for_image(
+            "begin-write-target",
+            selected.selection(),
+            data.len() as u64,
+            true,
+        );
+        let target_path = target_path.expect("persistent temp target path");
+
+        let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+        let writing_execution = execution.begin_write(CancelHandle::new()).unwrap();
+
+        let outcome = writing_execution.writing.write(|_| {});
+        let succeeded = match outcome {
+            WriteAttemptOutcome::Succeeded(s) => s,
+            other => panic!("expected Succeeded, got {other:?}"),
+        };
+        assert_eq!(succeeded.bytes_written, data.len() as u64);
+
+        let written = std::fs::read(&target_path).expect("reopen target temp file for read-back");
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written, data);
+    }
+
+    // M. self.image.open_reader() failing inside begin_write() surfaces as
+    // an Err before any write is attempted: the target temp file (created
+    // empty by gate_pass_active_write_for_image) is left untouched at 0
+    // bytes, and the consumed AuthorizedExecution (with the target FD it
+    // owned) is safely dropped via ordinary RAII.
+    #[test]
+    fn begin_write_reader_open_failure_leaves_target_untouched() {
+        let logical_size = 4096u64;
+        let selected = SelectedImage::new(Box::new(FailingImageSource { logical_size }));
+
+        let (target_path, authorized) = gate_pass_active_write_for_image(
+            "begin-write-open-failure-target",
+            selected.selection(),
+            logical_size,
+            true,
+        );
+        let target_path = target_path.expect("persistent temp target path");
+
+        let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+
+        let result = execution.begin_write(CancelHandle::new());
+
+        assert!(result.is_err());
+
+        let target_contents = std::fs::read(&target_path).expect("reopen target temp file");
+        assert!(target_contents.is_empty(), "no bytes should have reached the target");
+        let _ = std::fs::remove_file(&target_path);
+    }
+
+    // N. WritingExecution retains the exact SelectedImage bind() was given,
+    // still independently readable after begin_write() has already opened
+    // its own write-time reader from it -- the property a future write/sync/
+    // verify orchestration needs to obtain a second, verify-time reader.
+    #[test]
+    fn writing_execution_retains_the_selected_image_for_later_use() {
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 200) as u8).collect();
+        let path = write_temp_image_file("writing-execution-retains-image", &data);
+        let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+
+        let (_target_path, authorized) = gate_pass_active_write_for_image(
+            "writing-execution-retains-target",
+            selected.selection(),
+            data.len() as u64,
+            false,
+        );
+
+        let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+        let writing_execution = execution.begin_write(CancelHandle::new()).unwrap();
+
+        let mut verify_reader = writing_execution.image.open_reader().unwrap();
+        let mut read_back = Vec::new();
+        verify_reader.read_to_end(&mut read_back).unwrap();
+
+        assert_eq!(read_back, data);
+        let _ = std::fs::remove_file(&path);
     }
 }

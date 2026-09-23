@@ -692,6 +692,12 @@ pub struct ReadyToOpen {
     current: DeviceSnapshot,
     plan: WritePlan,
     verify_mode: VerifyMode,
+    // Carried through to `PreparedWrite`/`AuthorizedWrite` unchanged -- the
+    // confirmed `image_generation` a future `AuthorizedExecution::bind()`
+    // (write_job.rs) needs to compare against a `SelectedImage` right before
+    // a write starts. No getter here: `finalize_prepared_write` (below, same
+    // module) is the only reader.
+    image_generation: ImageGeneration,
 }
 
 impl ReadyToOpen {
@@ -727,12 +733,14 @@ pub struct PreparedWrite {
     pub target_block_path: String,
     pub target_size: u64,
     pub image_size: u64,
-    // `plan`/`verify_mode` travel from here straight into `AuthorizedWrite`
-    // via `begin()` below -- private, since a caller must never be able to
-    // re-supply or override either one; the only values that can ever reach
-    // `AuthorizedWrite` are the exact ones `prepare_for_open` verified.
+    // `plan`/`verify_mode`/`image_generation` travel from here straight into
+    // `AuthorizedWrite` via `begin()` below -- private, since a caller must
+    // never be able to re-supply or override any of them; the only values
+    // that can ever reach `AuthorizedWrite` are the exact ones
+    // `prepare_for_open` verified.
     plan: WritePlan,
     verify_mode: VerifyMode,
+    image_generation: ImageGeneration,
     #[allow(dead_code)]
     handle: OpenedDeviceHandle,
 }
@@ -813,6 +821,10 @@ pub fn prepare_for_open(
         current,
         plan,
         verify_mode,
+        // The current `image`'s generation, already proven (by
+        // `confirmation_matches` above) to match what was confirmed -- not
+        // a fresh value, and never re-derived later.
+        image_generation: image.image_generation(),
     })
 }
 
@@ -858,6 +870,7 @@ pub fn finalize_prepared_write(
         image_size: ready.plan.image_size,
         plan: ready.plan,
         verify_mode: ready.verify_mode,
+        image_generation: ready.image_generation,
         handle,
     })
 }
@@ -912,6 +925,11 @@ pub struct AuthorizedWrite {
     active: ActiveWrite,
     plan: WritePlan,
     verify_mode: VerifyMode,
+    // The confirmed `image_generation`, carried through unchanged from
+    // `prepare_for_open`. Exposed only via the `pub(crate)` getters below,
+    // for `write_job.rs`'s `AuthorizedExecution::bind()` to compare against
+    // a `SelectedImage` immediately before a write starts.
+    image_generation: ImageGeneration,
 }
 
 impl PreparedWrite {
@@ -935,18 +953,44 @@ impl PreparedWrite {
             active,
             plan: self.plan,
             verify_mode: self.verify_mode,
+            image_generation: self.image_generation,
         }
     }
 }
 
 impl AuthorizedWrite {
     // `pub(crate)`, not `pub`: the only legitimate consumer is
-    // `write_job::start()`, which immediately re-bundles the three pieces
+    // `write_job::start_inner()`, which immediately re-bundles the pieces
     // into `Writing`. No public constructor exists for `AuthorizedWrite`
     // itself, so this is the only way its parts ever become independently
-    // reachable, and only from within this crate.
+    // reachable, and only from within this crate. Deliberately still a
+    // 3-tuple, not 4: `image_generation` is not added here, since nothing
+    // in the write/sync hot path needs it -- only
+    // `write_job::AuthorizedExecution::bind()` does, and it reads
+    // `image_generation()`/`image_size()` below instead, without consuming
+    // `self`.
     pub(crate) fn into_parts(self) -> (ActiveWrite, WritePlan, VerifyMode) {
         (self.active, self.plan, self.verify_mode)
+    }
+
+    // `pub(crate)`: the only legitimate consumer is
+    // `write_job::AuthorizedExecution::bind()`, comparing this
+    // Gate-confirmed value against a `SelectedImage`'s own
+    // `image_generation` immediately before a write starts. `ImageGeneration`
+    // is opaque by design (see its doc comment) -- nothing outside the
+    // crate has a reason to read it in isolation.
+    pub(crate) fn image_generation(&self) -> ImageGeneration {
+        self.image_generation
+    }
+
+    // `pub(crate)`, for the same reason as `image_generation()` above.
+    // Deliberately delegates to `self.plan.image_size` rather than storing a
+    // second, independent copy of the same value -- `WritePlan` (inside
+    // `self.plan`) already carries it, and duplicating it here would be
+    // exactly the kind of "two fields that could quietly drift apart" this
+    // codebase avoids elsewhere (see `ImageSelection`'s own doc comment).
+    pub(crate) fn image_size(&self) -> u64 {
+        self.plan.image_size
     }
 }
 
@@ -1772,6 +1816,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
 
         let result = finalize_prepared_write(ready, None, None);
@@ -1791,6 +1836,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
         let (_path, handle) = test_handle_with_temp_file("mismatch");
 
@@ -1810,6 +1856,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
         let (_path, handle) = test_handle_with_temp_file("insufficient");
 
@@ -1836,6 +1883,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("drop-closes-fd");
@@ -1870,6 +1918,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("begin-fields");
@@ -1907,6 +1956,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("active-drop-closes-fd");
@@ -1943,6 +1993,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (path, handle) = test_handle_with_persistent_temp_file("write-known-data");
@@ -1987,6 +2038,7 @@ mod tests {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
             verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("type-compat");
@@ -2735,5 +2787,43 @@ mod tests {
         );
 
         assert!(result.is_ok());
+    }
+
+    // ---------------------------------------------------------------------
+    // image_generation transport: prepare_for_open -> ReadyToOpen ->
+    // PreparedWrite -> AuthorizedWrite
+    // ---------------------------------------------------------------------
+
+    // Gate generation transport. The confirmed `image_generation` (and,
+    // via `AuthorizedWrite::image_size()`, the confirmed `image_size`)
+    // travels unchanged all the way from `prepare_for_open` through
+    // `ReadyToOpen`/`PreparedWrite` to `AuthorizedWrite`, readable only via
+    // `AuthorizedWrite`'s own `pub(crate)` getters -- proving the value a
+    // future `write_job::AuthorizedExecution::bind()` compares against is
+    // exactly the one the Gate verified, never a fresh or re-derived one.
+    #[test]
+    fn authorized_write_carries_the_confirmed_image_generation_and_size() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let intent = WriteIntent::from_selection(&state, image, VerifyMode::None).unwrap();
+        let confirmation = ConfirmationToken::confirm(intent);
+
+        let ready = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot.clone()),
+            image,
+            VerifyMode::None,
+            Some(&confirmation),
+        )
+        .unwrap();
+
+        let metadata = matching_fd_metadata(&snapshot);
+        let (_path, handle) = test_handle_with_temp_file("generation-transport");
+        let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let authorized = prepared.begin();
+
+        assert_eq!(authorized.image_generation(), image.image_generation());
+        assert_eq!(authorized.image_size(), image.image_size());
     }
 }

@@ -241,23 +241,26 @@ fn print_selection_state(state: &core::SelectionState) {
         core::SelectionState::Selected {
             baseline,
             baseline_assessment,
+            selection_generation,
         } => {
             println!(
-                "\n[Selection] Selected  device={} risk={:?} writable={} diskseq={:?}",
+                "\n[Selection] Selected  device={} risk={:?} writable={} diskseq={:?} selection_generation={:?}",
                 baseline.device,
                 baseline_assessment.risk_level,
                 baseline_assessment.writable,
-                baseline.diskseq
+                baseline.diskseq,
+                selection_generation
             );
         }
         core::SelectionState::Invalidated {
             baseline,
             baseline_assessment,
             reason,
+            selection_generation,
         } => {
             println!(
-                "\n[Selection] Invalidated  device={} reason={reason:?} (baseline was risk={:?} writable={})",
-                baseline.device, baseline_assessment.risk_level, baseline_assessment.writable
+                "\n[Selection] Invalidated  device={} reason={reason:?} (baseline was risk={:?} writable={}) selection_generation={:?}",
+                baseline.device, baseline_assessment.risk_level, baseline_assessment.writable, selection_generation
             );
         }
     }
@@ -377,7 +380,12 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
         return Ok(());
     }
 
-    let core::SelectionState::Selected { baseline, .. } = &state else {
+    let core::SelectionState::Selected {
+        baseline,
+        selection_generation,
+        ..
+    } = &state
+    else {
         unreachable!("is_ready_to_open just confirmed Selected");
     };
 
@@ -385,13 +393,19 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
     // build the confirmation token (as the — currently nonexistent — GUI
     // would, from what it just showed the user), the other is fed to
     // `prepare_for_open` as its own required re-verification (condition B).
+    // `selection_generation` is copied from the current SelectionState, not
+    // reissued here -- see `core::ConfirmationToken::new`'s doc comment.
     let refreshed_for_token = collect_device_snapshot(&baseline.block_path);
     let SnapshotFetchOutcome::Found(current_for_token) = refreshed_for_token else {
         println!("\nprepare-test: target-specific refresh failed -- stopping before the Write Gate.");
         return Ok(());
     };
 
-    let confirmation = core::ConfirmationToken::new(&current_for_token, PREPARE_TEST_IMAGE_SIZE);
+    let confirmation = core::ConfirmationToken::new(
+        &current_for_token,
+        PREPARE_TEST_IMAGE_SIZE,
+        *selection_generation,
+    );
     println!(
         "\nprepare-test: confirmation created for {} (image_size={} bytes)",
         confirmation.target_block_path, confirmation.image_size

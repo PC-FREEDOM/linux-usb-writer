@@ -5,6 +5,8 @@
 // from the Linux Backend / Safety Engine / Identity modules, and decides what
 // they mean for the user's current Selection.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
 use crate::identity::{compare_identity, compare_instance, IdentityComparison, InstanceComparison};
 use crate::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle, SyncTarget};
@@ -24,17 +26,71 @@ pub enum InvalidationReason {
     SafetyChanged,
 }
 
+// An opaque, process-local generation counter for explicit Selection events
+// (`select()` calls) -- not a device identity, not a diskseq replacement,
+// never persisted, and never meant to be compared across process runs. Two
+// different physical devices selected in sequence get two different
+// generations, but so does the *same* device explicitly reselected twice in
+// a row with nothing about the device itself having changed (no replug, same
+// diskseq, same identity). That is precisely the gap `diskseq` alone cannot
+// close: diskseq only changes when the kernel recreates the block-device
+// instance (a physical replug), never when the user simply reselects the
+// still-connected instance again. `diskseq` (Instance identity, owned by
+// `identity::compare_instance`) and `SelectionGeneration` (Selection-event
+// identity, owned by this module) are deliberately independent and both
+// retained side by side in `confirmation_matches` below -- neither alone
+// covers what the other catches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionGeneration(u64);
+
+// Starts at 1 purely so the first-ever issued generation is a visibly
+// non-default value in Debug output; the exact starting value carries no
+// meaning beyond that -- only strict monotonic increase and uniqueness
+// within this process matter.
+static NEXT_SELECTION_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+// The only way to mint a `SelectionGeneration`. Called exactly once per
+// `select()` invocation (see `select()` below) -- never from `apply_event`
+// or `revalidate`, which must carry an existing generation through
+// unchanged, and never merely because a `SelectionState` is cloned or
+// pattern-matched.
+//
+// Overflow policy: `fetch_update` with `checked_add`, not a plain
+// `fetch_add`. A plain `fetch_add` would silently wrap back to 0 once the
+// counter reached `u64::MAX`, which would let a generation value be reissued
+// within the same process -- exactly the ambiguity this type exists to rule
+// out. At roughly 1.8*10^19 possible values this is not a practical concern
+// for any real run of this program, but "safe side by default" means this
+// must fail loudly rather than silently reuse a value if that were ever
+// reached. A `Result`-returning API (threading a new error variant through
+// `select()`, and therefore every caller) was considered and rejected as
+// over-engineering for a condition this far outside any realistic run; a
+// panic is the minimal choice that still refuses to wrap silently.
+fn next_selection_generation() -> SelectionGeneration {
+    let previous = NEXT_SELECTION_GENERATION
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_add(1)
+        })
+        .expect(
+            "selection_generation counter overflowed u64 -- refusing to silently wrap and reissue a generation value",
+        );
+
+    SelectionGeneration(previous)
+}
+
 #[derive(Debug)]
 pub enum SelectionState {
     NoSelection,
     Selected {
         baseline: DeviceSnapshot,
         baseline_assessment: SafetyAssessment,
+        selection_generation: SelectionGeneration,
     },
     Invalidated {
         baseline: DeviceSnapshot,
         baseline_assessment: SafetyAssessment,
         reason: InvalidationReason,
+        selection_generation: SelectionGeneration,
     },
 }
 
@@ -61,9 +117,15 @@ pub fn select(baseline: DeviceSnapshot) -> Result<SelectionState, SelectionError
         return Err(SelectionError::NotSelectable);
     }
 
+    // A fresh generation every time, unconditionally -- including a reselect
+    // of the exact same device with nothing else changed. This is what makes
+    // `selection_generation` answer "was this Selection event confirmed
+    // against?" rather than "is this the same device?" (`diskseq`/identity
+    // already answer that question elsewhere).
     Ok(SelectionState::Selected {
         baseline,
         baseline_assessment,
+        selection_generation: next_selection_generation(),
     })
 }
 
@@ -77,6 +139,7 @@ pub fn apply_event(state: SelectionState, event: &DeviceEvent) -> SelectionState
     let SelectionState::Selected {
         baseline,
         baseline_assessment,
+        selection_generation,
     } = state
     else {
         return state;
@@ -90,6 +153,7 @@ pub fn apply_event(state: SelectionState, event: &DeviceEvent) -> SelectionState
         return SelectionState::Selected {
             baseline,
             baseline_assessment,
+            selection_generation,
         };
     }
 
@@ -98,6 +162,7 @@ pub fn apply_event(state: SelectionState, event: &DeviceEvent) -> SelectionState
             baseline,
             baseline_assessment,
             reason: InvalidationReason::TargetRemoved,
+            selection_generation,
         },
         DeviceEvent::PropertiesChanged {
             interface, changed, ..
@@ -111,11 +176,13 @@ pub fn apply_event(state: SelectionState, event: &DeviceEvent) -> SelectionState
                     baseline,
                     baseline_assessment,
                     reason: InvalidationReason::MediaUnavailable,
+                    selection_generation,
                 }
             } else {
                 SelectionState::Selected {
                     baseline,
                     baseline_assessment,
+                    selection_generation,
                 }
             }
         }
@@ -128,6 +195,7 @@ pub fn apply_event(state: SelectionState, event: &DeviceEvent) -> SelectionState
         _ => SelectionState::Selected {
             baseline,
             baseline_assessment,
+            selection_generation,
         },
     }
 }
@@ -178,6 +246,7 @@ pub fn revalidate(state: SelectionState, outcome: SnapshotFetchOutcome) -> Selec
     let SelectionState::Selected {
         baseline,
         baseline_assessment,
+        selection_generation,
     } = state
     else {
         return state;
@@ -190,6 +259,7 @@ pub fn revalidate(state: SelectionState, outcome: SnapshotFetchOutcome) -> Selec
                 baseline,
                 baseline_assessment,
                 reason: InvalidationReason::TargetRemoved,
+                selection_generation,
             };
         }
         SnapshotFetchOutcome::Error(_) => {
@@ -197,6 +267,7 @@ pub fn revalidate(state: SelectionState, outcome: SnapshotFetchOutcome) -> Selec
                 baseline,
                 baseline_assessment,
                 reason: InvalidationReason::SnapshotRefreshFailed,
+                selection_generation,
             };
         }
     };
@@ -206,12 +277,14 @@ pub fn revalidate(state: SelectionState, outcome: SnapshotFetchOutcome) -> Selec
             baseline,
             baseline_assessment,
             reason,
+            selection_generation,
         };
     }
 
     SelectionState::Selected {
         baseline,
         baseline_assessment,
+        selection_generation,
     }
 }
 
@@ -298,44 +371,64 @@ pub fn check_fd_binding(current: &DeviceSnapshot, fd_metadata: Option<&FdMetadat
 // ---------------------------------------------------------------------
 
 // Binds a single "yes, write this image to this target" confirmation to the
-// exact target (by block_path), its exact size, the exact image size, and
-// the target's block-device generation (diskseq) at confirmation time. A
-// token is data only — there is no UI in this codebase yet, so (for now) the
-// only way to obtain one is to construct it directly from the snapshot the
-// user was actually looking at when they confirmed.
+// exact target (by block_path), its exact size, the exact image size, the
+// target's block-device generation (diskseq), and the Selection-event
+// generation (`selection_generation`) at confirmation time. A token is data
+// only — there is no UI in this codebase yet, so (for now) the only way to
+// obtain one is to construct it directly from the snapshot the user was
+// actually looking at, and the `SelectionState` that snapshot came from,
+// when they confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmationToken {
     pub target_block_path: String,
     pub target_size: u64,
     pub image_size: u64,
     pub target_diskseq: Option<u64>,
+    pub selection_generation: SelectionGeneration,
 }
 
 impl ConfirmationToken {
-    pub fn new(target: &DeviceSnapshot, image_size: u64) -> Self {
+    // `selection_generation` must be copied from the caller's current
+    // `SelectionState` (its `Selected`/`Invalidated` variant carries a field
+    // of the same name) — never minted fresh here. Minting a new one here
+    // would defeat the entire mechanism: the token has to freeze the
+    // generation that was current *at confirmation time*, so a later
+    // reselect (which always mints a new generation, see `select()`) shows
+    // up as a mismatch in `confirmation_matches` below.
+    pub fn new(
+        target: &DeviceSnapshot,
+        image_size: u64,
+        selection_generation: SelectionGeneration,
+    ) -> Self {
         ConfirmationToken {
             target_block_path: target.block_path.clone(),
             target_size: target.size,
             image_size,
             target_diskseq: target.diskseq,
+            selection_generation,
         }
     }
 }
 
-// A token only ever authorizes the exact (target, size, image_size,
-// generation) it was made for. Any difference — a different target, a
-// resized/different image, or the target having been replugged (a new
-// diskseq, whether via a plain reconnect or a full reselect) since the token
-// was made — is a mismatch, not a "close enough".
+// A token only ever authorizes the exact (target, size, image_size, diskseq
+// generation, selection generation) it was made for. Any difference — a
+// different target, a resized/different image, the target having been
+// replugged (a new diskseq) since the token was made, or the user having
+// explicitly reselected since (a new `selection_generation`, even with the
+// diskseq unchanged) — is a mismatch, not a "close enough". The last of
+// these is what `selection_generation` adds: `target_diskseq` alone cannot
+// catch a reselect of the same, still-connected instance.
 fn confirmation_matches(
     token: &ConfirmationToken,
     current: &DeviceSnapshot,
     image_size: u64,
+    current_selection_generation: SelectionGeneration,
 ) -> bool {
     token.target_block_path == current.block_path
         && token.target_size == current.size
         && token.image_size == image_size
         && token.target_diskseq == current.diskseq
+        && token.selection_generation == current_selection_generation
 }
 
 #[allow(dead_code)]
@@ -399,13 +492,14 @@ pub fn prepare_for_open(
     image_size: u64,
     confirmation: Option<&ConfirmationToken>,
 ) -> Result<ReadyToOpen, WriteGateError> {
-    let (baseline, _baseline_assessment) = match state {
+    let (baseline, _baseline_assessment, selection_generation) = match state {
         SelectionState::NoSelection => return Err(WriteGateError::NoSelection),
         SelectionState::Invalidated { .. } => return Err(WriteGateError::SelectionInvalidated),
         SelectionState::Selected {
             baseline,
             baseline_assessment,
-        } => (baseline, baseline_assessment),
+            selection_generation,
+        } => (baseline, baseline_assessment, selection_generation),
     };
 
     // B: the target-specific snapshot re-fetch must have actually succeeded.
@@ -450,7 +544,7 @@ pub fn prepare_for_open(
     // must match this exact target/image/generation.
     let token = confirmation.ok_or(WriteGateError::ConfirmationMissing)?;
 
-    if !confirmation_matches(token, &current, image_size) {
+    if !confirmation_matches(token, &current, image_size, *selection_generation) {
         return Err(WriteGateError::ConfirmationMismatch);
     }
 
@@ -582,6 +676,30 @@ impl ActiveWrite {
     #[allow(dead_code)] // exercised by this module's/write_job.rs's tests today; not yet called from main.rs.
     pub(crate) fn sync_target(&self) -> SyncTarget<'_> {
         self.handle.sync_target()
+    }
+}
+
+// Test-only accessor: extracts the `selection_generation` a `Selected` or
+// `Invalidated` `SelectionState` carries. Exists purely so tests (both this
+// module's own, and `write_job.rs`'s, which never constructs `SelectionState`
+// directly — only ever via the real `select()`/`apply_event()`/`revalidate()`
+// API) can bind a `ConfirmationToken` to whatever generation a real Selection
+// actually holds, without adding a public accessor to the production API
+// surface (production code that needs this value gets it the same way
+// `prepare_for_open` and `main.rs` do: by pattern-matching the
+// `SelectionState` variant directly).
+#[cfg(test)]
+pub(crate) fn selection_generation_of(state: &SelectionState) -> SelectionGeneration {
+    match state {
+        SelectionState::Selected {
+            selection_generation,
+            ..
+        }
+        | SelectionState::Invalidated {
+            selection_generation,
+            ..
+        } => *selection_generation,
+        SelectionState::NoSelection => panic!("NoSelection has no selection_generation"),
     }
 }
 
@@ -1039,7 +1157,7 @@ mod tests {
     fn prepare_for_open_succeeds_with_matching_confirmation() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let ready = prepare_for_open(
             &state,
@@ -1096,7 +1214,7 @@ mod tests {
 
         let mut other_target = base_device();
         other_target.block_path = "/org/freedesktop/UDisks2/block_devices/sdz".to_string();
-        let token = ConfirmationToken::new(&other_target, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&other_target, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
@@ -1114,7 +1232,7 @@ mod tests {
     fn prepare_for_open_rejects_confirmation_for_different_image_size() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
@@ -1134,7 +1252,7 @@ mod tests {
         let block_path = snapshot.block_path.clone();
         let state = select(snapshot.clone()).unwrap();
         let state = apply_event(state, &interfaces_removed(&block_path));
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
@@ -1152,7 +1270,7 @@ mod tests {
     fn prepare_for_open_rejects_snapshot_refresh_failure() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
@@ -1169,7 +1287,7 @@ mod tests {
     fn prepare_for_open_rejects_identity_changed() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.serial = "OTHER-SERIAL-0002".to_string();
@@ -1189,7 +1307,7 @@ mod tests {
     fn prepare_for_open_rejects_identity_insufficient() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.serial = String::new();
@@ -1209,7 +1327,7 @@ mod tests {
     fn prepare_for_open_rejects_instance_recreated() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.diskseq = Some(19);
@@ -1229,7 +1347,7 @@ mod tests {
     fn prepare_for_open_rejects_instance_insufficient() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.diskseq = None;
@@ -1249,7 +1367,7 @@ mod tests {
     fn prepare_for_open_rejects_safety_blocked() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.hint_system = true;
@@ -1270,7 +1388,7 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let too_large = snapshot.size + 1;
-        let token = ConfirmationToken::new(&snapshot, too_large);
+        let token = ConfirmationToken::new(&snapshot, too_large, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
@@ -1548,7 +1666,7 @@ mod tests {
         snapshot.size = target_size;
 
         let state = select(snapshot.clone()).unwrap();
-        let confirmation = ConfirmationToken::new(&snapshot, image_size);
+        let confirmation = ConfirmationToken::new(&snapshot, image_size, selection_generation_of(&state));
 
         let ready = prepare_for_open(
             &state,
@@ -1727,7 +1845,7 @@ mod tests {
         let mut snapshot = base_device();
         snapshot.size = target_size;
         let state = select(snapshot.clone()).unwrap();
-        let confirmation = ConfirmationToken::new(&snapshot, image_size);
+        let confirmation = ConfirmationToken::new(&snapshot, image_size, selection_generation_of(&state));
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
@@ -1770,11 +1888,20 @@ mod tests {
     #[test]
     fn prepare_for_open_rejects_confirmation_with_stale_diskseq() {
         let old_snapshot = base_device(); // diskseq = Some(12)
-        let stale_token = ConfirmationToken::new(&old_snapshot, TEST_IMAGE_SIZE);
 
         let mut new_snapshot = base_device();
         new_snapshot.diskseq = Some(99);
         let state = select(new_snapshot.clone()).unwrap();
+
+        // Same selection_generation as `state` -- built from `old_snapshot`
+        // only to carry its stale diskseq, so diskseq is the sole varying
+        // condition this test isolates (see the two dedicated
+        // selection_generation-only tests below for the reselect case).
+        let stale_token = ConfirmationToken::new(
+            &old_snapshot,
+            TEST_IMAGE_SIZE,
+            selection_generation_of(&state),
+        );
 
         let result = prepare_for_open(
             &state,
@@ -1786,16 +1913,24 @@ mod tests {
         assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
     }
 
-    // Gate M / Confirmation-mismatch D. After a Selection is Invalidated and
-    // the user explicitly re-selects (a fresh baseline, new diskseq), a
-    // confirmation obtained before that re-selection must not carry over.
+    // Gate M / Confirmation-mismatch D / instance change. After a Selection
+    // is Invalidated and the user explicitly re-selects following a real
+    // replug (a fresh baseline, new diskseq), a confirmation obtained before
+    // that re-selection must not carry over. This is the diskseq/Instance
+    // side of the story; see the two selection_generation-only tests below
+    // for the same-device, unchanged-diskseq case diskseq alone cannot
+    // catch.
     #[test]
-    fn prepare_for_open_rejects_confirmation_after_reselect() {
+    fn prepare_for_open_rejects_confirmation_after_reselect_with_diskseq_change() {
         let original = base_device();
         let block_path = original.block_path.clone();
-        let old_token = ConfirmationToken::new(&original, TEST_IMAGE_SIZE);
+        let state = select(original.clone()).unwrap();
+        let old_token = ConfirmationToken::new(
+            &original,
+            TEST_IMAGE_SIZE,
+            selection_generation_of(&state),
+        );
 
-        let state = select(original).unwrap();
         let state = apply_event(state, &interfaces_removed(&block_path));
         assert!(matches!(state, SelectionState::Invalidated { .. }));
 
@@ -1811,5 +1946,97 @@ mod tests {
         );
 
         assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // selection_generation A / Confirmation-mismatch E. Reselecting the
+    // *exact same*, still-connected device -- same block_path, same size,
+    // same identity, same diskseq, nothing physically changed at all -- must
+    // still invalidate a confirmation obtained before that reselect. This is
+    // precisely the gap `target_diskseq` alone cannot close (diskseq is
+    // unchanged here, deliberately, unlike the test above): only
+    // `selection_generation` catches it, because `select()` always mints a
+    // fresh generation on every explicit call, even for the same device.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_after_same_device_reselect_with_unchanged_diskseq() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let old_token = ConfirmationToken::new(
+            &snapshot,
+            TEST_IMAGE_SIZE,
+            selection_generation_of(&state),
+        );
+
+        // Explicit reselect of the exact same device. No replug, no field on
+        // `snapshot` differs at all -- only `selection_generation` changes.
+        let state = select(snapshot.clone()).unwrap();
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            TEST_IMAGE_SIZE,
+            Some(&old_token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // selection_generation B. The same same-device reselect as above does
+    // not permanently lock the device out -- only the stale token. A freshly
+    // issued ConfirmationToken, bound to the new selection_generation, lets
+    // prepare_for_open succeed against the identical snapshot.
+    #[test]
+    fn prepare_for_open_succeeds_with_fresh_confirmation_after_same_device_reselect() {
+        let snapshot = base_device();
+        let _first_state = select(snapshot.clone()).unwrap();
+
+        let state = select(snapshot.clone()).unwrap();
+        let new_token = ConfirmationToken::new(
+            &snapshot,
+            TEST_IMAGE_SIZE,
+            selection_generation_of(&state),
+        );
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            TEST_IMAGE_SIZE,
+            Some(&new_token),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    // selection_generation C. Every explicit select() call mints a strictly
+    // new generation, regardless of whether the device changed: the same
+    // device selected twice in a row yields two different generations, which
+    // is the property the two tests above rely on.
+    #[test]
+    fn select_always_mints_a_new_generation_even_for_the_same_device() {
+        let snapshot = base_device();
+
+        let first = select(snapshot.clone()).unwrap();
+        let second = select(snapshot).unwrap();
+
+        assert_ne!(
+            selection_generation_of(&first),
+            selection_generation_of(&second)
+        );
+    }
+
+    // selection_generation D. apply_event()/revalidate() must carry the
+    // existing selection_generation through unchanged -- only select()
+    // itself ever mints a new one. Checked here via apply_event(); revalidate
+    // shares the same destructure/reconstruct pattern.
+    #[test]
+    fn selection_generation_is_preserved_across_invalidation() {
+        let snapshot = base_device();
+        let block_path = snapshot.block_path.clone();
+        let state = select(snapshot).unwrap();
+        let original_generation = selection_generation_of(&state);
+
+        let state = apply_event(state, &interfaces_removed(&block_path));
+
+        assert!(matches!(state, SelectionState::Invalidated { .. }));
+        assert_eq!(selection_generation_of(&state), original_generation);
     }
 }

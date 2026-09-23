@@ -632,7 +632,8 @@ mod tests {
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
-        let confirmation = ConfirmationToken::new(&snapshot, image_size);
+        let confirmation =
+            ConfirmationToken::new(&snapshot, image_size, core::selection_generation_of(&state));
 
         let ready = core::prepare_for_open(
             &state,
@@ -841,7 +842,8 @@ mod tests {
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
-        let confirmation = ConfirmationToken::new(&snapshot, image_size);
+        let confirmation =
+            ConfirmationToken::new(&snapshot, image_size, core::selection_generation_of(&state));
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
@@ -993,7 +995,8 @@ mod tests {
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
-        let confirmation = ConfirmationToken::new(&snapshot, image_size);
+        let confirmation =
+            ConfirmationToken::new(&snapshot, image_size, core::selection_generation_of(&state));
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),

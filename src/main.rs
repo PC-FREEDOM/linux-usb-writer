@@ -8,7 +8,7 @@ mod safety;
 mod writer;
 
 use device::SnapshotFetchOutcome;
-use execution::{core, linux_access};
+use execution::{core, linux_access, write_job};
 use identity::{compare_identity, compare_instance};
 use linux_backend::{collect_device_snapshot, collect_device_snapshots};
 use linux_monitor::{start_monitoring, DeviceEvent};
@@ -42,6 +42,22 @@ fn main() -> zbus::Result<()> {
             };
 
             return run_prepare_test(target);
+        }
+        Some("write-test") => {
+            let Some(image_path) = args.next() else {
+                eprintln!(
+                    "usage: cargo run -- write-test <image-path> <udisks2-block-object-path>"
+                );
+                return Ok(());
+            };
+            let Some(target) = args.next() else {
+                eprintln!(
+                    "usage: cargo run -- write-test <image-path> <udisks2-block-object-path>"
+                );
+                return Ok(());
+            };
+
+            return run_write_test(image_path, target);
         }
         Some("writer-test") => return run_writer_test(),
         _ => {}
@@ -513,6 +529,261 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
             println!("prepare-test: FD (if any was opened) was already closed via RAII inside the Write Gate");
         }
     }
+
+    Ok(())
+}
+
+// PoC mode: Production execution path wiring (`cargo run -- write-test
+// <image-path> <block_path>`). This is the first CLI mode that connects the
+// full, real production path in one straight line: select -> re-verify ->
+// a *real* `SelectedImage` opened from `image_path` on disk (never the
+// synthetic `ImageSelection::new(fixed_size)` `prepare-test` uses) ->
+// WriteIntent -> confirm -> prepare_for_open -> OpenDevice -> FD binding ->
+// finalize_prepared_write -> AuthorizedWrite -> AuthorizedExecution::bind()
+// -> begin_write() -> WritingExecution::write() -> (on success only)
+// WriteSucceeded::begin_sync().sync(). None of Selection/Identity/Instance/
+// Safety/Confirmation/FD-binding is skipped -- this reuses exactly the same
+// `core`/`linux_access` calls `run_prepare_test` above already exercises,
+// it just does not stop at `AuthorizedWrite` and drop it.
+//
+// `block_path` is a UDisks2 block object path, exactly like every other CLI
+// mode above (`select`/`open-test`/`prepare-test`) -- not a raw `/dev/sdX`
+// string accepted with no safety checks. `image_path` is opened by
+// `image_source::FileImageSource::new()` exactly once; the resulting
+// `SelectedImage` (`selected_image` below) is held by this one variable,
+// unchanged, from that point until it is moved into
+// `AuthorizedExecution::bind()` -- it is never re-opened, never
+// reconstructed, and no second `FileImageSource`/`SelectedImage` is ever
+// created for the same invocation.
+//
+// Still a linear CLI PoC, not a Controller: every step happens in this one
+// function, exactly like `run_prepare_test`. If OpenDevice needs polkit
+// authentication, this program does nothing but wait for the reply; it
+// never falls back to sudo or any other bypass.
+fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
+    let mut state = attempt_select(&block_path);
+
+    if let core::SelectionState::Selected { baseline, .. } = &state {
+        let outcome = collect_device_snapshot(&baseline.block_path);
+        state = core::revalidate(state, outcome);
+    }
+
+    print_selection_state(&state);
+
+    if !core::is_ready_to_open(&state) {
+        println!("\nwrite-test: Selection invalid -- stopping before the Write Gate.");
+        return Ok(());
+    }
+
+    let core::SelectionState::Selected { baseline, .. } = &state else {
+        unreachable!("is_ready_to_open just confirmed Selected");
+    };
+
+    // The one and only place `image_path` is opened this invocation.
+    // `selected_image` is what travels, as a single variable, all the way
+    // to `AuthorizedExecution::bind()` below -- `selection()` (a cheap Copy)
+    // is all that gets threaded through the Gate calls in between.
+    let source = match image_source::FileImageSource::new(&image_path) {
+        Ok(source) => source,
+        Err(error) => {
+            println!("write-test: failed to open image {image_path}: {error:?}");
+            return Ok(());
+        }
+    };
+    let selected_image = image_source::SelectedImage::new(Box::new(source));
+
+    println!(
+        "\nwrite-test: image selected from {image_path} (image_size={} bytes)",
+        selected_image.logical_size()
+    );
+
+    // This PoC never implements Verify itself (see CLAUDE.md/reports) --
+    // `VerifyMode::None` here only means "no verify policy was chosen yet".
+    let verify_mode = core::VerifyMode::None;
+
+    let intent = match core::WriteIntent::from_selection(
+        &state,
+        selected_image.selection(),
+        verify_mode,
+    ) {
+        Ok(intent) => intent,
+        Err(error) => {
+            println!("write-test: WriteIntent construction rejected: {error:?}");
+            return Ok(());
+        }
+    };
+    let confirmation = core::ConfirmationToken::confirm(intent);
+    println!(
+        "write-test: confirmation created for {} (image_size={} bytes, verify_mode={:?})",
+        confirmation.intent().target_block_path(),
+        confirmation.intent().image_size(),
+        confirmation.intent().verify_mode()
+    );
+
+    let refreshed_for_gate = collect_device_snapshot(&baseline.block_path);
+
+    let ready = match core::prepare_for_open(
+        &state,
+        refreshed_for_gate,
+        selected_image.selection(),
+        verify_mode,
+        Some(&confirmation),
+    ) {
+        Ok(ready) => ready,
+        Err(error) => {
+            println!("write-test: Write Gate rejected before OpenDevice: {error:?}");
+            return Ok(());
+        }
+    };
+
+    println!(
+        "write-test: Write Gate (pre-open) passed. WritePlan: image_size={} target_size={} chunk_size={}",
+        ready.plan().image_size, ready.plan().target_size, ready.plan().chunk_size
+    );
+
+    println!(
+        "write-test: requesting OpenDevice(mode=\"rw\") on {}.",
+        ready.current().block_path
+    );
+    println!(
+        "If a polkit authentication prompt appears, please complete it yourself -- \
+         this program will not use sudo or any other privilege bypass."
+    );
+
+    let open_result = linux_access::open_device(&ready.current().block_path, "rw");
+
+    // Metadata must be read from the handle *before* the handle's ownership
+    // moves into `finalize_prepared_write`, exactly like `run_prepare_test`
+    // above -- `core.rs` stays free of Linux I/O calls.
+    let (handle_opt, metadata) = match open_result {
+        Ok(handle) => {
+            println!("write-test: OpenDevice: success");
+            let metadata = handle.metadata();
+            (Some(handle), metadata)
+        }
+        Err(error) => {
+            println!("write-test: OpenDevice: failed ({error:?})");
+            (None, None)
+        }
+    };
+
+    if let Some(meta) = &metadata {
+        println!(
+            "write-test: FD major:minor={}:{} size={:?}",
+            meta.major, meta.minor, meta.size
+        );
+    }
+
+    let prepared = match core::finalize_prepared_write(ready, handle_opt, metadata.as_ref()) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            println!("write-test: Write Gate rejected after OpenDevice: {error:?}");
+            println!("write-test: FD (if any was opened) was already closed via RAII inside the Write Gate");
+            return Ok(());
+        }
+    };
+
+    println!(
+        "write-test: PreparedWrite established for {} (target_size={} image_size={})",
+        prepared.target_block_path, prepared.target_size, prepared.image_size
+    );
+
+    // PreparedWrite -> AuthorizedWrite. The fd moves once, with no
+    // dup()/try_clone(), exactly like `run_prepare_test`. Unlike
+    // `run_prepare_test`, this `authorized` is not dropped here -- it is
+    // handed straight to `AuthorizedExecution::bind()` below, together with
+    // the exact same `selected_image` this function has held since the top.
+    let authorized = prepared.begin();
+    println!("write-test: WRITE SESSION AUTHORIZED (verify_mode={verify_mode:?})");
+
+    let execution = match write_job::AuthorizedExecution::bind(authorized, selected_image) {
+        Ok(execution) => execution,
+        Err(error) => {
+            println!("write-test: AuthorizedExecution::bind() rejected: {error:?}");
+            println!("write-test: AuthorizedWrite dropped -- FD closed via RAII");
+            return Ok(());
+        }
+    };
+    println!("write-test: AuthorizedExecution bound (image_generation/image_size match confirmed)");
+
+    // No UI exists yet to request cancellation from another thread; a fresh,
+    // never-cancelled handle is all this CLI PoC needs.
+    let cancel = write_job::CancelHandle::new();
+
+    let writing_execution = match execution.begin_write(cancel) {
+        Ok(writing_execution) => writing_execution,
+        Err(error) => {
+            println!("write-test: begin_write() failed to open the image reader: {error}");
+            println!("write-test: AuthorizedExecution dropped -- FD closed via RAII, 0 bytes written");
+            return Ok(());
+        }
+    };
+    println!("write-test: write started");
+
+    let (selected_image, outcome) = writing_execution.write(|progress| {
+        let percent = if progress.total_bytes > 0 {
+            (progress.bytes_written as f64 / progress.total_bytes as f64) * 100.0
+        } else {
+            100.0
+        };
+        println!(
+            "write-test: progress {}/{} bytes ({percent:.1}%)",
+            progress.bytes_written, progress.total_bytes
+        );
+    });
+
+    match outcome {
+        write_job::WriteAttemptOutcome::Succeeded(succeeded) => {
+            println!(
+                "write-test: write succeeded ({} of {} bytes written)",
+                succeeded.bytes_written, succeeded.image_size
+            );
+
+            // Write success -> sync, in the same straight line, with no
+            // branch that returns early and skips it.
+            println!("write-test: syncing...");
+            match succeeded.begin_sync().sync() {
+                write_job::SyncAttemptOutcome::Succeeded(sync_succeeded) => {
+                    println!(
+                        "write-test: sync succeeded -- write + sync completed ({} bytes)",
+                        sync_succeeded.bytes_written
+                    );
+                }
+                write_job::SyncAttemptOutcome::Failed(failed) => {
+                    println!("write-test: sync FAILED: {failed:?}");
+                    println!(
+                        "write-test: retry_requires_fresh_gate={} -- not retrying automatically",
+                        failed.retry_requires_fresh_gate
+                    );
+                }
+            }
+        }
+        write_job::WriteAttemptOutcome::Failed(failed) => {
+            println!("write-test: write FAILED: {failed:?}");
+            println!(
+                "write-test: not syncing -- retry_requires_fresh_gate={}",
+                failed.retry_requires_fresh_gate
+            );
+        }
+        write_job::WriteAttemptOutcome::Cancelled(cancelled) => {
+            println!("write-test: write CANCELLED: {cancelled:?}");
+            println!(
+                "write-test: not syncing -- retry_requires_fresh_gate={}",
+                cancelled.retry_requires_fresh_gate
+            );
+        }
+    }
+
+    // `selected_image` (the exact same value bind() was given, handed back
+    // unchanged by `WritingExecution::write()`) is kept alive only as proof
+    // that its identity survived the whole write -- a future Verify stage
+    // would reach it here for a second, verify-time `open_reader()` call.
+    // Not implemented this revision; see CLAUDE.md/reports. This PoC does
+    // not start a new write, re-bind, or retry with it.
+    println!(
+        "write-test: SelectedImage identity preserved after write (image_size={}); Verify not implemented this revision",
+        selected_image.logical_size()
+    );
 
     Ok(())
 }

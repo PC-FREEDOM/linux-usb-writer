@@ -370,63 +370,181 @@ pub fn check_fd_binding(current: &DeviceSnapshot, fd_metadata: Option<&FdMetadat
 // outcomes such a call would produce, remain future, separate steps.
 // ---------------------------------------------------------------------
 
+// An opaque, process-local generation counter for explicit image-selection
+// events -- the image-side counterpart to `SelectionGeneration`. It is
+// *not* a content hash or checksum, and proves nothing about whether two
+// images are byte-for-byte identical: two completely different images of
+// the same size, or even the exact same file selected twice in a row, get
+// two different generations. What it answers is narrower and is all this
+// module needs: "is this the same explicit image-selection event the
+// confirmation was made against?" A hash would answer a different, stronger
+// question (are the *contents* the same?) that this design does not need
+// and deliberately does not attempt -- see `ImageSelection` below for why
+// that stays out of scope here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageGeneration(u64);
+
+// Starts at 1 for the same reason `NEXT_SELECTION_GENERATION` does: purely
+// so the first issued value is visibly non-default in Debug output.
+static NEXT_IMAGE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+// The only way to mint an `ImageGeneration`. Called exactly once per
+// `ImageSelection::new()` (see below) -- an `ImageSelection` value being
+// copied around afterward never mints another one, exactly like
+// `SelectionGeneration`/`select()`.
+//
+// Overflow policy: identical to `next_selection_generation()` above --
+// `fetch_update` + `checked_add`, panicking via `.expect()` rather than
+// silently wrapping. Deliberately not a different policy for this
+// generation type: both exist to rule out the same class of ambiguity
+// (a generation value being reissued within one process), so both fail the
+// same way for the same reason. See `next_selection_generation()`'s doc
+// comment for the full overflow rationale (Result-based API rejected as
+// over-engineering for a practically unreachable condition).
+fn next_image_generation() -> ImageGeneration {
+    let previous = NEXT_IMAGE_GENERATION
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+            value.checked_add(1)
+        })
+        .expect(
+            "image_generation counter overflowed u64 -- refusing to silently wrap and reissue a generation value",
+        );
+
+    ImageGeneration(previous)
+}
+
+// A pure data snapshot of "which image the user explicitly selected, and
+// when" -- the image-side counterpart to `SelectionState`'s
+// `selection_generation` field. Deliberately minimal: only the logical
+// image size (what `WritePlan`/`ConfirmationToken` actually need to
+// validate) and the opaque generation identifying the selection event
+// itself. No path, `File`, `RawFd`, reader, compression info, or hash --
+// those questions belong to a future `ImageSource` I/O abstraction ("how do
+// I read the bytes?"), which is a distinct concern from this type's own
+// question ("what, and which selection event, did the user mean?"). Mixing
+// the two here would be exactly the kind of cross-layer responsibility this
+// codebase avoids (see CLAUDE.md's architecture section).
+// Fields are deliberately private: `image_size` and `image_generation` must
+// always travel together as a single value minted by `new()`, never
+// reassembled field-by-field from two different `ImageSelection`s (e.g.
+// `ImageSelection { image_size: <from B>, image_generation: <from A>'s
+// generation }`). A struct-literal with `pub` fields cannot rule that out --
+// any code holding two `ImageSelection`s could freely mix their fields into
+// a third, fabricated one. Private fields plus `new()` as the only
+// constructor closes that gap: the only way to ever have an
+// `image_generation` in hand is as half of an `ImageSelection` that was
+// minted whole, by exactly one `new()` call, alongside the `image_size` it
+// is paired with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageSelection {
+    image_size: u64,
+    image_generation: ImageGeneration,
+}
+
+impl ImageSelection {
+    // The only way to construct one. Mints a fresh `image_generation` every
+    // time, unconditionally -- including reselecting an image of the exact
+    // same size, or even the exact same file. Mirrors `select()`'s contract
+    // for `selection_generation` on purpose: both answer "was this
+    // confirmed against the same explicit choice?", never "is this the same
+    // content?". Copying an existing `ImageSelection` (it is `Copy`) never
+    // goes through this constructor and therefore never mints a new
+    // generation -- only an explicit, new image selection does.
+    pub fn new(image_size: u64) -> Self {
+        ImageSelection {
+            image_size,
+            image_generation: next_image_generation(),
+        }
+    }
+
+    // The one field callers outside this module have any legitimate need
+    // for on its own (e.g. displaying "image_size=N bytes" in `main.rs`'s
+    // PoC output). `pub`, unlike `image_generation()` below.
+    pub fn image_size(&self) -> u64 {
+        self.image_size
+    }
+
+    // `pub(crate)`, not `pub`: the generation is opaque by design (see
+    // `ImageGeneration`'s doc comment) and the only legitimate consumers of
+    // its raw value are `ConfirmationToken::new`/`confirmation_matches`
+    // (both in this module) and this crate's own tests -- nothing outside
+    // the crate has a reason to read it in isolation from the
+    // `ImageSelection` it came from.
+    pub(crate) fn image_generation(&self) -> ImageGeneration {
+        self.image_generation
+    }
+}
+
 // Binds a single "yes, write this image to this target" confirmation to the
-// exact target (by block_path), its exact size, the exact image size, the
-// target's block-device generation (diskseq), and the Selection-event
-// generation (`selection_generation`) at confirmation time. A token is data
-// only — there is no UI in this codebase yet, so (for now) the only way to
-// obtain one is to construct it directly from the snapshot the user was
-// actually looking at, and the `SelectionState` that snapshot came from,
-// when they confirmed.
+// exact target (by block_path), its exact size, the exact image selection
+// (size and generation), the target's block-device generation (diskseq),
+// and the Selection-event generation (`selection_generation`) at
+// confirmation time. A token is data only — there is no UI in this
+// codebase yet, so (for now) the only way to obtain one is to construct it
+// directly from the snapshot and `ImageSelection` the user was actually
+// looking at, and the `SelectionState` that snapshot came from, when they
+// confirmed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfirmationToken {
     pub target_block_path: String,
     pub target_size: u64,
     pub image_size: u64,
+    pub image_generation: ImageGeneration,
     pub target_diskseq: Option<u64>,
     pub selection_generation: SelectionGeneration,
 }
 
 impl ConfirmationToken {
-    // `selection_generation` must be copied from the caller's current
-    // `SelectionState` (its `Selected`/`Invalidated` variant carries a field
-    // of the same name) — never minted fresh here. Minting a new one here
-    // would defeat the entire mechanism: the token has to freeze the
-    // generation that was current *at confirmation time*, so a later
-    // reselect (which always mints a new generation, see `select()`) shows
-    // up as a mismatch in `confirmation_matches` below.
+    // `image` and `selection_generation` must both be copied from the
+    // caller's current, already-explicit choices -- an `ImageSelection` the
+    // caller already obtained via `ImageSelection::new()`, and the
+    // `selection_generation` field of the caller's current `SelectionState`
+    // -- never minted fresh here. Taking `image` as a single `ImageSelection`
+    // (rather than a separate `image_size: u64` and `image_generation:
+    // ImageGeneration`) is deliberate: it structurally rules out the mistake
+    // of pairing one image's size with a *different* image's generation,
+    // since both fields always travel together as the one value the caller
+    // got back from a single `ImageSelection::new()` call. Minting either
+    // value fresh here would defeat the entire mechanism: the token has to
+    // freeze exactly what was current *at confirmation time*, so a later
+    // reselect of either the target or the image shows up as a mismatch in
+    // `confirmation_matches` below.
     pub fn new(
         target: &DeviceSnapshot,
-        image_size: u64,
+        image: ImageSelection,
         selection_generation: SelectionGeneration,
     ) -> Self {
         ConfirmationToken {
             target_block_path: target.block_path.clone(),
             target_size: target.size,
-            image_size,
+            image_size: image.image_size(),
+            image_generation: image.image_generation(),
             target_diskseq: target.diskseq,
             selection_generation,
         }
     }
 }
 
-// A token only ever authorizes the exact (target, size, image_size, diskseq
-// generation, selection generation) it was made for. Any difference — a
-// different target, a resized/different image, the target having been
-// replugged (a new diskseq) since the token was made, or the user having
-// explicitly reselected since (a new `selection_generation`, even with the
-// diskseq unchanged) — is a mismatch, not a "close enough". The last of
-// these is what `selection_generation` adds: `target_diskseq` alone cannot
-// catch a reselect of the same, still-connected instance.
+// A token only ever authorizes the exact (target, size, image size, image
+// generation, diskseq generation, selection generation) it was made for.
+// Any difference — a different target, a resized image, a *different*
+// image of the same size (a new `image_generation`, even with `image_size`
+// unchanged), the target having been replugged (a new diskseq) since the
+// token was made, or the user having explicitly reselected the target since
+// (a new `selection_generation`) — is a mismatch, not a "close enough".
+// `image_generation` is what closes the gap `image_size` alone cannot:
+// `image_size` only catches a *resized* image, never same-size image A
+// silently swapped for same-size image B.
 fn confirmation_matches(
     token: &ConfirmationToken,
     current: &DeviceSnapshot,
-    image_size: u64,
+    image: ImageSelection,
     current_selection_generation: SelectionGeneration,
 ) -> bool {
     token.target_block_path == current.block_path
         && token.target_size == current.size
-        && token.image_size == image_size
+        && token.image_size == image.image_size()
+        && token.image_generation == image.image_generation()
         && token.target_diskseq == current.diskseq
         && token.selection_generation == current_selection_generation
 }
@@ -489,7 +607,7 @@ pub struct PreparedWrite {
 pub fn prepare_for_open(
     state: &SelectionState,
     refreshed: SnapshotFetchOutcome,
-    image_size: u64,
+    image: ImageSelection,
     confirmation: Option<&ConfirmationToken>,
 ) -> Result<ReadyToOpen, WriteGateError> {
     let (baseline, _baseline_assessment, selection_generation) = match state {
@@ -530,7 +648,7 @@ pub fn prepare_for_open(
     // F, G, H, I: image_size > 0, target_size > 0, image_size <= target_size,
     // and a valid chunk size — all delegated to `WritePlan::new` rather than
     // re-implemented here.
-    let plan = match WritePlan::new(image_size, current.size, DEFAULT_CHUNK_SIZE) {
+    let plan = match WritePlan::new(image.image_size(), current.size, DEFAULT_CHUNK_SIZE) {
         Ok(plan) => plan,
         Err(WriterError::ImageTooLarge) => return Err(WriteGateError::ImageTooLarge),
         // InvalidSize covers both image_size == 0 and target_size == 0;
@@ -544,7 +662,7 @@ pub fn prepare_for_open(
     // must match this exact target/image/generation.
     let token = confirmation.ok_or(WriteGateError::ConfirmationMissing)?;
 
-    if !confirmation_matches(token, &current, image_size, *selection_generation) {
+    if !confirmation_matches(token, &current, image, *selection_generation) {
         return Err(WriteGateError::ConfirmationMismatch);
     }
 
@@ -1157,12 +1275,13 @@ mod tests {
     fn prepare_for_open_succeeds_with_matching_confirmation() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(base_device()),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         )
         .unwrap();
@@ -1182,7 +1301,7 @@ mod tests {
         let result = prepare_for_open(
             &SelectionState::NoSelection,
             SnapshotFetchOutcome::Found(base_device()),
-            TEST_IMAGE_SIZE,
+            ImageSelection::new(TEST_IMAGE_SIZE),
             None,
         );
 
@@ -1198,7 +1317,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(base_device()),
-            TEST_IMAGE_SIZE,
+            ImageSelection::new(TEST_IMAGE_SIZE),
             None,
         );
 
@@ -1214,12 +1333,13 @@ mod tests {
 
         let mut other_target = base_device();
         other_target.block_path = "/org/freedesktop/UDisks2/block_devices/sdz".to_string();
-        let token = ConfirmationToken::new(&other_target, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&other_target, image, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1232,12 +1352,13 @@ mod tests {
     fn prepare_for_open_rejects_confirmation_for_different_image_size() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
-            TEST_IMAGE_SIZE * 5,
+            ImageSelection::new(TEST_IMAGE_SIZE * 5),
             Some(&token),
         );
 
@@ -1252,12 +1373,13 @@ mod tests {
         let block_path = snapshot.block_path.clone();
         let state = select(snapshot.clone()).unwrap();
         let state = apply_event(state, &interfaces_removed(&block_path));
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1270,12 +1392,13 @@ mod tests {
     fn prepare_for_open_rejects_snapshot_refresh_failure() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Error("simulated D-Bus failure".to_string()),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1287,7 +1410,8 @@ mod tests {
     fn prepare_for_open_rejects_identity_changed() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.serial = "OTHER-SERIAL-0002".to_string();
@@ -1295,7 +1419,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(current),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1307,7 +1431,8 @@ mod tests {
     fn prepare_for_open_rejects_identity_insufficient() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.serial = String::new();
@@ -1315,7 +1440,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(current),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1327,7 +1452,8 @@ mod tests {
     fn prepare_for_open_rejects_instance_recreated() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.diskseq = Some(19);
@@ -1335,7 +1461,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(current),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1347,7 +1473,8 @@ mod tests {
     fn prepare_for_open_rejects_instance_insufficient() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.diskseq = None;
@@ -1355,7 +1482,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(current),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1367,7 +1494,8 @@ mod tests {
     fn prepare_for_open_rejects_safety_blocked() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let token = ConfirmationToken::new(&snapshot, TEST_IMAGE_SIZE, selection_generation_of(&state));
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let mut current = snapshot;
         current.hint_system = true;
@@ -1375,7 +1503,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(current),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&token),
         );
 
@@ -1388,12 +1516,13 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let too_large = snapshot.size + 1;
-        let token = ConfirmationToken::new(&snapshot, too_large, selection_generation_of(&state));
+        let image = ImageSelection::new(too_large);
+        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
-            too_large,
+            image,
             Some(&token),
         );
 
@@ -1666,12 +1795,13 @@ mod tests {
         snapshot.size = target_size;
 
         let state = select(snapshot.clone()).unwrap();
-        let confirmation = ConfirmationToken::new(&snapshot, image_size, selection_generation_of(&state));
+        let image = ImageSelection::new(image_size);
+        let confirmation = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
-            image_size,
+            image,
             Some(&confirmation),
         )
         .expect("prepare_for_open should succeed for a freshly matching snapshot/confirmation");
@@ -1845,11 +1975,12 @@ mod tests {
         let mut snapshot = base_device();
         snapshot.size = target_size;
         let state = select(snapshot.clone()).unwrap();
-        let confirmation = ConfirmationToken::new(&snapshot, image_size, selection_generation_of(&state));
+        let image = ImageSelection::new(image_size);
+        let confirmation = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
-            image_size,
+            image,
             Some(&confirmation),
         )
         .unwrap();
@@ -1896,17 +2027,20 @@ mod tests {
         // Same selection_generation as `state` -- built from `old_snapshot`
         // only to carry its stale diskseq, so diskseq is the sole varying
         // condition this test isolates (see the two dedicated
-        // selection_generation-only tests below for the reselect case).
+        // selection_generation-only tests below for the reselect case). Same
+        // ImageSelection on both sides too, so image_generation is not the
+        // condition under test here either.
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
         let stale_token = ConfirmationToken::new(
             &old_snapshot,
-            TEST_IMAGE_SIZE,
+            image,
             selection_generation_of(&state),
         );
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(new_snapshot),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&stale_token),
         );
 
@@ -1925,9 +2059,10 @@ mod tests {
         let original = base_device();
         let block_path = original.block_path.clone();
         let state = select(original.clone()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
         let old_token = ConfirmationToken::new(
             &original,
-            TEST_IMAGE_SIZE,
+            image,
             selection_generation_of(&state),
         );
 
@@ -1941,7 +2076,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(reselected_snapshot),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&old_token),
         );
 
@@ -1960,11 +2095,10 @@ mod tests {
     fn prepare_for_open_rejects_confirmation_after_same_device_reselect_with_unchanged_diskseq() {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
-        let old_token = ConfirmationToken::new(
-            &snapshot,
-            TEST_IMAGE_SIZE,
-            selection_generation_of(&state),
-        );
+        // Same ImageSelection (same image_generation) on both sides -- this
+        // test isolates selection_generation alone, not image_generation.
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let old_token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         // Explicit reselect of the exact same device. No replug, no field on
         // `snapshot` differs at all -- only `selection_generation` changes.
@@ -1973,7 +2107,7 @@ mod tests {
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&old_token),
         );
 
@@ -1990,16 +2124,13 @@ mod tests {
         let _first_state = select(snapshot.clone()).unwrap();
 
         let state = select(snapshot.clone()).unwrap();
-        let new_token = ConfirmationToken::new(
-            &snapshot,
-            TEST_IMAGE_SIZE,
-            selection_generation_of(&state),
-        );
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let new_token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
-            TEST_IMAGE_SIZE,
+            image,
             Some(&new_token),
         );
 
@@ -2038,5 +2169,127 @@ mod tests {
 
         assert!(matches!(state, SelectionState::Invalidated { .. }));
         assert_eq!(selection_generation_of(&state), original_generation);
+    }
+
+    // image_generation A / Confirmation-mismatch F (most important test for
+    // this feature). The user selects image A, gets a confirmation, then --
+    // without touching the target selection at all -- explicitly selects a
+    // *different* image B of the exact same size. Nothing about the target
+    // changed (same block_path, same target_size, same diskseq, same
+    // selection_generation -- `state` is never re-derived here) and
+    // image_size is identical too; only image_generation differs. The old
+    // confirmation must still be rejected, proving image_size alone cannot
+    // catch a same-size image swap.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_after_same_size_image_reselect() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+
+        let image_a = ImageSelection::new(TEST_IMAGE_SIZE);
+        let old_token = ConfirmationToken::new(&snapshot, image_a, selection_generation_of(&state));
+
+        // Explicit reselect of a different image, same size. `state` (the
+        // target selection) is untouched.
+        let image_b = ImageSelection::new(TEST_IMAGE_SIZE);
+        assert_eq!(image_a.image_size(), image_b.image_size());
+        assert_ne!(image_a.image_generation(), image_b.image_generation());
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            image_b,
+            Some(&old_token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // image_generation B. The same same-size image reselect as above does
+    // not permanently lock the target out -- only the stale token. A freshly
+    // issued ConfirmationToken, bound to the new image_generation, lets
+    // prepare_for_open succeed against the identical target.
+    #[test]
+    fn prepare_for_open_succeeds_with_fresh_confirmation_after_image_reselect() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+
+        let _image_a = ImageSelection::new(TEST_IMAGE_SIZE);
+        let image_b = ImageSelection::new(TEST_IMAGE_SIZE);
+        let new_token = ConfirmationToken::new(&snapshot, image_b, selection_generation_of(&state));
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            image_b,
+            Some(&new_token),
+        );
+
+        assert!(result.is_ok());
+    }
+
+    // image_generation C. Every explicit ImageSelection::new() call mints a
+    // strictly new generation, regardless of whether image_size matches: the
+    // same size selected twice in a row (e.g. two different 4 GiB images, or
+    // even the same file picked again) yields two different generations,
+    // which is the property the two tests above rely on. This is also the
+    // direct evidence that `image_generation` is not a content hash: it says
+    // nothing about whether the two selections' bytes are equal, only that
+    // they are two distinct selection events.
+    #[test]
+    fn image_selection_always_mints_a_new_generation_even_for_the_same_size() {
+        let first = ImageSelection::new(TEST_IMAGE_SIZE);
+        let second = ImageSelection::new(TEST_IMAGE_SIZE);
+
+        assert_eq!(first.image_size(), second.image_size());
+        assert_ne!(first.image_generation(), second.image_generation());
+    }
+
+    // image_generation D. Copying an existing ImageSelection (it is `Copy`)
+    // must never mint a new generation -- only an explicit `ImageSelection::
+    // new()` call does. Mirrors `selection_generation`'s equivalent
+    // guarantee for `SelectionState`.
+    #[test]
+    fn image_selection_copy_does_not_mint_a_new_generation() {
+        let original = ImageSelection::new(TEST_IMAGE_SIZE);
+        let copied = original;
+
+        assert_eq!(original.image_generation(), copied.image_generation());
+    }
+
+    // selection_generation / image_generation E. The two generations vary
+    // fully independently: reselecting only the target changes
+    // selection_generation without affecting whatever ImageSelection is
+    // already held, reselecting only the image changes image_generation
+    // without affecting selection_generation, and reselecting both changes
+    // both. This is the structural guarantee the two mismatch tests above
+    // (target-only and image-only) each exercise in isolation.
+    #[test]
+    fn selection_generation_and_image_generation_vary_independently() {
+        let snapshot = base_device();
+
+        let state_1 = select(snapshot.clone()).unwrap();
+        let image_1 = ImageSelection::new(TEST_IMAGE_SIZE);
+
+        // Target reselect only: selection_generation changes; `image_1`
+        // itself is an already-held plain value, not re-derived by this.
+        let state_2 = select(snapshot.clone()).unwrap();
+        assert_ne!(
+            selection_generation_of(&state_1),
+            selection_generation_of(&state_2)
+        );
+
+        // Image reselect only: image_generation changes, independent of
+        // selection_generation.
+        let image_2 = ImageSelection::new(TEST_IMAGE_SIZE);
+        assert_ne!(image_1.image_generation(), image_2.image_generation());
+
+        // Both reselected: both generations differ from their originals.
+        let state_3 = select(snapshot).unwrap();
+        let image_3 = ImageSelection::new(TEST_IMAGE_SIZE);
+        assert_ne!(
+            selection_generation_of(&state_1),
+            selection_generation_of(&state_3)
+        );
+        assert_ne!(image_1.image_generation(), image_3.image_generation());
     }
 }

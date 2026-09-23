@@ -632,13 +632,13 @@ mod tests {
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
-        let confirmation =
-            ConfirmationToken::new(&snapshot, image_size, core::selection_generation_of(&state));
+        let image = core::ImageSelection::new(image_size);
+        let confirmation = ConfirmationToken::new(&snapshot, image, core::selection_generation_of(&state));
 
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
-            image_size,
+            image,
             Some(&confirmation),
         )
         .expect("prepare_for_open should succeed for a freshly matching snapshot/confirmation");
@@ -842,12 +842,12 @@ mod tests {
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
-        let confirmation =
-            ConfirmationToken::new(&snapshot, image_size, core::selection_generation_of(&state));
+        let image = core::ImageSelection::new(image_size);
+        let confirmation = ConfirmationToken::new(&snapshot, image, core::selection_generation_of(&state));
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
-            image_size,
+            image,
             Some(&confirmation),
         )
         .unwrap();
@@ -995,12 +995,12 @@ mod tests {
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
-        let confirmation =
-            ConfirmationToken::new(&snapshot, image_size, core::selection_generation_of(&state));
+        let image = core::ImageSelection::new(image_size);
+        let confirmation = ConfirmationToken::new(&snapshot, image, core::selection_generation_of(&state));
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
-            image_size,
+            image,
             Some(&confirmation),
         )
         .unwrap();

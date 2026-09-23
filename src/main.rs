@@ -401,11 +401,14 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
         return Ok(());
     };
 
-    let confirmation = core::ConfirmationToken::new(
-        &current_for_token,
-        PREPARE_TEST_IMAGE_SIZE,
-        *selection_generation,
-    );
+    // `image` is this PoC's stand-in for an explicit image selection (the
+    // currently-nonexistent GUI would call `ImageSelection::new()` once,
+    // when the user picks a file). The same `ImageSelection` value is reused
+    // for both the confirmation and the later Gate call below, since this
+    // PoC never re-selects a different image mid-run.
+    let image = core::ImageSelection::new(PREPARE_TEST_IMAGE_SIZE);
+
+    let confirmation = core::ConfirmationToken::new(&current_for_token, image, *selection_generation);
     println!(
         "\nprepare-test: confirmation created for {} (image_size={} bytes)",
         confirmation.target_block_path, confirmation.image_size
@@ -413,12 +416,7 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
 
     let refreshed_for_gate = collect_device_snapshot(&baseline.block_path);
 
-    let ready = match core::prepare_for_open(
-        &state,
-        refreshed_for_gate,
-        PREPARE_TEST_IMAGE_SIZE,
-        Some(&confirmation),
-    ) {
+    let ready = match core::prepare_for_open(&state, refreshed_for_gate, image, Some(&confirmation)) {
         Ok(ready) => ready,
         Err(error) => {
             println!("prepare-test: Write Gate rejected before OpenDevice: {error:?}");

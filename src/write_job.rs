@@ -65,7 +65,7 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::core::ActiveWrite;
+use crate::core::{ActiveWrite, AuthorizedWrite, VerifyMode};
 use crate::writer::{self, WriteError, WritePlan, WriteProgress};
 
 const CANCEL_NONE: u8 = 0;
@@ -293,6 +293,10 @@ pub struct WriteSucceeded {
     pub bytes_written: u64,
     pub target_may_be_modified: bool,
     pub retry_requires_fresh_gate: bool,
+    // Carried through unchanged from the `AuthorizedWrite` this attempt
+    // started from -- not read or branched on anywhere in `Writing::write()`
+    // itself, only relayed forward for a future `Verifying` stage to act on.
+    pub verify_mode: VerifyMode,
     active: ActiveWrite,
 }
 
@@ -306,6 +310,7 @@ impl std::fmt::Debug for WriteSucceeded {
             .field("bytes_written", &self.bytes_written)
             .field("target_may_be_modified", &self.target_may_be_modified)
             .field("retry_requires_fresh_gate", &self.retry_requires_fresh_gate)
+            .field("verify_mode", &self.verify_mode)
             .finish_non_exhaustive()
     }
 }
@@ -339,21 +344,31 @@ pub enum WriteAttemptOutcome {
 pub struct Writing<R: Read> {
     active: ActiveWrite,
     plan: WritePlan,
+    verify_mode: VerifyMode,
     source: R,
     cancel: CancelHandle,
 }
 
-// The one and only way to reach a `Writing`. Consumes `active` by value: the
-// `ActiveWrite` passed in can never be referred to again afterward (the Rust
-// compiler enforces this, not a runtime check), and there is no way to mint
-// a second `Writing` from it since nothing here keeps a copy. No fd is
-// duplicated -- `active` is moved, never cloned (`ActiveWrite` is not
-// `Clone`/`Copy`), and `writer_target()` (called later, inside
-// `Writing::write`) only ever borrows it.
-pub fn start<R: Read>(active: ActiveWrite, plan: WritePlan, source: R, cancel: CancelHandle) -> Writing<R> {
+// The one and only way to reach a `Writing`. Consumes `authorized` by value:
+// the `AuthorizedWrite` passed in can never be referred to again afterward
+// (the Rust compiler enforces this, not a runtime check), and there is no
+// way to mint a second `Writing` from it since nothing here keeps a copy.
+// `into_parts()` (the only way to take an `AuthorizedWrite` apart) hands
+// back the exact `ActiveWrite`/`WritePlan`/`VerifyMode` the Gate bundled
+// together -- there is no way to call this with an `ActiveWrite`,
+// `WritePlan`, and `VerifyMode` supplied as three independent arguments, so
+// a caller cannot accidentally pair a Gate-approved FD with a plan or
+// verify mode from a different Gate pass. No fd is duplicated -- `active`
+// is moved, never cloned (`ActiveWrite` is not `Clone`/`Copy`), and
+// `writer_target()` (called later, inside `Writing::write`) only ever
+// borrows it.
+pub fn start<R: Read>(authorized: AuthorizedWrite, source: R, cancel: CancelHandle) -> Writing<R> {
+    let (active, plan, verify_mode) = authorized.into_parts();
+
     Writing {
         active,
         plan,
+        verify_mode,
         source,
         cancel,
     }
@@ -379,6 +394,7 @@ impl<R: Read> Writing<R> {
         let Writing {
             mut active,
             plan,
+            verify_mode,
             source,
             cancel,
         } = self;
@@ -399,6 +415,7 @@ impl<R: Read> Writing<R> {
                 // complete modification of the target (rule E).
                 target_may_be_modified: true,
                 retry_requires_fresh_gate: true,
+                verify_mode,
                 active,
             }),
             Err(WriteError::Cancelled { bytes_written }) => {
@@ -466,6 +483,7 @@ pub struct Syncing {
     active: ActiveWrite,
     image_size: u64,
     bytes_written: u64,
+    verify_mode: VerifyMode,
 }
 
 impl WriteSucceeded {
@@ -484,6 +502,7 @@ impl WriteSucceeded {
             active: self.active,
             image_size: self.image_size,
             bytes_written: self.bytes_written,
+            verify_mode: self.verify_mode,
         }
     }
 }
@@ -505,6 +524,12 @@ pub struct SyncSucceeded {
     pub bytes_written: u64,
     pub target_may_be_modified: bool,
     pub retry_requires_fresh_gate: bool,
+    // Carried through unchanged from `Syncing`, which itself carried it
+    // through unchanged from `WriteSucceeded`. `Syncing::sync()` never
+    // branches on this -- it only relays it forward so a future `Verifying`
+    // stage (`SyncSucceeded -> Verifying`) knows which policy (None / Quick
+    // / Full) to apply.
+    pub verify_mode: VerifyMode,
     active: ActiveWrite,
 }
 
@@ -517,6 +542,7 @@ impl std::fmt::Debug for SyncSucceeded {
             .field("bytes_written", &self.bytes_written)
             .field("target_may_be_modified", &self.target_may_be_modified)
             .field("retry_requires_fresh_gate", &self.retry_requires_fresh_gate)
+            .field("verify_mode", &self.verify_mode)
             .finish_non_exhaustive()
     }
 }
@@ -547,6 +573,7 @@ impl Syncing {
             active,
             image_size,
             bytes_written,
+            verify_mode,
         } = self;
 
         match active.sync_target().sync_all() {
@@ -557,6 +584,7 @@ impl Syncing {
                 // was modified -- the raw write already made it so.
                 target_may_be_modified: true,
                 retry_requires_fresh_gate: true,
+                verify_mode,
                 active,
             }),
             Err(error) => {
@@ -611,20 +639,22 @@ mod tests {
         }
     }
 
-    // Drives the full production Gate sequence -- select -> ConfirmationToken
-    // -> prepare_for_open -> (simulated OpenDevice via the test-only
-    // `from_file_for_test`) -> finalize_prepared_write -> begin() -- against
-    // a plain, throwaway regular file, never a block device, never real
-    // D-Bus/OpenDevice. Returns the resulting `ActiveWrite` plus the exact
-    // `WritePlan` `prepare_for_open` produced for it. `persistent` selects
-    // whether the temp file's directory entry survives (needed only by
-    // tests that reopen it by path afterward to check written content).
+    // Drives the full production Gate sequence -- select -> WriteIntent ->
+    // ConfirmationToken -> prepare_for_open -> (simulated OpenDevice via the
+    // test-only `from_file_for_test`) -> finalize_prepared_write -> begin()
+    // -- against a plain, throwaway regular file, never a block device,
+    // never real D-Bus/OpenDevice. Returns the resulting `AuthorizedWrite`
+    // (bundling the `ActiveWrite`, `WritePlan`, and `VerifyMode` the Gate
+    // verified) -- the exact value `write_job::start()` now requires.
+    // `persistent` selects whether the temp file's directory entry survives
+    // (needed only by tests that reopen it by path afterward to check
+    // written content).
     fn gate_pass_active_write(
         tag: &str,
         image_size: u64,
         target_size: u64,
         persistent: bool,
-    ) -> (Option<std::path::PathBuf>, ActiveWrite, WritePlan) {
+    ) -> (Option<std::path::PathBuf>, AuthorizedWrite) {
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -633,17 +663,24 @@ mod tests {
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
         let image = core::ImageSelection::new(image_size);
-        let confirmation = ConfirmationToken::new(&snapshot, image, core::selection_generation_of(&state));
+        let verify_mode = VerifyMode::None;
+        let intent = core::write_intent_for_test(
+            &snapshot,
+            image,
+            core::selection_generation_of(&state),
+            verify_mode,
+        );
+        let confirmation = ConfirmationToken::confirm(intent);
 
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
             image,
+            verify_mode,
             Some(&confirmation),
         )
         .expect("prepare_for_open should succeed for a freshly matching snapshot/confirmation");
 
-        let plan = ready.plan;
         let metadata = fd_metadata_matching(&snapshot);
 
         let path = std::env::temp_dir().join(format!(
@@ -660,7 +697,7 @@ mod tests {
             .expect("finalize_prepared_write should succeed with matching FD metadata");
 
         let returned_path = if persistent { Some(path) } else { None };
-        (returned_path, prepared.begin(), plan)
+        (returned_path, prepared.begin())
     }
 
     // Builds on `gate_pass_active_write` by also running the write attempt
@@ -674,9 +711,9 @@ mod tests {
         target_size: u64,
         persistent: bool,
     ) -> (Option<std::path::PathBuf>, WriteSucceeded) {
-        let (path, active, plan) = gate_pass_active_write(tag, image_size, target_size, persistent);
+        let (path, authorized) = gate_pass_active_write(tag, image_size, target_size, persistent);
         let data = vec![6u8; image_size as usize];
-        let writing = start(active, plan, Cursor::new(data), CancelHandle::new());
+        let writing = start(authorized, Cursor::new(data), CancelHandle::new());
 
         let outcome = writing.write(|_| {});
         let succeeded = match outcome {
@@ -694,12 +731,12 @@ mod tests {
     // ownership/borrow checker is the actual enforcement mechanism.
     #[test]
     fn start_consumes_active_write_into_writing() {
-        let (_path, active, plan) = gate_pass_active_write("start", 10, 20, false);
+        let (_path, authorized) = gate_pass_active_write("start", 10, 20, false);
         let source = Cursor::new(vec![0u8; 10]);
         let cancel = CancelHandle::new();
 
-        let _writing: Writing<Cursor<Vec<u8>>> = start(active, plan, source, cancel);
-        // `active` is not, and cannot be, referred to again here.
+        let _writing: Writing<Cursor<Vec<u8>>> = start(authorized, source, cancel);
+        // `authorized` is not, and cannot be, referred to again here.
     }
 
     // B/C. A successful write produces WriteSucceeded with bytes_written ==
@@ -711,11 +748,11 @@ mod tests {
         let image_size = SOURCE.len() as u64;
         let target_size = image_size + 100;
 
-        let (path, active, plan) =
+        let (path, authorized) =
             gate_pass_active_write("success", image_size, target_size, true);
         let path = path.expect("persistent temp file path");
 
-        let writing = start(active, plan, Cursor::new(SOURCE.to_vec()), CancelHandle::new());
+        let writing = start(authorized, Cursor::new(SOURCE.to_vec()), CancelHandle::new());
         let outcome = writing.write(|_| {});
 
         let succeeded = match outcome {
@@ -742,13 +779,13 @@ mod tests {
     fn cancel_before_any_chunk_is_cancelled_with_user_requested_reason() {
         let image_size = 100u64;
         let target_size = 200u64;
-        let (_path, active, plan) =
+        let (_path, authorized) =
             gate_pass_active_write("cancel-immediate", image_size, target_size, false);
 
         let cancel = CancelHandle::new();
         cancel.request_cancel(CancelReason::UserRequested);
 
-        let writing = start(active, plan, Cursor::new(vec![1u8; image_size as usize]), cancel);
+        let writing = start(authorized, Cursor::new(vec![1u8; image_size as usize]), cancel);
         let outcome = writing.write(|_| {});
 
         let cancelled = match outcome {
@@ -769,13 +806,12 @@ mod tests {
     fn cancel_partway_through_multiple_chunks_reports_partial_progress() {
         let image_size = 3 * writer::DEFAULT_CHUNK_SIZE as u64;
         let target_size = image_size;
-        let (_path, active, plan) =
+        let (_path, authorized) =
             gate_pass_active_write("cancel-partial", image_size, target_size, false);
 
         let cancel = CancelHandle::new();
         let writing = start(
-            active,
-            plan,
+            authorized,
             Cursor::new(vec![2u8; image_size as usize]),
             cancel.clone(),
         );
@@ -806,11 +842,11 @@ mod tests {
     fn source_too_short_is_failed_with_matching_bytes_written() {
         let image_size = 1000u64;
         let target_size = 2000u64;
-        let (_path, active, plan) =
+        let (_path, authorized) =
             gate_pass_active_write("source-short", image_size, target_size, false);
 
         let short_source = vec![3u8; 400];
-        let writing = start(active, plan, Cursor::new(short_source), CancelHandle::new());
+        let writing = start(authorized, Cursor::new(short_source), CancelHandle::new());
         let outcome = writing.write(|_| {});
 
         let failed = match outcome {
@@ -843,15 +879,22 @@ mod tests {
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
         let image = core::ImageSelection::new(image_size);
-        let confirmation = ConfirmationToken::new(&snapshot, image, core::selection_generation_of(&state));
+        let verify_mode = VerifyMode::None;
+        let intent = core::write_intent_for_test(
+            &snapshot,
+            image,
+            core::selection_generation_of(&state),
+            verify_mode,
+        );
+        let confirmation = ConfirmationToken::confirm(intent);
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
             image,
+            verify_mode,
             Some(&confirmation),
         )
         .unwrap();
-        let plan = ready.plan;
         let metadata = fd_metadata_matching(&snapshot);
 
         let path = std::env::temp_dir().join(format!(
@@ -867,10 +910,10 @@ mod tests {
 
         let prepared =
             core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
-        let active = prepared.begin();
+        let authorized = prepared.begin();
 
         let source = Cursor::new(vec![7u8; image_size as usize]);
-        let writing = start(active, plan, source, CancelHandle::new());
+        let writing = start(authorized, source, CancelHandle::new());
         let outcome = writing.write(|_| {});
 
         let _ = std::fs::remove_file(&path);
@@ -897,11 +940,11 @@ mod tests {
     fn progress_is_monotonic_and_ends_at_image_size() {
         let image_size = 2 * writer::DEFAULT_CHUNK_SIZE as u64;
         let target_size = image_size;
-        let (_path, active, plan) =
+        let (_path, authorized) =
             gate_pass_active_write("progress", image_size, target_size, false);
         let data = vec![5u8; image_size as usize];
 
-        let writing = start(active, plan, Cursor::new(data), CancelHandle::new());
+        let writing = start(authorized, Cursor::new(data), CancelHandle::new());
 
         let mut progress_log = Vec::new();
         let outcome = writing.write(|progress| progress_log.push(progress.bytes_written));
@@ -996,15 +1039,22 @@ mod tests {
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
         let image = core::ImageSelection::new(image_size);
-        let confirmation = ConfirmationToken::new(&snapshot, image, core::selection_generation_of(&state));
+        let verify_mode = VerifyMode::None;
+        let intent = core::write_intent_for_test(
+            &snapshot,
+            image,
+            core::selection_generation_of(&state),
+            verify_mode,
+        );
+        let confirmation = ConfirmationToken::confirm(intent);
         let ready = core::prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
             image,
+            verify_mode,
             Some(&confirmation),
         )
         .unwrap();
-        let plan = ready.plan;
         let metadata = fd_metadata_matching(&snapshot);
 
         let path = std::env::temp_dir().join(format!(
@@ -1018,10 +1068,10 @@ mod tests {
 
         let prepared =
             core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
-        let active = prepared.begin();
+        let authorized = prepared.begin();
 
         let data = vec![8u8; image_size as usize];
-        let writing = start(active, plan, Cursor::new(data), CancelHandle::new());
+        let writing = start(authorized, Cursor::new(data), CancelHandle::new());
         let outcome = writing.write(|_| {});
         let succeeded = match outcome {
             WriteAttemptOutcome::Succeeded(s) => s,

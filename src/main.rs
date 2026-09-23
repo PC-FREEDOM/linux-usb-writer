@@ -380,25 +380,8 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
         return Ok(());
     }
 
-    let core::SelectionState::Selected {
-        baseline,
-        selection_generation,
-        ..
-    } = &state
-    else {
+    let core::SelectionState::Selected { baseline, .. } = &state else {
         unreachable!("is_ready_to_open just confirmed Selected");
-    };
-
-    // A second, independent target-specific re-fetch: one copy is used to
-    // build the confirmation token (as the — currently nonexistent — GUI
-    // would, from what it just showed the user), the other is fed to
-    // `prepare_for_open` as its own required re-verification (condition B).
-    // `selection_generation` is copied from the current SelectionState, not
-    // reissued here -- see `core::ConfirmationToken::new`'s doc comment.
-    let refreshed_for_token = collect_device_snapshot(&baseline.block_path);
-    let SnapshotFetchOutcome::Found(current_for_token) = refreshed_for_token else {
-        println!("\nprepare-test: target-specific refresh failed -- stopping before the Write Gate.");
-        return Ok(());
     };
 
     // `image` is this PoC's stand-in for an explicit image selection (the
@@ -408,15 +391,39 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
     // PoC never re-selects a different image mid-run.
     let image = core::ImageSelection::new(PREPARE_TEST_IMAGE_SIZE);
 
-    let confirmation = core::ConfirmationToken::new(&current_for_token, image, *selection_generation);
+    // This PoC never implements Verify itself (see CLAUDE.md/reports) --
+    // `VerifyMode::None` here only means "no verify policy was chosen yet",
+    // not that a future GUI must default to it.
+    let verify_mode = core::VerifyMode::None;
+
+    // `WriteIntent::from_selection` pulls `baseline` and `selection_generation`
+    // out of the same `state` value -- there is no way to build one from a
+    // mismatched pairing of the two. This is what the — currently
+    // nonexistent — GUI would call once, at the moment the user confirms.
+    let intent = match core::WriteIntent::from_selection(&state, image, verify_mode) {
+        Ok(intent) => intent,
+        Err(error) => {
+            println!("prepare-test: WriteIntent construction rejected: {error:?}");
+            return Ok(());
+        }
+    };
+    let confirmation = core::ConfirmationToken::confirm(intent);
     println!(
-        "\nprepare-test: confirmation created for {} (image_size={} bytes)",
-        confirmation.target_block_path, confirmation.image_size
+        "\nprepare-test: confirmation created for {} (image_size={} bytes, verify_mode={:?})",
+        confirmation.intent().target_block_path(),
+        confirmation.intent().image_size(),
+        confirmation.intent().verify_mode()
     );
 
     let refreshed_for_gate = collect_device_snapshot(&baseline.block_path);
 
-    let ready = match core::prepare_for_open(&state, refreshed_for_gate, image, Some(&confirmation)) {
+    let ready = match core::prepare_for_open(
+        &state,
+        refreshed_for_gate,
+        image,
+        verify_mode,
+        Some(&confirmation),
+    ) {
         Ok(ready) => ready,
         Err(error) => {
             println!("prepare-test: Write Gate rejected before OpenDevice: {error:?}");
@@ -426,19 +433,19 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
 
     println!(
         "prepare-test: Write Gate (pre-open) passed. WritePlan: image_size={} target_size={} chunk_size={}",
-        ready.plan.image_size, ready.plan.target_size, ready.plan.chunk_size
+        ready.plan().image_size, ready.plan().target_size, ready.plan().chunk_size
     );
 
     println!(
         "prepare-test: requesting OpenDevice(mode=\"rw\") on {}.",
-        ready.current.block_path
+        ready.current().block_path
     );
     println!(
         "If a polkit authentication prompt appears, please complete it yourself -- \
          this program will not use sudo or any other privilege bypass."
     );
 
-    let open_result = linux_access::open_device(&ready.current.block_path, "rw");
+    let open_result = linux_access::open_device(&ready.current().block_path, "rw");
 
     // Metadata must be read from the handle (a genuine, if tiny, bit of
     // Linux I/O -- fstat/ioctl) *before* the handle's ownership moves into
@@ -477,22 +484,29 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
             );
             println!("prepare-test: WRITE NOT PERFORMED (writer::write() is not called by this PoC)");
 
-            // Demonstrate the next ownership stage: PreparedWrite -> ActiveWrite.
+            // Demonstrate the next ownership stage: PreparedWrite -> AuthorizedWrite.
             // `begin()` consumes `prepared` by value -- the fd moves once,
-            // with no dup()/try_clone(), into the new ActiveWrite. `prepared`
-            // cannot be referred to again after this line; the compiler
-            // enforces that, not a runtime check.
-            let active = prepared.begin();
+            // with no dup()/try_clone(), into the new AuthorizedWrite, which
+            // also now bundles the exact WritePlan/VerifyMode the Gate
+            // verified. `prepared` cannot be referred to again after this
+            // line; the compiler enforces that, not a runtime check. Fields
+            // are captured beforehand since AuthorizedWrite exposes none of
+            // them publicly -- only `write_job::start()` (via the
+            // crate-private `into_parts()`) is meant to take it apart.
+            let target_block_path = prepared.target_block_path.clone();
+            let target_size = prepared.target_size;
+            let image_size = prepared.image_size;
+
+            let authorized = prepared.begin();
             println!(
-                "prepare-test: WRITE SESSION CREATED for {} (target_size={} image_size={})",
-                active.target_block_path, active.target_size, active.image_size
+                "prepare-test: WRITE SESSION AUTHORIZED for {target_block_path} (target_size={target_size} image_size={image_size} verify_mode={verify_mode:?})"
             );
             println!(
-                "prepare-test: WRITE NOT PERFORMED (ActiveWrite exposes no writer::write() connection yet)"
+                "prepare-test: WRITE NOT PERFORMED (AuthorizedWrite is not connected to write_job::start() by this PoC)"
             );
 
-            drop(active);
-            println!("prepare-test: ActiveWrite dropped -- FD closed via RAII");
+            drop(authorized);
+            println!("prepare-test: AuthorizedWrite dropped -- FD closed via RAII");
         }
         Err(error) => {
             println!("prepare-test: Write Gate rejected after OpenDevice: {error:?}");

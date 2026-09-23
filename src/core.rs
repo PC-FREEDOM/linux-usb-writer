@@ -466,7 +466,7 @@ impl ImageSelection {
 
     // `pub(crate)`, not `pub`: the generation is opaque by design (see
     // `ImageGeneration`'s doc comment) and the only legitimate consumers of
-    // its raw value are `ConfirmationToken::new`/`confirmation_matches`
+    // its raw value are `WriteIntent::from_selection`/`confirmation_matches`
     // (both in this module) and this crate's own tests -- nothing outside
     // the crate has a reason to read it in isolation from the
     // `ImageSelection` it came from.
@@ -475,78 +475,183 @@ impl ImageSelection {
     }
 }
 
-// Binds a single "yes, write this image to this target" confirmation to the
-// exact target (by block_path), its exact size, the exact image selection
-// (size and generation), the target's block-device generation (diskseq),
-// and the Selection-event generation (`selection_generation`) at
-// confirmation time. A token is data only — there is no UI in this
-// codebase yet, so (for now) the only way to obtain one is to construct it
-// directly from the snapshot and `ImageSelection` the user was actually
-// looking at, and the `SelectionState` that snapshot came from, when they
-// confirmed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfirmationToken {
-    pub target_block_path: String,
-    pub target_size: u64,
-    pub image_size: u64,
-    pub image_generation: ImageGeneration,
-    pub target_diskseq: Option<u64>,
-    pub selection_generation: SelectionGeneration,
+// Fixed once, before a write starts, and carried unchanged through the
+// entire Job -- never branched on inside `Writing`'s or `Syncing`'s hot
+// loops (see `write_job.rs`). `None` still means write + flush + sync
+// happen as normal; it only means no read-back verification stage runs
+// afterward. `Quick`/`Full` name a policy for a future `Verifying` stage
+// that this revision does not implement -- see `write_job.rs`'s
+// module-level doc comment.
+// `#[allow(dead_code)]`: `Quick`/`Full` are not yet constructed by any
+// production call site (`main.rs`'s PoC only ever passes `None` -- Verify
+// itself is not implemented this revision, see the module-level doc
+// comment on `write_job.rs`), mirroring `WriteGateError`'s existing
+// `#[allow(dead_code)]` for the same reason.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerifyMode {
+    None,
+    Quick,
+    Full,
 }
 
-impl ConfirmationToken {
-    // `image` and `selection_generation` must both be copied from the
-    // caller's current, already-explicit choices -- an `ImageSelection` the
-    // caller already obtained via `ImageSelection::new()`, and the
-    // `selection_generation` field of the caller's current `SelectionState`
-    // -- never minted fresh here. Taking `image` as a single `ImageSelection`
-    // (rather than a separate `image_size: u64` and `image_generation:
-    // ImageGeneration`) is deliberate: it structurally rules out the mistake
-    // of pairing one image's size with a *different* image's generation,
-    // since both fields always travel together as the one value the caller
-    // got back from a single `ImageSelection::new()` call. Minting either
-    // value fresh here would defeat the entire mechanism: the token has to
-    // freeze exactly what was current *at confirmation time*, so a later
-    // reselect of either the target or the image shows up as a mismatch in
-    // `confirmation_matches` below.
-    pub fn new(
-        target: &DeviceSnapshot,
+// Why `WriteIntent::from_selection` refused to build a `WriteIntent`. Kept
+// deliberately separate from `WriteGateError` (15 variants, almost all of
+// which describe re-verification failures that can only happen inside
+// `prepare_for_open`, after a `WriteIntent` already exists) -- mirrors the
+// existing `SelectionError` precedent of a small, single-purpose error type
+// per construction step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntentBuildError {
+    NoSelection,
+    SelectionInvalidated,
+}
+
+// A pure, immutable snapshot of "what the user confirmed": which target
+// (by block_path/size/diskseq), which Selection event
+// (`selection_generation`), which image (`image_size`/`image_generation`),
+// and under which `VerifyMode` -- all frozen together at the moment of
+// confirmation. `Copy` is not derived (the `String` field rules it out),
+// but this is still a one-time, pre-write construction, never something
+// built inside a write's hot loop.
+//
+// Fields are deliberately private, for the same reason `ImageSelection`'s
+// are: `target_block_path`/`target_size`/`target_diskseq` and
+// `selection_generation` must always come from the *same* `SelectionState`
+// value, never `baseline` from one Selection paired with
+// `selection_generation` from a different one. A struct literal with `pub`
+// fields (or a loose-value constructor taking `baseline` and
+// `selection_generation` as two independent parameters) cannot rule that
+// mismatch out; `from_selection` below is the only way to obtain one, and
+// it destructures both fields out of the same `SelectionState::Selected`
+// match arm.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteIntent {
+    target_block_path: String,
+    target_size: u64,
+    target_diskseq: Option<u64>,
+    selection_generation: SelectionGeneration,
+    image_size: u64,
+    image_generation: ImageGeneration,
+    verify_mode: VerifyMode,
+}
+
+impl WriteIntent {
+    // The only way to construct a `WriteIntent`. `baseline` and
+    // `selection_generation` are pulled out of the same `SelectionState`
+    // match arm, so they can never be mismatched the way two independent
+    // loose parameters could be. Only `SelectionState::Selected` can ever
+    // produce a `WriteIntent`: `NoSelection` and `Invalidated` are rejected
+    // outright, since neither has a baseline worth confirming against.
+    pub fn from_selection(
+        state: &SelectionState,
         image: ImageSelection,
-        selection_generation: SelectionGeneration,
-    ) -> Self {
-        ConfirmationToken {
-            target_block_path: target.block_path.clone(),
-            target_size: target.size,
+        verify_mode: VerifyMode,
+    ) -> Result<WriteIntent, IntentBuildError> {
+        let (baseline, selection_generation) = match state {
+            SelectionState::NoSelection => return Err(IntentBuildError::NoSelection),
+            SelectionState::Invalidated { .. } => {
+                return Err(IntentBuildError::SelectionInvalidated);
+            }
+            SelectionState::Selected {
+                baseline,
+                selection_generation,
+                ..
+            } => (baseline, selection_generation),
+        };
+
+        Ok(WriteIntent {
+            target_block_path: baseline.block_path.clone(),
+            target_size: baseline.size,
+            target_diskseq: baseline.diskseq,
+            selection_generation: *selection_generation,
             image_size: image.image_size(),
             image_generation: image.image_generation(),
-            target_diskseq: target.diskseq,
-            selection_generation,
-        }
+            verify_mode,
+        })
+    }
+
+    pub fn target_block_path(&self) -> &str {
+        &self.target_block_path
+    }
+
+    pub fn target_size(&self) -> u64 {
+        self.target_size
+    }
+
+    pub fn target_diskseq(&self) -> Option<u64> {
+        self.target_diskseq
+    }
+
+    pub fn image_size(&self) -> u64 {
+        self.image_size
+    }
+
+    pub fn verify_mode(&self) -> VerifyMode {
+        self.verify_mode
+    }
+
+    // `pub(crate)`, not `pub`, for the same reason as
+    // `ImageSelection::image_generation()`: opaque by design, only needed by
+    // `confirmation_matches` (below) and this crate's own tests.
+    pub(crate) fn selection_generation(&self) -> SelectionGeneration {
+        self.selection_generation
+    }
+
+    pub(crate) fn image_generation(&self) -> ImageGeneration {
+        self.image_generation
     }
 }
 
-// A token only ever authorizes the exact (target, size, image size, image
-// generation, diskseq generation, selection generation) it was made for.
-// Any difference — a different target, a resized image, a *different*
-// image of the same size (a new `image_generation`, even with `image_size`
-// unchanged), the target having been replugged (a new diskseq) since the
-// token was made, or the user having explicitly reselected the target since
-// (a new `selection_generation`) — is a mismatch, not a "close enough".
-// `image_generation` is what closes the gap `image_size` alone cannot:
-// `image_size` only catches a *resized* image, never same-size image A
-// silently swapped for same-size image B.
+// A token only ever proves "this exact `WriteIntent` was confirmed" -- it
+// is data, not a cryptographic credential, and needs no generation of its
+// own (a stale `WriteIntent` inside it is already stale via the
+// `selection_generation`/`image_generation` it carries). `confirm()` is the
+// only constructor: there is no UI in this codebase yet, so (for now) the
+// only way to obtain a token is to build a `WriteIntent` first and confirm
+// it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfirmationToken {
+    intent: WriteIntent,
+}
+
+impl ConfirmationToken {
+    pub fn confirm(intent: WriteIntent) -> Self {
+        ConfirmationToken { intent }
+    }
+
+    // `pub(crate)`: only `confirmation_matches` (below, same module) and
+    // this crate's own tests have a legitimate reason to look inside a
+    // confirmed token.
+    pub(crate) fn intent(&self) -> &WriteIntent {
+        &self.intent
+    }
+}
+
+// A token only ever authorizes the exact (target, size, diskseq, selection
+// generation, image size, image generation, verify mode) its frozen
+// `WriteIntent` was built for. Any difference -- a different target, a
+// resized image, a *different* image of the same size (a new
+// `image_generation`), the target having been replugged (a new diskseq)
+// since the token was made, the user having explicitly reselected the
+// target since (a new `selection_generation`), or the confirmed
+// `VerifyMode` having changed -- is a mismatch, not a "close enough".
 fn confirmation_matches(
     token: &ConfirmationToken,
     current: &DeviceSnapshot,
     image: ImageSelection,
     current_selection_generation: SelectionGeneration,
+    current_verify_mode: VerifyMode,
 ) -> bool {
-    token.target_block_path == current.block_path
-        && token.target_size == current.size
-        && token.image_size == image.image_size()
-        && token.image_generation == image.image_generation()
-        && token.target_diskseq == current.diskseq
-        && token.selection_generation == current_selection_generation
+    let intent = token.intent();
+
+    intent.target_block_path() == current.block_path.as_str()
+        && intent.target_size() == current.size
+        && intent.target_diskseq() == current.diskseq
+        && intent.selection_generation() == current_selection_generation
+        && intent.image_size() == image.image_size()
+        && intent.image_generation() == image.image_generation()
+        && intent.verify_mode() == current_verify_mode
 }
 
 #[allow(dead_code)]
@@ -574,10 +679,37 @@ pub enum WriteGateError {
 // caller now has the freshly re-verified snapshot plus a valid WritePlan to
 // use when actually calling OpenDevice. Holding this value proves nothing
 // about the FD yet — that is `finalize_prepared_write`'s job.
+//
+// Fields are deliberately private: with `pub` fields, a caller holding a
+// `ReadyToOpen` could overwrite `plan`/`verify_mode` with values the Gate
+// never verified, or swap `current` for a different snapshot, before
+// passing it into `finalize_prepared_write` -- silently defeating the
+// "Gate-decided values travel through unmodified" guarantee `PreparedWrite`/
+// `AuthorizedWrite` already rely on. `prepare_for_open` (below, same module)
+// is the only constructor; there is no public one.
 #[derive(Debug)]
 pub struct ReadyToOpen {
-    pub current: DeviceSnapshot,
-    pub plan: WritePlan,
+    current: DeviceSnapshot,
+    plan: WritePlan,
+    verify_mode: VerifyMode,
+}
+
+impl ReadyToOpen {
+    // `&DeviceSnapshot`, not a narrower projection: `main.rs`'s PoC reads
+    // `block_path` from it today, and `DeviceSnapshot`'s own fields are
+    // already `pub` (see `device.rs`), so this is the minimal way to expose
+    // read access without re-deciding `DeviceSnapshot`'s own field
+    // visibility here.
+    pub fn current(&self) -> &DeviceSnapshot {
+        &self.current
+    }
+
+    // `WritePlan` is `Copy`, so returning it by value is a plain copy, not a
+    // borrow -- consistent with how `ImageSelection`/`WriteIntent` getters
+    // return their `Copy` fields by value elsewhere in this module.
+    pub fn plan(&self) -> WritePlan {
+        self.plan
+    }
 }
 
 // Proof that every gate condition (A through K, plus a matching
@@ -595,6 +727,12 @@ pub struct PreparedWrite {
     pub target_block_path: String,
     pub target_size: u64,
     pub image_size: u64,
+    // `plan`/`verify_mode` travel from here straight into `AuthorizedWrite`
+    // via `begin()` below -- private, since a caller must never be able to
+    // re-supply or override either one; the only values that can ever reach
+    // `AuthorizedWrite` are the exact ones `prepare_for_open` verified.
+    plan: WritePlan,
+    verify_mode: VerifyMode,
     #[allow(dead_code)]
     handle: OpenedDeviceHandle,
 }
@@ -603,11 +741,16 @@ pub struct PreparedWrite {
 // Takes the current `SelectionState` (by reference — this does not mutate
 // ongoing Selection Continuity monitoring) and a target-specific re-fetch
 // the caller already performed (condition B). Reuses `writer::WritePlan` for
-// F/G/H/I instead of re-implementing size validation here.
+// F/G/H/I instead of re-implementing size validation here. `verify_mode` is
+// not derived from `confirmation` -- it is the caller's current choice,
+// checked *against* the confirmation's frozen `WriteIntent` exactly like
+// every other condition below, so a `VerifyMode` change after confirming
+// surfaces as a `ConfirmationMismatch` like any other stale confirmation.
 pub fn prepare_for_open(
     state: &SelectionState,
     refreshed: SnapshotFetchOutcome,
     image: ImageSelection,
+    verify_mode: VerifyMode,
     confirmation: Option<&ConfirmationToken>,
 ) -> Result<ReadyToOpen, WriteGateError> {
     let (baseline, _baseline_assessment, selection_generation) = match state {
@@ -662,11 +805,15 @@ pub fn prepare_for_open(
     // must match this exact target/image/generation.
     let token = confirmation.ok_or(WriteGateError::ConfirmationMissing)?;
 
-    if !confirmation_matches(token, &current, image, *selection_generation) {
+    if !confirmation_matches(token, &current, image, *selection_generation, verify_mode) {
         return Err(WriteGateError::ConfirmationMismatch);
     }
 
-    Ok(ReadyToOpen { current, plan })
+    Ok(ReadyToOpen {
+        current,
+        plan,
+        verify_mode,
+    })
 }
 
 // The second half of the gate (conditions J and K), run after the caller has
@@ -709,6 +856,8 @@ pub fn finalize_prepared_write(
         target_block_path: ready.current.block_path,
         target_size: ready.current.size,
         image_size: ready.plan.image_size,
+        plan: ready.plan,
+        verify_mode: ready.verify_mode,
         handle,
     })
 }
@@ -732,6 +881,16 @@ pub fn finalize_prepared_write(
 // `writer::write()`, and the WrittenTarget/Failed/Cancelled outcomes a real
 // write attempt would produce, remain distinct, later steps this module does
 // not implement.
+// `#[allow(dead_code)]`: these three `pub` fields are read by this module's
+// own tests and exist for a future GUI/Controller's diagnostics, but no
+// production code path reads them today -- `AuthorizedWrite` (what
+// `PreparedWrite::begin()` now returns) does not expose `ActiveWrite`'s
+// fields directly, and `main.rs`'s prepare-test PoC captures the same
+// information from `PreparedWrite` before `begin()` consumes it. Mirrors
+// `write_job.rs`'s own module-level `#![allow(dead_code)]`: nothing here is
+// wired into a real write path yet (`Real-device execution path: NOT
+// CONNECTED`).
+#[allow(dead_code)]
 pub struct ActiveWrite {
     pub target_block_path: String,
     pub target_size: u64,
@@ -739,19 +898,55 @@ pub struct ActiveWrite {
     handle: OpenedDeviceHandle,
 }
 
+// Proof that the Gate authorized not just an FD (`ActiveWrite`), but a
+// specific `WritePlan` and `VerifyMode` to use with it. Bundling the three
+// together as one value closes the same class of gap `ImageSelection` and
+// `WriteIntent` close elsewhere: nothing outside this module can pair the
+// `ActiveWrite` the Gate approved with a `WritePlan`/`VerifyMode` from a
+// different, unrelated Gate pass, because there is no public constructor
+// that accepts them as independent parameters. `WritePlan`/`VerifyMode` are
+// both `Copy`, so bundling them here costs nothing at runtime (no heap
+// allocation, no syscalls) -- this is still a one-time value built once
+// before the write starts, not something reconstructed per chunk.
+pub struct AuthorizedWrite {
+    active: ActiveWrite,
+    plan: WritePlan,
+    verify_mode: VerifyMode,
+}
+
 impl PreparedWrite {
-    // The one and only way to reach an `ActiveWrite`. Takes `self` by value
-    // (not `&self`/`&mut self`), so calling this is the last thing that can
-    // ever be done with a given `PreparedWrite` — the Rust compiler refuses
-    // any further use of the variable that was passed in, which is exactly
-    // the "consumed exactly once" guarantee this type exists to provide.
-    pub fn begin(self) -> ActiveWrite {
-        ActiveWrite {
+    // The one and only way to reach an `AuthorizedWrite`. Takes `self` by
+    // value (not `&self`/`&mut self`), so calling this is the last thing
+    // that can ever be done with a given `PreparedWrite` — the Rust
+    // compiler refuses any further use of the variable that was passed in,
+    // which is exactly the "consumed exactly once" guarantee this type
+    // exists to provide. `plan`/`verify_mode` are carried straight through
+    // from the Gate-verified values `PreparedWrite` already held -- never
+    // re-derived, never re-supplied by the caller.
+    pub fn begin(self) -> AuthorizedWrite {
+        let active = ActiveWrite {
             target_block_path: self.target_block_path,
             target_size: self.target_size,
             image_size: self.image_size,
             handle: self.handle,
+        };
+
+        AuthorizedWrite {
+            active,
+            plan: self.plan,
+            verify_mode: self.verify_mode,
         }
+    }
+}
+
+impl AuthorizedWrite {
+    // `pub(crate)`, not `pub`: the only legitimate consumer is
+    // `write_job::start()`, which immediately re-bundles the three pieces
+    // into `Writing`. No public constructor exists for `AuthorizedWrite`
+    // itself, so this is the only way its parts ever become independently
+    // reachable, and only from within this crate.
+    pub(crate) fn into_parts(self) -> (ActiveWrite, WritePlan, VerifyMode) {
+        (self.active, self.plan, self.verify_mode)
     }
 }
 
@@ -818,6 +1013,31 @@ pub(crate) fn selection_generation_of(state: &SelectionState) -> SelectionGenera
             ..
         } => *selection_generation,
         SelectionState::NoSelection => panic!("NoSelection has no selection_generation"),
+    }
+}
+
+// Test-only, direct `WriteIntent` construction from independent raw parts --
+// the loose-value shape `WriteIntent::from_selection` deliberately does NOT
+// expose in production (see its doc comment). Tests need this to construct
+// intentionally-stale/mismatched `WriteIntent`s (e.g. an old target paired
+// with a current selection_generation) to prove `confirmation_matches`
+// rejects each field independently; production code has no such need and
+// must always go through `from_selection`.
+#[cfg(test)]
+pub(crate) fn write_intent_for_test(
+    target: &DeviceSnapshot,
+    image: ImageSelection,
+    selection_generation: SelectionGeneration,
+    verify_mode: VerifyMode,
+) -> WriteIntent {
+    WriteIntent {
+        target_block_path: target.block_path.clone(),
+        target_size: target.size,
+        target_diskseq: target.diskseq,
+        selection_generation,
+        image_size: image.image_size(),
+        image_generation: image.image_generation(),
+        verify_mode,
     }
 }
 
@@ -1276,12 +1496,13 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(base_device()),
             image,
+            VerifyMode::None,
             Some(&token),
         )
         .unwrap();
@@ -1302,6 +1523,7 @@ mod tests {
             &SelectionState::NoSelection,
             SnapshotFetchOutcome::Found(base_device()),
             ImageSelection::new(TEST_IMAGE_SIZE),
+            VerifyMode::None,
             None,
         );
 
@@ -1318,6 +1540,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(base_device()),
             ImageSelection::new(TEST_IMAGE_SIZE),
+            VerifyMode::None,
             None,
         );
 
@@ -1334,12 +1557,13 @@ mod tests {
         let mut other_target = base_device();
         other_target.block_path = "/org/freedesktop/UDisks2/block_devices/sdz".to_string();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&other_target, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&other_target, image, selection_generation_of(&state), VerifyMode::None));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1353,12 +1577,13 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             ImageSelection::new(TEST_IMAGE_SIZE * 5),
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1374,12 +1599,13 @@ mod tests {
         let state = select(snapshot.clone()).unwrap();
         let state = apply_event(state, &interfaces_removed(&block_path));
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1393,12 +1619,13 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Error("simulated D-Bus failure".to_string()),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1411,7 +1638,7 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let mut current = snapshot;
         current.serial = "OTHER-SERIAL-0002".to_string();
@@ -1420,6 +1647,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(current),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1432,7 +1660,7 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let mut current = snapshot;
         current.serial = String::new();
@@ -1441,6 +1669,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(current),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1453,7 +1682,7 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let mut current = snapshot;
         current.diskseq = Some(19);
@@ -1462,6 +1691,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(current),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1474,7 +1704,7 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let mut current = snapshot;
         current.diskseq = None;
@@ -1483,6 +1713,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(current),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1495,7 +1726,7 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let mut current = snapshot;
         current.hint_system = true;
@@ -1504,6 +1735,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(current),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1517,12 +1749,13 @@ mod tests {
         let state = select(snapshot.clone()).unwrap();
         let too_large = snapshot.size + 1;
         let image = ImageSelection::new(too_large);
-        let token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             image,
+            VerifyMode::None,
             Some(&token),
         );
 
@@ -1538,6 +1771,7 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
+            verify_mode: VerifyMode::None,
         };
 
         let result = finalize_prepared_write(ready, None, None);
@@ -1556,6 +1790,7 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
+            verify_mode: VerifyMode::None,
         };
         let (_path, handle) = test_handle_with_temp_file("mismatch");
 
@@ -1574,6 +1809,7 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
+            verify_mode: VerifyMode::None,
         };
         let (_path, handle) = test_handle_with_temp_file("insufficient");
 
@@ -1599,6 +1835,7 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
+            verify_mode: VerifyMode::None,
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("drop-closes-fd");
@@ -1632,6 +1869,7 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
+            verify_mode: VerifyMode::None,
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("begin-fields");
@@ -1641,7 +1879,11 @@ mod tests {
         let expected_target_size = prepared.target_size;
         let expected_image_size = prepared.image_size;
 
-        let active = prepared.begin();
+        // `begin()` now returns `AuthorizedWrite`, not `ActiveWrite`
+        // directly; `into_parts()` (the only way to take it apart, normally
+        // called only from `write_job::start()`) hands back the exact
+        // `ActiveWrite` this test still wants to inspect.
+        let (active, _plan, _verify_mode) = prepared.begin().into_parts();
 
         assert_eq!(active.target_block_path, expected_block_path);
         assert_eq!(active.target_size, expected_target_size);
@@ -1664,6 +1906,7 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
+            verify_mode: VerifyMode::None,
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("active-drop-closes-fd");
@@ -1675,7 +1918,7 @@ mod tests {
             "fd should still be open right after finalize_prepared_write"
         );
 
-        let active = prepared.begin();
+        let (active, _plan, _verify_mode) = prepared.begin().into_parts();
         let target_before_drop = linux_access::fd_proc_target_for_test(raw_fd);
         assert!(
             target_before_drop.is_some(),
@@ -1699,11 +1942,12 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
+            verify_mode: VerifyMode::None,
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (path, handle) = test_handle_with_persistent_temp_file("write-known-data");
         let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
-        let mut active = prepared.begin();
+        let (mut active, _plan, _verify_mode) = prepared.begin().into_parts();
 
         const PATTERN: &[u8] = b"linux-usb-writer ActiveWriteTarget self-test pattern";
 
@@ -1742,11 +1986,12 @@ mod tests {
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot.clone(),
+            verify_mode: VerifyMode::None,
         };
         let metadata = matching_fd_metadata(&snapshot);
         let (_path, handle) = test_handle_with_temp_file("type-compat");
         let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
-        let mut active = prepared.begin();
+        let (mut active, _plan, _verify_mode) = prepared.begin().into_parts();
 
         let mut target = active.writer_target();
         accepts_write(&mut target);
@@ -1796,12 +2041,13 @@ mod tests {
 
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(image_size);
-        let confirmation = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let confirmation = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
             image,
+            VerifyMode::None,
             Some(&confirmation),
         )
         .expect("prepare_for_open should succeed for a freshly matching snapshot/confirmation");
@@ -1820,7 +2066,13 @@ mod tests {
         let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata))
             .expect("finalize_prepared_write should succeed with matching FD metadata");
 
-        (path, prepared.begin(), plan)
+        // `begin()` returns `AuthorizedWrite` now; this helper still hands
+        // back a plain `ActiveWrite` (via the crate-private `into_parts()`)
+        // since every caller below only exercises `writer_target()`/
+        // `writer::write()` directly, not `write_job::start()`.
+        let (active, _plan, _verify_mode) = prepared.begin().into_parts();
+
+        (path, active, plan)
     }
 
     // Integration A (normal case). The full chain connects end to end for
@@ -1976,11 +2228,12 @@ mod tests {
         snapshot.size = target_size;
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(image_size);
-        let confirmation = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let confirmation = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
             image,
+            VerifyMode::None,
             Some(&confirmation),
         )
         .unwrap();
@@ -1999,7 +2252,7 @@ mod tests {
         let handle = OpenedDeviceHandle::from_file_for_test(read_only_file);
 
         let prepared = finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
-        let mut active = prepared.begin();
+        let (mut active, _plan, _verify_mode) = prepared.begin().into_parts();
 
         let source = std::io::Cursor::new(vec![7u8; image_size as usize]);
         let result = writer::write(&plan, source, active.writer_target(), |_| {}, || false);
@@ -2031,16 +2284,18 @@ mod tests {
         // ImageSelection on both sides too, so image_generation is not the
         // condition under test here either.
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let stale_token = ConfirmationToken::new(
+        let stale_token = ConfirmationToken::confirm(write_intent_for_test(
             &old_snapshot,
             image,
             selection_generation_of(&state),
-        );
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(new_snapshot),
             image,
+            VerifyMode::None,
             Some(&stale_token),
         );
 
@@ -2060,11 +2315,12 @@ mod tests {
         let block_path = original.block_path.clone();
         let state = select(original.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let old_token = ConfirmationToken::new(
+        let old_token = ConfirmationToken::confirm(write_intent_for_test(
             &original,
             image,
             selection_generation_of(&state),
-        );
+            VerifyMode::None,
+        ));
 
         let state = apply_event(state, &interfaces_removed(&block_path));
         assert!(matches!(state, SelectionState::Invalidated { .. }));
@@ -2077,6 +2333,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(reselected_snapshot),
             image,
+            VerifyMode::None,
             Some(&old_token),
         );
 
@@ -2098,7 +2355,7 @@ mod tests {
         // Same ImageSelection (same image_generation) on both sides -- this
         // test isolates selection_generation alone, not image_generation.
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let old_token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let old_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         // Explicit reselect of the exact same device. No replug, no field on
         // `snapshot` differs at all -- only `selection_generation` changes.
@@ -2108,6 +2365,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             image,
+            VerifyMode::None,
             Some(&old_token),
         );
 
@@ -2125,12 +2383,13 @@ mod tests {
 
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let new_token = ConfirmationToken::new(&snapshot, image, selection_generation_of(&state));
+        let new_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             image,
+            VerifyMode::None,
             Some(&new_token),
         );
 
@@ -2186,7 +2445,7 @@ mod tests {
         let state = select(snapshot.clone()).unwrap();
 
         let image_a = ImageSelection::new(TEST_IMAGE_SIZE);
-        let old_token = ConfirmationToken::new(&snapshot, image_a, selection_generation_of(&state));
+        let old_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image_a, selection_generation_of(&state), VerifyMode::None));
 
         // Explicit reselect of a different image, same size. `state` (the
         // target selection) is untouched.
@@ -2198,6 +2457,7 @@ mod tests {
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             image_b,
+            VerifyMode::None,
             Some(&old_token),
         );
 
@@ -2215,12 +2475,13 @@ mod tests {
 
         let _image_a = ImageSelection::new(TEST_IMAGE_SIZE);
         let image_b = ImageSelection::new(TEST_IMAGE_SIZE);
-        let new_token = ConfirmationToken::new(&snapshot, image_b, selection_generation_of(&state));
+        let new_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image_b, selection_generation_of(&state), VerifyMode::None));
 
         let result = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot),
             image_b,
+            VerifyMode::None,
             Some(&new_token),
         );
 
@@ -2291,5 +2552,188 @@ mod tests {
             selection_generation_of(&state_3)
         );
         assert_ne!(image_1.image_generation(), image_3.image_generation());
+    }
+
+    // ---------------------------------------------------------------------
+    // WriteIntent::from_selection
+    // ---------------------------------------------------------------------
+
+    // WriteIntent A. A Selected SelectionState builds a WriteIntent whose
+    // target/selection_generation fields match the same state's own
+    // baseline/selection_generation, and whose image/verify_mode fields
+    // match the caller's own arguments unchanged.
+    #[test]
+    fn write_intent_from_selection_succeeds_for_selected_and_matches_the_same_state() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+
+        let intent = WriteIntent::from_selection(&state, image, VerifyMode::Full)
+            .expect("Selected SelectionState must build a WriteIntent");
+
+        assert_eq!(intent.target_block_path(), snapshot.block_path);
+        assert_eq!(intent.target_size(), snapshot.size);
+        assert_eq!(intent.target_diskseq(), snapshot.diskseq);
+        assert_eq!(intent.selection_generation(), selection_generation_of(&state));
+        assert_eq!(intent.image_size(), image.image_size());
+        assert_eq!(intent.image_generation(), image.image_generation());
+        assert_eq!(intent.verify_mode(), VerifyMode::Full);
+    }
+
+    // WriteIntent B. NoSelection can never build a WriteIntent.
+    #[test]
+    fn write_intent_from_selection_rejects_no_selection() {
+        let result = WriteIntent::from_selection(
+            &SelectionState::NoSelection,
+            ImageSelection::new(TEST_IMAGE_SIZE),
+            VerifyMode::None,
+        );
+
+        assert!(matches!(result, Err(IntentBuildError::NoSelection)));
+    }
+
+    // WriteIntent C. An Invalidated SelectionState can never build a
+    // WriteIntent, regardless of why it was invalidated -- mirrors
+    // `prepare_for_open_rejects_invalidated_selection` for the Gate itself.
+    #[test]
+    fn write_intent_from_selection_rejects_invalidated() {
+        let snapshot = base_device();
+        let block_path = snapshot.block_path.clone();
+        let state = select(snapshot).unwrap();
+        let state = apply_event(state, &interfaces_removed(&block_path));
+        assert!(matches!(state, SelectionState::Invalidated { .. }));
+
+        let result = WriteIntent::from_selection(
+            &state,
+            ImageSelection::new(TEST_IMAGE_SIZE),
+            VerifyMode::None,
+        );
+
+        assert!(matches!(result, Err(IntentBuildError::SelectionInvalidated)));
+    }
+
+    // WriteIntent D. `image_size`/`image_generation` are taken from the
+    // caller's `ImageSelection` unchanged -- not re-derived, not minted
+    // fresh inside `from_selection`.
+    #[test]
+    fn write_intent_preserves_the_given_image_selection() {
+        let state = select(base_device()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+
+        let intent = WriteIntent::from_selection(&state, image, VerifyMode::None).unwrap();
+
+        assert_eq!(intent.image_size(), image.image_size());
+        assert_eq!(intent.image_generation(), image.image_generation());
+    }
+
+    // WriteIntent E. `verify_mode` is taken from the caller's argument
+    // unchanged, for every variant.
+    #[test]
+    fn write_intent_preserves_the_given_verify_mode() {
+        let state = select(base_device()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+
+        for mode in [VerifyMode::None, VerifyMode::Quick, VerifyMode::Full] {
+            let intent = WriteIntent::from_selection(&state, image, mode).unwrap();
+            assert_eq!(intent.verify_mode(), mode);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Stale confirmation: VerifyMode
+    // ---------------------------------------------------------------------
+
+    // Stale confirmation C. A confirmation made while VerifyMode::Quick was
+    // selected must not authorize a write once the caller's current choice
+    // has moved on to VerifyMode::Full -- even though target, image, and
+    // selection_generation are all still identical.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_after_verify_mode_change_quick_to_full() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let intent = WriteIntent::from_selection(&state, image, VerifyMode::Quick).unwrap();
+        let old_token = ConfirmationToken::confirm(intent);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            image,
+            VerifyMode::Full,
+            Some(&old_token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // Stale confirmation D. Same as above, VerifyMode::Full -> VerifyMode::None.
+    #[test]
+    fn prepare_for_open_rejects_confirmation_after_verify_mode_change_full_to_none() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+        let intent = WriteIntent::from_selection(&state, image, VerifyMode::Full).unwrap();
+        let old_token = ConfirmationToken::confirm(intent);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            image,
+            VerifyMode::None,
+            Some(&old_token),
+        );
+
+        assert!(matches!(result, Err(WriteGateError::ConfirmationMismatch)));
+    }
+
+    // Stale confirmation E. Nothing changed (same target, image,
+    // selection_generation, and VerifyMode as the confirmation was made
+    // with) -> the Gate accepts it, for every VerifyMode variant.
+    #[test]
+    fn prepare_for_open_succeeds_when_verify_mode_is_unchanged() {
+        for mode in [VerifyMode::None, VerifyMode::Quick, VerifyMode::Full] {
+            let snapshot = base_device();
+            let state = select(snapshot.clone()).unwrap();
+            let image = ImageSelection::new(TEST_IMAGE_SIZE);
+            let intent = WriteIntent::from_selection(&state, image, mode).unwrap();
+            let token = ConfirmationToken::confirm(intent);
+
+            let result = prepare_for_open(
+                &state,
+                SnapshotFetchOutcome::Found(snapshot),
+                image,
+                mode,
+                Some(&token),
+            );
+
+            assert!(result.is_ok(), "expected Ok for VerifyMode {mode:?}");
+        }
+    }
+
+    // Stale confirmation F. The same VerifyMode change as test C does not
+    // permanently lock the target out -- only the stale token. A freshly
+    // built WriteIntent/ConfirmationToken bound to the new VerifyMode lets
+    // prepare_for_open succeed against the identical target and image.
+    #[test]
+    fn prepare_for_open_succeeds_with_fresh_confirmation_after_verify_mode_change() {
+        let snapshot = base_device();
+        let state = select(snapshot.clone()).unwrap();
+        let image = ImageSelection::new(TEST_IMAGE_SIZE);
+
+        let old_intent = WriteIntent::from_selection(&state, image, VerifyMode::Quick).unwrap();
+        let _old_token = ConfirmationToken::confirm(old_intent);
+
+        let new_intent = WriteIntent::from_selection(&state, image, VerifyMode::Full).unwrap();
+        let new_token = ConfirmationToken::confirm(new_intent);
+
+        let result = prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot),
+            image,
+            VerifyMode::Full,
+            Some(&new_token),
+        );
+
+        assert!(result.is_ok());
     }
 }

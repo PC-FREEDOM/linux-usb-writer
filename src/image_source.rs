@@ -66,7 +66,7 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::core::ImageSelection;
+use crate::execution::core::ImageSelection;
 
 // Why `FileImageSource::new` refused to construct a source. Deliberately
 // small and specific to construction-time failures -- `open_reader()`

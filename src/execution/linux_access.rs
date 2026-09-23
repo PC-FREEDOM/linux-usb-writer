@@ -48,16 +48,13 @@ pub struct OpenedDeviceHandle {
 // `&mut OpenedDeviceHandle` borrow that produced it (see `writer_target`
 // below), so it cannot outlive that one call site's exclusive borrow of the
 // handle, and no two `ActiveWriteTarget`s for the same handle can exist at
-// once. `pub(crate)`, not `pub`: nothing outside this crate could reach it
-// even if it were `pub` (this is a binary crate with no library surface),
-// and within the crate the only intended caller is
-// `core::ActiveWrite::writer_target()` — see that method's doc comment for
-// why this is a documented convention rather than something Rust's
-// module-visibility system can express directly (`linux_access` and `core`
-// are sibling modules, so there is no `pub(in path)` that names "only
-// `core`" without also being reachable from here).
+// once. `pub(in crate::execution)`, not `pub(crate)`: reachable only from
+// within the `execution` module tree (`core`/`linux_access`/`write_job`,
+// see `execution/mod.rs`), not from `main.rs` or any other sibling module.
+// The intended caller within that tree is
+// `core::ActiveWrite::writer_target()` — see that method's doc comment.
 #[allow(dead_code)] // exercised by core.rs's tests today; not yet called from any non-test code path.
-pub(crate) struct ActiveWriteTarget<'a> {
+pub(in crate::execution) struct ActiveWriteTarget<'a> {
     file: &'a mut File,
 }
 
@@ -80,12 +77,9 @@ impl Write for ActiveWriteTarget<'_> {
 // `File::sync_all()` only needs `&File` -- this borrows shared, not
 // exclusive.
 //
-// `pub(crate)`, not `pub`, for the same reason as `ActiveWriteTarget`: the
-// intended (and, as of this revision, only actual) caller is
-// `core::ActiveWrite::sync_target()`. See `ActiveWriteTarget`'s doc comment
-// for why "only core::ActiveWrite calls this" is a documented convention
-// rather than something Rust's visibility system can enforce across sibling
-// modules -- the same limitation applies here.
+// `pub(in crate::execution)`, not `pub(crate)`, for the same reason as
+// `ActiveWriteTarget`: the intended (and, as of this revision, only actual)
+// caller is `core::ActiveWrite::sync_target()`, also inside `execution`.
 //
 // IMPORTANT CAVEAT: `File::sync_all()` (which calls `fsync()` on Linux) is a
 // *candidate* durability primitive, not a confirmed final answer for block
@@ -97,13 +91,13 @@ impl Write for ActiveWriteTarget<'_> {
 // read as claiming that `sync_all()` returning `Ok` means a write is
 // physically durable on real media.
 #[allow(dead_code)] // exercised by core.rs's/write_job.rs's tests today; not yet called from any non-test code path.
-pub(crate) struct SyncTarget<'a> {
+pub(in crate::execution) struct SyncTarget<'a> {
     file: &'a File,
 }
 
 impl SyncTarget<'_> {
     #[allow(dead_code)] // exercised by core.rs's/write_job.rs's tests today; not yet called from any non-test code path.
-    pub(crate) fn sync_all(&self) -> io::Result<()> {
+    pub(in crate::execution) fn sync_all(&self) -> io::Result<()> {
         self.file.sync_all()
     }
 }
@@ -216,7 +210,7 @@ impl OpenedDeviceHandle {
     // `core::ActiveWrite` calls this" is a documented convention (verified by
     // grep) rather than a compiler-enforced guarantee.
     #[allow(dead_code)] // exercised by core.rs's tests today; not yet called from any non-test code path.
-    pub(crate) fn writer_target(&mut self) -> ActiveWriteTarget<'_> {
+    pub(in crate::execution) fn writer_target(&mut self) -> ActiveWriteTarget<'_> {
         ActiveWriteTarget {
             file: &mut self.file,
         }
@@ -231,7 +225,7 @@ impl OpenedDeviceHandle {
     // this crate; see `SyncTarget`'s doc comment for the caller convention
     // and the block-device durability caveat.
     #[allow(dead_code)] // exercised by core.rs's/write_job.rs's tests today; not yet called from any non-test code path.
-    pub(crate) fn sync_target(&self) -> SyncTarget<'_> {
+    pub(in crate::execution) fn sync_target(&self) -> SyncTarget<'_> {
         SyncTarget { file: &self.file }
     }
 

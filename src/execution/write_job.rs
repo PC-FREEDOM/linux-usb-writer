@@ -84,7 +84,7 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use crate::core::{ActiveWrite, AuthorizedWrite, VerifyMode};
+use super::core::{ActiveWrite, AuthorizedWrite, VerifyMode};
 use crate::image_source::SelectedImage;
 use crate::writer::{self, WriteError, WritePlan, WriteProgress};
 
@@ -775,10 +775,10 @@ impl Syncing {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{self, ConfirmationToken};
     use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
+    use crate::execution::core::{self, ConfirmationToken};
+    use crate::execution::linux_access::{FdMetadata, OpenedDeviceHandle};
     use crate::image_source::{FileImageSource, ImageSource, ImageSourceAccess};
-    use crate::linux_access::{FdMetadata, OpenedDeviceHandle};
     use std::io::Cursor;
 
     fn base_device(size: u64) -> DeviceSnapshot {
@@ -1277,7 +1277,7 @@ mod tests {
         // H: still open once ownership has moved into Syncing.
         let syncing = succeeded.begin_sync();
         assert!(
-            crate::linux_access::fd_proc_target_for_test(raw_fd).is_some(),
+            crate::execution::linux_access::fd_proc_target_for_test(raw_fd).is_some(),
             "fd should still be open once ownership has moved into Syncing"
         );
 
@@ -1288,7 +1288,7 @@ mod tests {
         };
 
         // I: still open while SyncSucceeded is alive.
-        let target_before_drop = crate::linux_access::fd_proc_target_for_test(raw_fd);
+        let target_before_drop = crate::execution::linux_access::fd_proc_target_for_test(raw_fd);
         assert!(
             target_before_drop.is_some(),
             "fd should still be open while SyncSucceeded is alive"
@@ -1297,7 +1297,7 @@ mod tests {
         drop(synced);
 
         // J: closed once SyncSucceeded is dropped.
-        crate::linux_access::assert_fd_closed_for_test(raw_fd, target_before_drop.as_deref());
+        crate::execution::linux_access::assert_fd_closed_for_test(raw_fd, target_before_drop.as_deref());
     }
 
     // ---------------------------------------------------------------------

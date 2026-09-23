@@ -1,15 +1,14 @@
-mod core;
 mod device;
+mod execution;
 mod identity;
 mod image_source;
-mod linux_access;
 mod linux_backend;
 mod linux_monitor;
 mod safety;
 mod writer;
-mod write_job;
 
 use device::SnapshotFetchOutcome;
+use execution::{core, linux_access};
 use identity::{compare_identity, compare_instance};
 use linux_backend::{collect_device_snapshot, collect_device_snapshots};
 use linux_monitor::{start_monitoring, DeviceEvent};

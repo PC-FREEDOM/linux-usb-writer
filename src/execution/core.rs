@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
 use crate::identity::{compare_identity, compare_instance, IdentityComparison, InstanceComparison};
-use crate::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle, SyncTarget};
+use super::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle, SyncTarget};
 use crate::linux_monitor::DeviceEvent;
 use crate::safety::{assess_device, RiskLevel, SafetyAssessment};
 use crate::writer::{WriteError as WriterError, WritePlan, DEFAULT_CHUNK_SIZE};
@@ -959,17 +959,20 @@ impl PreparedWrite {
 }
 
 impl AuthorizedWrite {
-    // `pub(crate)`, not `pub`: the only legitimate consumer is
-    // `write_job::start_inner()`, which immediately re-bundles the pieces
-    // into `Writing`. No public constructor exists for `AuthorizedWrite`
-    // itself, so this is the only way its parts ever become independently
-    // reachable, and only from within this crate. Deliberately still a
-    // 3-tuple, not 4: `image_generation` is not added here, since nothing
-    // in the write/sync hot path needs it -- only
+    // `pub(in crate::execution)`, not `pub(crate)`: the only legitimate
+    // consumer is `write_job::start_inner()`, which immediately re-bundles
+    // the pieces into `Writing`. No public constructor exists for
+    // `AuthorizedWrite` itself, so this is the only way its parts ever
+    // become independently reachable, and only from within the `execution`
+    // module tree (`core`/`linux_access`/`write_job`) -- not from `main.rs`,
+    // `image_source.rs`, or any other sibling module (see the Raw Write
+    // Capability Boundary note at the top of `execution/mod.rs`). Deliberately
+    // still a 3-tuple, not 4: `image_generation` is not added here, since
+    // nothing in the write/sync hot path needs it -- only
     // `write_job::AuthorizedExecution::bind()` does, and it reads
     // `image_generation()`/`image_size()` below instead, without consuming
     // `self`.
-    pub(crate) fn into_parts(self) -> (ActiveWrite, WritePlan, VerifyMode) {
+    pub(in crate::execution) fn into_parts(self) -> (ActiveWrite, WritePlan, VerifyMode) {
         (self.active, self.plan, self.verify_mode)
     }
 
@@ -1004,16 +1007,15 @@ impl ActiveWrite {
     // plain `&mut` borrow of the handle `ActiveWrite` already owns, nothing
     // more.
     //
-    // `pub(crate)` rather than `pub`: this stays reachable only from within
-    // this crate (irrelevant in practice, since this is a binary crate with
-    // no external consumers), and — by documented convention, not something
-    // Rust's visibility system can enforce across sibling modules — nothing
-    // in `main.rs` calls this yet. Wiring an `ActiveWriteTarget` obtained
-    // here into an actual `writer::write()` call is a distinct, later step;
-    // this method only proves the capability can be obtained, not that it is
-    // ever used to write anything.
+    // `pub(in crate::execution)` rather than `pub(crate)`: reachable only
+    // from within the `execution` module tree, compiler-enforced (see
+    // `execution/mod.rs`) -- not from `main.rs` or any other sibling module.
+    // Wiring an `ActiveWriteTarget` obtained here into an actual
+    // `writer::write()` call is a distinct, later step; this method only
+    // proves the capability can be obtained, not that it is ever used to
+    // write anything.
     #[allow(dead_code)] // exercised by this module's own tests today; not yet called from main.rs.
-    pub(crate) fn writer_target(&mut self) -> ActiveWriteTarget<'_> {
+    pub(in crate::execution) fn writer_target(&mut self) -> ActiveWriteTarget<'_> {
         self.handle.writer_target()
     }
 
@@ -1028,10 +1030,10 @@ impl ActiveWrite {
     // doc comment for the block-device durability caveat: a successful sync
     // is not, by itself, a confirmed guarantee of physical media durability.
     //
-    // `pub(crate)` rather than `pub`, for the same convention (and the same
-    // Rust visibility limitation across sibling modules) as `writer_target()`.
+    // `pub(in crate::execution)` rather than `pub(crate)`, for the same
+    // reason as `writer_target()` above.
     #[allow(dead_code)] // exercised by this module's/write_job.rs's tests today; not yet called from main.rs.
-    pub(crate) fn sync_target(&self) -> SyncTarget<'_> {
+    pub(in crate::execution) fn sync_target(&self) -> SyncTarget<'_> {
         self.handle.sync_target()
     }
 }
@@ -1088,7 +1090,7 @@ pub(crate) fn write_intent_for_test(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::linux_access;
+    use crate::execution::linux_access;
     use crate::linux_monitor::PropertyChange;
     use crate::writer;
     use std::io::Write;

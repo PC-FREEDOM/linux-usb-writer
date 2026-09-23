@@ -552,6 +552,56 @@ pub struct WritingExecution {
     image: SelectedImage,
 }
 
+impl WritingExecution {
+    // The minimal public surface needed to actually drive a
+    // `WritingExecution` to completion from outside this module. Before this
+    // method existed, `WritingExecution` had no `impl` block at all: both
+    // fields are private, so a caller outside `write_job.rs` holding one
+    // could do nothing with it whatsoever (see this struct's own doc comment
+    // above). This method closes exactly that gap, and nothing more.
+    //
+    // Delegates straight to `Writing::write()` (unchanged, exercised by this
+    // module's own tests since day one) and adds no behavior of its own
+    // beyond also returning `self.image` alongside the result. Takes `self`
+    // by value: the same "consumed exactly once" guarantee every other
+    // state-transition method in this module already provides
+    // (`Writing::write()`, `WriteSucceeded::begin_sync()`,
+    // `Syncing::sync()`) -- there is no `&self`/`&mut self` variant, so the
+    // same `WritingExecution` can never be written twice. Takes no reader
+    // parameter, mirroring `AuthorizedExecution::begin_write()`: the only
+    // bytes ever written are the ones `self.image` already produced when
+    // `begin_write()` opened its reader: there is no way for a caller to
+    // substitute a different one here.
+    //
+    // Returns `(SelectedImage, WriteAttemptOutcome)` rather than exposing
+    // `self.writing`/`self.image` separately, so the two can never be pulled
+    // apart and recombined with something unrelated (the same reasoning
+    // `AuthorizedExecution`/`WritingExecution`'s own doc comments already
+    // give for not exposing their fields). The returned `SelectedImage` is
+    // the exact same value `AuthorizedExecution::bind()` was given -- never
+    // a freshly constructed one, and `open_reader()` is not called again
+    // here -- so a future write/sync/verify orchestration can still reach it
+    // for a second, verify-time reader (see `WritingExecution`'s own doc
+    // comment for why that matters). `WriteAttemptOutcome` is returned
+    // exactly as `Writing::write()` already produces it --
+    // `Succeeded`/`Failed`/`Cancelled` keep their existing fields and
+    // meaning unchanged; this method does not interpret, wrap, or summarize
+    // it further.
+    //
+    // Returns no `ActiveWrite`/`ActiveWriteTarget`/`OpenedDeviceHandle`/raw
+    // fd/`dyn Write`: this method exposes nothing beyond what
+    // `WriteAttemptOutcome`'s existing variants already choose to expose
+    // (`Failed`/`Cancelled` do not carry `active` at all; `WriteSucceeded`
+    // keeps it private with no accessor). The Raw Write Capability Boundary
+    // (`pub(in crate::execution)` on `ActiveWrite::writer_target()` etc.) is
+    // therefore unaffected by adding this method.
+    pub fn write(self, on_progress: impl FnMut(WriteProgress)) -> (SelectedImage, WriteAttemptOutcome) {
+        let WritingExecution { writing, image } = self;
+
+        (image, writing.write(on_progress))
+    }
+}
+
 impl<R: Read> Writing<R> {
     // Consumes this `Writing` to run the one write attempt it was set up
     // for. Calls `writer::write()` exactly once, with `active.writer_target()`
@@ -1551,5 +1601,166 @@ mod tests {
 
         assert_eq!(read_back, data);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // WritingExecution::write()
+    // ---------------------------------------------------------------------
+
+    // O. WritingExecution::write() (the new public entry point) actually
+    // runs the write, relays progress, returns Succeeded, and hands back the
+    // exact same SelectedImage -- checked via its own existing public
+    // identity getters (`selection().image_generation()`/`logical_size()`),
+    // not a new test-only constructor.
+    #[test]
+    fn writing_execution_write_succeeds_and_returns_the_same_selected_image() {
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 240) as u8).collect();
+        let path = write_temp_image_file("writing-execution-write-success", &data);
+        let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+        let original_generation = selected.selection().image_generation();
+        let original_logical_size = selected.logical_size();
+
+        let (target_path, authorized) = gate_pass_active_write_for_image(
+            "writing-execution-write-success-target",
+            selected.selection(),
+            data.len() as u64,
+            true,
+        );
+        let target_path = target_path.expect("persistent temp target path");
+
+        let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+        let writing_execution = execution.begin_write(CancelHandle::new()).unwrap();
+
+        let mut progress_log = Vec::new();
+        let (returned_image, outcome) =
+            writing_execution.write(|progress| progress_log.push(progress.bytes_written));
+
+        assert_eq!(
+            returned_image.selection().image_generation(),
+            original_generation
+        );
+        assert_eq!(returned_image.logical_size(), original_logical_size);
+        assert!(!progress_log.is_empty(), "on_progress should be called at least once");
+
+        let succeeded = match outcome {
+            WriteAttemptOutcome::Succeeded(s) => s,
+            other => panic!("expected Succeeded, got {other:?}"),
+        };
+        assert_eq!(succeeded.bytes_written, data.len() as u64);
+
+        let written = std::fs::read(&target_path).expect("reopen target temp file for read-back");
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(written, data);
+    }
+
+    // P. WritingExecution::write(), cancelled before any chunk, still
+    // returns the same SelectedImage alongside WriteAttemptOutcome::Cancelled
+    // -- reusing the exact same pre-cancel technique as
+    // `cancel_before_any_chunk_is_cancelled_with_user_requested_reason`
+    // above, just through the new public entry point.
+    #[test]
+    fn writing_execution_write_cancelled_before_any_chunk_returns_cancelled_and_same_image() {
+        let data = vec![9u8; 5000];
+        let path = write_temp_image_file("writing-execution-write-cancel", &data);
+        let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+        let original_generation = selected.selection().image_generation();
+
+        let (_target_path, authorized) = gate_pass_active_write_for_image(
+            "writing-execution-write-cancel-target",
+            selected.selection(),
+            data.len() as u64,
+            false,
+        );
+
+        let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+        let cancel = CancelHandle::new();
+        cancel.request_cancel(CancelReason::UserRequested);
+        let writing_execution = execution.begin_write(cancel).unwrap();
+
+        let (returned_image, outcome) = writing_execution.write(|_| {});
+
+        assert_eq!(
+            returned_image.selection().image_generation(),
+            original_generation
+        );
+        let cancelled = match outcome {
+            WriteAttemptOutcome::Cancelled(c) => c,
+            other => panic!("expected Cancelled, got {other:?}"),
+        };
+        assert_eq!(cancelled.bytes_written, 0);
+        assert_eq!(cancelled.reason, CancelReason::UserRequested);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Q. WritingExecution::write(), a genuine target write() failure (EBADF
+    // via a read-only fd -- the same technique as
+    // `target_write_error_is_failed_and_conservatively_flagged_as_modified_even_with_zero_bytes_written`
+    // above) becomes Failed, and the same SelectedImage is still returned.
+    #[test]
+    fn writing_execution_write_target_error_returns_failed_and_same_image() {
+        let image_size = 64u64;
+        let target_size = 128u64;
+        let data = vec![7u8; image_size as usize];
+        let path = write_temp_image_file("writing-execution-write-failure", &data);
+        let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+        let original_generation = selected.selection().image_generation();
+
+        let snapshot = base_device(target_size);
+        let state = core::select(snapshot.clone()).unwrap();
+        let verify_mode = VerifyMode::None;
+        let intent = core::write_intent_for_test(
+            &snapshot,
+            selected.selection(),
+            core::selection_generation_of(&state),
+            verify_mode,
+        );
+        let confirmation = ConfirmationToken::confirm(intent);
+        let ready = core::prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot.clone()),
+            selected.selection(),
+            verify_mode,
+            Some(&confirmation),
+        )
+        .unwrap();
+        let metadata = fd_metadata_matching(&snapshot);
+
+        let target_path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-write-job-test-writing-execution-write-failure-{}.tmp",
+            std::process::id()
+        ));
+        std::fs::File::create(&target_path).expect("create temp file for read-only test");
+        let read_only_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&target_path)
+            .expect("reopen temp file read-only");
+        let handle = OpenedDeviceHandle::from_file_for_test(read_only_file);
+
+        let prepared =
+            core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let authorized = prepared.begin();
+
+        let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+        let writing_execution = execution.begin_write(CancelHandle::new()).unwrap();
+
+        let (returned_image, outcome) = writing_execution.write(|_| {});
+
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            returned_image.selection().image_generation(),
+            original_generation
+        );
+        let failed = match outcome {
+            WriteAttemptOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(matches!(
+            failed.cause,
+            WriteJobFailureCause::Write(WriteError::TargetWrite(_))
+        ));
     }
 }

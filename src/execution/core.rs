@@ -7,9 +7,9 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use super::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle, SyncTarget};
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
 use crate::identity::{compare_identity, compare_instance, IdentityComparison, InstanceComparison};
-use super::linux_access::{ActiveWriteTarget, FdMetadata, OpenedDeviceHandle, SyncTarget};
 use crate::linux_monitor::DeviceEvent;
 use crate::safety::{assess_device, RiskLevel, SafetyAssessment};
 use crate::writer::{WriteError as WriterError, WritePlan, DEFAULT_CHUNK_SIZE};
@@ -237,6 +237,146 @@ fn check_identity_instance_safety(
     Ok(())
 }
 
+// Why `check_identity_instance_for_verify` (below) refused to allow a
+// Verify pass to proceed. Deliberately small and flat, the same style as
+// `IntentBuildError`/`FdBindingCheck` above rather than `InvalidationReason`
+// (which is `Debug`-only, since nothing compares it): this type exists to
+// be matched and asserted on directly, both by this module's own tests and
+// by a future `write_job.rs` Verify state machine converting it into its
+// own, larger `VerifyStartError` -- exactly how `prepare_for_open` (below)
+// already converts `InvalidationReason` into the matching `WriteGateError`
+// variants. `UnsafeTargetState` is deliberately not split further (e.g. into
+// per-field variants such as `SystemDevice`/`ActiveSwap`/`ComplexStorage`):
+// `InvalidationReason::SafetyChanged` sets the existing precedent for not
+// carrying that level of detail in this kind of small, flat pre-check
+// error, and a future Verify layer that needs the specific reason can
+// re-inspect the same `DeviceSnapshot` it already has in hand.
+//
+// `pub(in crate::execution)`, not the plain `pub` `FdBindingCheck`/
+// `WriteGateError` use: unlike `check_fd_binding`/`prepare_for_open` (both
+// plain `pub fn`), `check_identity_instance_for_verify` itself is
+// `pub(in crate::execution)` (its only intended caller, a future
+// `write_job.rs` Verify state machine, is a sibling module inside
+// `execution`) -- keeping this error type at the same, narrower visibility
+// avoids leaving a fully public type reachable crate-wide for a function
+// nothing outside `execution` can actually call yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::execution) enum VerifyTargetCheckError {
+    IdentityChanged,
+    IdentityInsufficient,
+    InstanceRecreated,
+    InstanceInsufficient,
+    UnsafeTargetState,
+}
+
+// Verify-specific counterpart to `check_identity_instance_safety` above,
+// intended as the pre-flight check a future Verify orchestration
+// (`write_job.rs`, a later step) runs immediately before opening a
+// read-only FD for verification. Deliberately NOT implemented by calling
+// `check_identity_instance_safety` and loosening its result afterward: that
+// function requires `assess_device(current).risk_level == Normal &&
+// writable` -- a gate shaped for "is it safe to *write*?". Verify is
+// read-only, and several conditions that correctly make `assess_device`
+// return `Caution`/`writable: false` are expected, benign side effects of a
+// write that already succeeded -- most importantly, the OS/desktop
+// auto-mounting a newly-written filesystem (`RiskReason::MountedFilesystem`)
+// or a hybrid image changing how its partition table is recognized
+// (`RiskReason::NotPartitionable`). Reusing the write-time gate here would
+// make Verify spuriously fail on exactly the real, already-proven-successful
+// MyPocketOS Hybrid ISO scenario (write, then an auto-mounted partition).
+//
+// Identity and Instance are checked with the exact same strictness as write
+// time -- a wrong or replaced target is exactly as unacceptable to read
+// from as it is to write to, so Verify does not relax either check. What
+// Verify does NOT reuse from write time is the Safety Engine's
+// `writable`/`RiskLevel` verdict: instead, a small, explicit set of hazard
+// conditions is checked directly against the fresh `DeviceSnapshot` (see
+// `verify_target_has_hard_hazard` below) -- `safety::assess_device` itself
+// is not called, and is not modified by this function.
+//
+// Pure: no D-Bus, no file I/O, no global state -- takes only the two
+// snapshots already in the caller's hand, exactly like
+// `check_identity_instance_safety`.
+#[allow(dead_code)] // no production caller yet; a future Verify state machine (write_job.rs) is the intended one. Exercised by this module's own tests below.
+pub(in crate::execution) fn check_identity_instance_for_verify(
+    baseline: &DeviceSnapshot,
+    current: &DeviceSnapshot,
+) -> Result<(), VerifyTargetCheckError> {
+    match compare_identity(baseline, current) {
+        IdentityComparison::Changed => return Err(VerifyTargetCheckError::IdentityChanged),
+        IdentityComparison::InsufficientIdentity => {
+            return Err(VerifyTargetCheckError::IdentityInsufficient);
+        }
+        IdentityComparison::Same => {}
+    }
+
+    match compare_instance(baseline, current) {
+        InstanceComparison::Recreated => return Err(VerifyTargetCheckError::InstanceRecreated),
+        InstanceComparison::InsufficientInformation => {
+            return Err(VerifyTargetCheckError::InstanceInsufficient);
+        }
+        InstanceComparison::SameInstance => {}
+    }
+
+    if verify_target_has_hard_hazard(current) {
+        return Err(VerifyTargetCheckError::UnsafeTargetState);
+    }
+
+    Ok(())
+}
+
+// The narrow set of `DeviceSnapshot` conditions that block Verify, read
+// directly from the fresh snapshot rather than through
+// `safety::assess_device` -- see `check_identity_instance_for_verify`'s doc
+// comment for why. Every field checked here also appears somewhere in
+// `assess_device`'s own rule chain, but this is not a re-derivation or a
+// mechanical subset of it: it is Verify's own, independent judgement of
+// which conditions matter for a *read*, and it deliberately omits every
+// condition `assess_device` treats as a write-time-only concern.
+//
+// Excluded on purpose (allowed for Verify -- tolerated as benign or
+// irrelevant post-write changes):
+//   - `mount_points` becoming non-empty (`assess_device`'s
+//     `MountedFilesystem` -> `Caution`) -- expected after writing any
+//     filesystem-bearing image; this is this step's whole reason for
+//     existing (see the regression test below).
+//   - `hint_partitionable` becoming `false` (`assess_device`'s
+//     `NotPartitionable` -> `Caution`) -- some hybrid images legitimately
+//     change how their partition table is recognized.
+//   - `removable`/`connection_bus` reclassification -- if this reflects an
+//     actual device swap, Identity/Instance above already reject it; a
+//     classification change alone (e.g. udev re-enumeration timing) is not
+//     itself treated as a hazard here.
+//   - `read_only` becoming `true` -- reconsidered explicitly for this step
+//     (it was only a tentative hard-hazard candidate in the earlier design
+//     phase). `read_only` reflects UDisks2's own `Block.ReadOnly` property
+//     (see `linux_backend.rs`), a write-restriction signal -- it says
+//     nothing about whether the device can still be *read*, which is all
+//     Verify ever does. Blocking Verify on a newly-`true` `read_only` would
+//     also work against Verify's actual purpose: the scenario most likely
+//     to *cause* an unexpected read-only flip after a successful write --
+//     a hardware fault or media error -- is exactly the scenario where a
+//     user most needs Verify to still be able to read back and report what
+//     is actually on the device. Deliberately not blocked.
+//
+// Included (still block Verify, unchanged from the design phase):
+//   - `hint_system` -- a device the system now considers a system disk is
+//     never an acceptable Verify target, identity match or not.
+//   - `active_swap` -- newly-active swap on a device that was just given a
+//     plain image is a strong signal something is wrong with this target.
+//   - `complex_storage` -- a LUKS/LVM/RAID signature suddenly appearing
+//     indicates either target confusion or a highly unusual write result;
+//     either way, not a state Verify should silently read through.
+//   - `hint_ignore` -- the system now says to leave this device alone.
+//   - `!media_available` -- there is no media to read from at all.
+fn verify_target_has_hard_hazard(current: &DeviceSnapshot) -> bool {
+    current.hint_system
+        || current.active_swap
+        || current.complex_storage
+        || current.hint_ignore
+        || !current.media_available
+}
+
 // Re-verifies the current Selection against a freshly re-fetched
 // DeviceSnapshot for the same target (see
 // `linux_backend::collect_device_snapshot`). Like `apply_event`, this only
@@ -310,7 +450,10 @@ pub enum FdBindingCheck {
 // Instance (same block-device generation?): it only asks whether *this
 // specific FD* is bound to the *device node* the caller expects, using the
 // kernel's own st_rdev/BLKGETSIZE64, independent of D-Bus entirely.
-pub fn check_fd_binding(current: &DeviceSnapshot, fd_metadata: Option<&FdMetadata>) -> FdBindingCheck {
+pub fn check_fd_binding(
+    current: &DeviceSnapshot,
+    fd_metadata: Option<&FdMetadata>,
+) -> FdBindingCheck {
     let Some(fd_metadata) = fd_metadata else {
         return FdBindingCheck::InsufficientInformation;
     };
@@ -1099,8 +1242,7 @@ mod tests {
         DeviceSnapshot {
             device: "/dev/sdx".to_string(),
             block_path: "/org/freedesktop/UDisks2/block_devices/sdx".to_string(),
-            drive_path: "/org/freedesktop/UDisks2/drives/Test_Model_TEST-SERIAL-0001"
-                .to_string(),
+            drive_path: "/org/freedesktop/UDisks2/drives/Test_Model_TEST-SERIAL-0001".to_string(),
             major: 8,
             minor: 0,
             diskseq: Some(12),
@@ -1423,7 +1565,9 @@ mod tests {
     // actually written to it) -- every other test uses the unlink-immediately
     // variant above. The caller is responsible for removing the returned
     // path once done with it.
-    fn test_handle_with_persistent_temp_file(tag: &str) -> (std::path::PathBuf, OpenedDeviceHandle) {
+    fn test_handle_with_persistent_temp_file(
+        tag: &str,
+    ) -> (std::path::PathBuf, OpenedDeviceHandle) {
         use std::sync::atomic::{AtomicU64, Ordering};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1542,7 +1686,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let ready = prepare_for_open(
             &state,
@@ -1603,7 +1752,12 @@ mod tests {
         let mut other_target = base_device();
         other_target.block_path = "/org/freedesktop/UDisks2/block_devices/sdz".to_string();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&other_target, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &other_target,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
@@ -1623,7 +1777,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
@@ -1645,7 +1804,12 @@ mod tests {
         let state = select(snapshot.clone()).unwrap();
         let state = apply_event(state, &interfaces_removed(&block_path));
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
@@ -1665,7 +1829,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
@@ -1684,7 +1853,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let mut current = snapshot;
         current.serial = "OTHER-SERIAL-0002".to_string();
@@ -1706,7 +1880,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let mut current = snapshot;
         current.serial = String::new();
@@ -1728,7 +1907,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let mut current = snapshot;
         current.diskseq = Some(19);
@@ -1750,7 +1934,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let mut current = snapshot;
         current.diskseq = None;
@@ -1772,7 +1961,12 @@ mod tests {
         let snapshot = base_device();
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let mut current = snapshot;
         current.hint_system = true;
@@ -1795,7 +1989,12 @@ mod tests {
         let state = select(snapshot.clone()).unwrap();
         let too_large = snapshot.size + 1;
         let image = ImageSelection::new(too_large);
-        let token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
@@ -2095,7 +2294,12 @@ mod tests {
 
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(image_size);
-        let confirmation = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let confirmation = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let ready = prepare_for_open(
             &state,
@@ -2282,7 +2486,12 @@ mod tests {
         snapshot.size = target_size;
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(image_size);
-        let confirmation = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let confirmation = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
         let ready = prepare_for_open(
             &state,
             SnapshotFetchOutcome::Found(snapshot.clone()),
@@ -2409,7 +2618,12 @@ mod tests {
         // Same ImageSelection (same image_generation) on both sides -- this
         // test isolates selection_generation alone, not image_generation.
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let old_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let old_token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         // Explicit reselect of the exact same device. No replug, no field on
         // `snapshot` differs at all -- only `selection_generation` changes.
@@ -2437,7 +2651,12 @@ mod tests {
 
         let state = select(snapshot.clone()).unwrap();
         let image = ImageSelection::new(TEST_IMAGE_SIZE);
-        let new_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image, selection_generation_of(&state), VerifyMode::None));
+        let new_token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
@@ -2499,7 +2718,12 @@ mod tests {
         let state = select(snapshot.clone()).unwrap();
 
         let image_a = ImageSelection::new(TEST_IMAGE_SIZE);
-        let old_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image_a, selection_generation_of(&state), VerifyMode::None));
+        let old_token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image_a,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         // Explicit reselect of a different image, same size. `state` (the
         // target selection) is untouched.
@@ -2529,7 +2753,12 @@ mod tests {
 
         let _image_a = ImageSelection::new(TEST_IMAGE_SIZE);
         let image_b = ImageSelection::new(TEST_IMAGE_SIZE);
-        let new_token = ConfirmationToken::confirm(write_intent_for_test(&snapshot, image_b, selection_generation_of(&state), VerifyMode::None));
+        let new_token = ConfirmationToken::confirm(write_intent_for_test(
+            &snapshot,
+            image_b,
+            selection_generation_of(&state),
+            VerifyMode::None,
+        ));
 
         let result = prepare_for_open(
             &state,
@@ -2628,7 +2857,10 @@ mod tests {
         assert_eq!(intent.target_block_path(), snapshot.block_path);
         assert_eq!(intent.target_size(), snapshot.size);
         assert_eq!(intent.target_diskseq(), snapshot.diskseq);
-        assert_eq!(intent.selection_generation(), selection_generation_of(&state));
+        assert_eq!(
+            intent.selection_generation(),
+            selection_generation_of(&state)
+        );
         assert_eq!(intent.image_size(), image.image_size());
         assert_eq!(intent.image_generation(), image.image_generation());
         assert_eq!(intent.verify_mode(), VerifyMode::Full);
@@ -2663,7 +2895,10 @@ mod tests {
             VerifyMode::None,
         );
 
-        assert!(matches!(result, Err(IntentBuildError::SelectionInvalidated)));
+        assert!(matches!(
+            result,
+            Err(IntentBuildError::SelectionInvalidated)
+        ));
     }
 
     // WriteIntent D. `image_size`/`image_generation` are taken from the
@@ -2827,5 +3062,208 @@ mod tests {
 
         assert_eq!(authorized.image_generation(), image.image_generation());
         assert_eq!(authorized.image_size(), image.image_size());
+    }
+
+    // ---------------------------------------------------------------------
+    // check_identity_instance_for_verify (Built-in Verify implementation
+    // step 3)
+    // ---------------------------------------------------------------------
+
+    // V1. Identical baseline/current, no hazard: Verify is allowed.
+    #[test]
+    fn verify_target_check_succeeds_for_identical_snapshot() {
+        let baseline = base_device();
+        let current = base_device();
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
+    }
+
+    // V2. A changed serial is rejected, exactly as strictly as write time.
+    #[test]
+    fn verify_target_check_rejects_identity_changed() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.serial = "DIFFERENT-SERIAL".to_string();
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::IdentityChanged)
+        );
+    }
+
+    // V3. Neither snapshot reports a usable serial: Identity cannot be
+    // proven, so Verify is rejected rather than assumed safe.
+    #[test]
+    fn verify_target_check_rejects_identity_insufficient() {
+        let mut baseline = base_device();
+        baseline.serial = String::new();
+        let mut current = base_device();
+        current.serial = String::new();
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::IdentityInsufficient)
+        );
+    }
+
+    // V4. A changed diskseq (unplug/replug, or device re-enumeration) is
+    // rejected, exactly as strictly as write time.
+    #[test]
+    fn verify_target_check_rejects_instance_recreated() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.diskseq = Some(999);
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::InstanceRecreated)
+        );
+    }
+
+    // V5. Missing diskseq information cannot prove Instance sameness, so
+    // Verify is rejected rather than assumed safe.
+    #[test]
+    fn verify_target_check_rejects_instance_insufficient() {
+        let mut baseline = base_device();
+        baseline.diskseq = None;
+        let current = base_device();
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::InstanceInsufficient)
+        );
+    }
+
+    // V6 (the key regression test this step exists for). A device that
+    // gained mount points since the baseline -- exactly what happens when
+    // the OS/desktop auto-mounts a newly-written filesystem, as observed on
+    // real hardware after the MyPocketOS Hybrid ISO write -- must NOT block
+    // Verify. Reusing `check_identity_instance_safety` here would have
+    // rejected this via `assess_device`'s `MountedFilesystem` -> `Caution`.
+    #[test]
+    fn verify_target_check_allows_newly_mounted_filesystem() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.mount_points = vec!["/media/example".to_string()];
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
+    }
+
+    // V7. A device that is no longer reported as partitionable (some hybrid
+    // images legitimately change this) does not block Verify on its own.
+    #[test]
+    fn verify_target_check_allows_not_partitionable_change() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.hint_partitionable = false;
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
+    }
+
+    // V8. A removable/connection_bus reclassification alone -- with Identity
+    // and Instance both unchanged -- does not block Verify; an actual device
+    // swap is caught by the Identity/Instance checks above instead.
+    #[test]
+    fn verify_target_check_allows_removable_and_bus_reclassification() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.removable = false;
+        current.connection_bus = "unknown".to_string();
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
+    }
+
+    // V9. A device the system now considers a system disk is rejected.
+    #[test]
+    fn verify_target_check_rejects_system_device() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.hint_system = true;
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // V10. Newly-active swap on the target is rejected.
+    #[test]
+    fn verify_target_check_rejects_active_swap() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.active_swap = true;
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // V11. A newly-detected LUKS/LVM/RAID signature is rejected.
+    #[test]
+    fn verify_target_check_rejects_complex_storage() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.complex_storage = true;
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // V12. A device the system now says to ignore is rejected.
+    #[test]
+    fn verify_target_check_rejects_hint_ignore() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.hint_ignore = true;
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // V13. Media no longer available (nothing to read) is rejected.
+    #[test]
+    fn verify_target_check_rejects_media_unavailable() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.media_available = false;
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // V14. `read_only` becoming `true` is deliberately NOT a hard hazard for
+    // Verify -- see `verify_target_has_hard_hazard`'s doc comment for the
+    // full rationale (it is a write-restriction signal, irrelevant to a
+    // read-only Verify, and blocking on it would work against Verify's own
+    // diagnostic purpose). This test pins that deliberate design decision.
+    #[test]
+    fn verify_target_check_allows_read_only_becoming_true() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.read_only = true;
+
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
     }
 }

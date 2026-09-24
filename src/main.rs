@@ -13,6 +13,7 @@ use identity::{compare_identity, compare_instance};
 use linux_backend::{collect_device_snapshot, collect_device_snapshots};
 use linux_monitor::{start_monitoring, DeviceEvent};
 use safety::assess_device;
+use std::io::Write as _;
 
 fn main() -> zbus::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -533,6 +534,34 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
     Ok(())
 }
 
+// Simple, dependency-free human-readable size formatting for the Pre-write
+// Safety Summary in `run_write_test` below -- not a general-purpose
+// formatting utility, just enough to show e.g. "8000000000 bytes
+// (7.45 GiB)" without adding a crate for it.
+fn format_size(bytes: u64) -> String {
+    const MIB: f64 = 1024.0 * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+
+    let bytes_f = bytes as f64;
+
+    if bytes_f >= GIB {
+        format!("{bytes} bytes ({:.2} GiB)", bytes_f / GIB)
+    } else if bytes_f >= MIB {
+        format!("{bytes} bytes ({:.2} MiB)", bytes_f / MIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+// Pure comparison used by the Human Confirmation prompt in `run_write_test`
+// below: the operator's raw input line, trimmed, must equal the target's
+// `/dev` node string exactly -- case-sensitive, no partial/prefix match, no
+// "y"/"yes" shortcut. Kept as its own small function (rather than inlined)
+// purely so it can be unit tested without stdin or a real device.
+fn confirmation_matches(input: &str, expected_device: &str) -> bool {
+    input.trim() == expected_device
+}
+
 // PoC mode: Production execution path wiring (`cargo run -- write-test
 // <image-path> <block_path>`). This is the first CLI mode that connects the
 // full, real production path in one straight line: select -> re-verify ->
@@ -560,6 +589,19 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
 // function, exactly like `run_prepare_test`. If OpenDevice needs polkit
 // authentication, this program does nothing but wait for the reply; it
 // never falls back to sudo or any other bypass.
+//
+// Before reaching OpenDevice, this function also runs a Human Confirmation
+// step (see below): a Pre-write Safety Summary, a destructive-write warning,
+// and a prompt requiring the operator to type the target's `/dev` node
+// exactly. This is a second, independent layer on top of (not a
+// replacement for) `core::ConfirmationToken` -- the internal token still
+// exists and is still built and checked exactly as before, just after this
+// human step instead of before it. Everything that already re-verifies the
+// target immediately before OpenDevice (`collect_device_snapshot` +
+// `prepare_for_open`'s Identity/Instance/Safety re-check) is unchanged and,
+// as a consequence of where the human prompt is placed, now runs *after*
+// whatever time the operator took to read the summary and type the
+// confirmation -- not before it.
 fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
     let mut state = attempt_select(&block_path);
 
@@ -575,7 +617,12 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
         return Ok(());
     }
 
-    let core::SelectionState::Selected { baseline, .. } = &state else {
+    let core::SelectionState::Selected {
+        baseline,
+        baseline_assessment,
+        ..
+    } = &state
+    else {
         unreachable!("is_ready_to_open just confirmed Selected");
     };
 
@@ -596,6 +643,55 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
         "\nwrite-test: image selected from {image_path} (image_size={} bytes)",
         selected_image.logical_size()
     );
+
+    // ---- Pre-write Safety Summary / Destructive Warning / Human Confirmation ----
+    // Reuses `baseline`/`baseline_assessment` from the same `state` that
+    // `attempt_select`/`revalidate` already fetched and re-verified above --
+    // no new device probe, no extra D-Bus call added just for this summary.
+    println!("\nwrite-test: Pre-write Safety Summary");
+    println!("Target:");
+    println!("  Device:      {}", baseline.device);
+    println!("  Model:       {} {}", baseline.vendor, baseline.model);
+    println!("  Serial:      {}", baseline.serial);
+    println!("  Size:        {}", format_size(baseline.size));
+    println!("  Bus:         {}", baseline.connection_bus);
+    println!("  Removable:   {}", baseline.removable);
+    if baseline.mount_points.is_empty() {
+        println!("  Mounts:      none");
+    } else {
+        println!("  Mounts:      {}", baseline.mount_points.join(", "));
+    }
+    println!("  Risk:        {:?}", baseline_assessment.risk_level);
+    println!("  Writable:    {}", baseline_assessment.writable);
+    println!("  Reasons:     {:?}", baseline_assessment.reasons);
+    println!("  Block path:  {}", baseline.block_path);
+    println!("  DiskSeq:     {:?}", baseline.diskseq);
+    println!("Image:");
+    println!("  Path:        {image_path}");
+    println!("  Size:        {}", format_size(selected_image.logical_size()));
+    println!();
+    println!("WARNING: Writing will overwrite the target device.");
+    println!("ALL EXISTING DATA ON THIS DEVICE MAY BE DESTROYED. This cannot be undone.");
+    println!();
+
+    let expected_device = baseline.device.clone();
+    println!("Type the target device name exactly to continue: {expected_device}");
+    print!("> ");
+    let _ = std::io::stdout().flush();
+
+    let mut confirmation_input = String::new();
+    let confirmed = match std::io::stdin().read_line(&mut confirmation_input) {
+        Ok(0) => false, // EOF (e.g. stdin closed or redirected from an empty source): treat as "no answer given", never as an implicit yes.
+        Ok(_) => confirmation_matches(&confirmation_input, &expected_device),
+        Err(_) => false,
+    };
+
+    if !confirmed {
+        println!("write-test: confirmation failed; no device was opened and nothing was written");
+        return Ok(());
+    }
+
+    println!("write-test: confirmation accepted for {expected_device}");
 
     // This PoC never implements Verify itself (see CLAUDE.md/reports) --
     // `VerifyMode::None` here only means "no verify policy was chosen yet".
@@ -675,7 +771,16 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
     }
 
     let prepared = match core::finalize_prepared_write(ready, handle_opt, metadata.as_ref()) {
-        Ok(prepared) => prepared,
+        // `finalize_prepared_write` can only reach `Ok` after
+        // `check_fd_binding` (core.rs) itself returned `FdBindingCheck::Match`
+        // -- `Mismatch`/`InsufficientInformation` both return `Err` before a
+        // `PreparedWrite` is ever constructed. So printing "Match" here is
+        // not a guess about internal state; it is what reaching this arm at
+        // all already proves.
+        Ok(prepared) => {
+            println!("write-test: FD binding: Match");
+            prepared
+        }
         Err(error) => {
             println!("write-test: Write Gate rejected after OpenDevice: {error:?}");
             println!("write-test: FD (if any was opened) was already closed via RAII inside the Write Gate");
@@ -873,4 +978,46 @@ fn run_writer_test_inner(temp_path: &std::path::Path) -> Result<(), String> {
     println!("writer-test: read-back verified byte-for-byte identical to the original pattern");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::confirmation_matches;
+
+    // A. Exact match -> true.
+    #[test]
+    fn exact_match_confirms() {
+        assert!(confirmation_matches("/dev/sdb", "/dev/sdb"));
+    }
+
+    // B. A trailing newline (as `read_line` always includes one) is
+    // trimmed before comparing -> still true.
+    #[test]
+    fn trailing_newline_is_trimmed_before_comparing() {
+        assert!(confirmation_matches("/dev/sdb\n", "/dev/sdb"));
+        assert!(confirmation_matches("/dev/sdb\r\n", "/dev/sdb"));
+    }
+
+    // C. A different, even superficially similar, device string -> false.
+    #[test]
+    fn wrong_device_does_not_confirm() {
+        assert!(!confirmation_matches("/dev/sdc", "/dev/sdb"));
+        assert!(!confirmation_matches("/dev/sdb1", "/dev/sdb"));
+    }
+
+    // D. No "y"/"yes" shortcut -- only the exact device string confirms.
+    #[test]
+    fn yes_or_y_does_not_confirm() {
+        assert!(!confirmation_matches("yes\n", "/dev/sdb"));
+        assert!(!confirmation_matches("y\n", "/dev/sdb"));
+    }
+
+    // E. Empty input (including EOF, which this function never sees
+    // directly since `run_write_test` special-cases it, but an empty
+    // trimmed string must still never match a non-empty device) -> false.
+    #[test]
+    fn empty_input_does_not_confirm() {
+        assert!(!confirmation_matches("", "/dev/sdb"));
+        assert!(!confirmation_matches("\n", "/dev/sdb"));
+    }
 }

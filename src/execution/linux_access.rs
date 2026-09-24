@@ -18,7 +18,7 @@ use std::{
     fs::File,
     io::{self, Write},
     os::fd::{AsRawFd, RawFd},
-    os::unix::fs::MetadataExt,
+    os::unix::fs::{FileExt, MetadataExt},
 };
 
 use zbus::{
@@ -102,6 +102,49 @@ impl SyncTarget<'_> {
     }
 }
 
+// A narrow, single-purpose borrow of the underlying `File` for read-only,
+// offset-based reads: the one and only place in this crate where a *read*
+// capability for a Gate-passed FD can be created, for a future Built-in
+// Verify stage to sample or fully re-read a target device's content.
+// Exposes exactly `read_at()` and nothing else -- no `Write`, no `Seek`, no
+// way to recover the raw fd or a plain `File`. Borrows shared (`&File`),
+// like `SyncTarget` above, not exclusive (`&mut File`) like
+// `ActiveWriteTarget`: `FileExt::read_at` needs no exclusive access.
+//
+// `pub(in crate::execution)`, not `pub(crate)`, for the same reason as
+// `ActiveWriteTarget`/`SyncTarget`: this stays inside the same module
+// boundary, reachable only from `core`/`linux_access`/`write_job`, never
+// from `main.rs` or any other sibling module. This revision adds no
+// production caller -- a future Verify state machine in `write_job.rs` is
+// the intended one, exactly as `writer_target()`/`sync_target()` were added
+// before `write_job.rs`'s `Writing`/`Syncing` states existed to call them.
+#[allow(dead_code)] // not yet called from any non-test code path; exercised by this module's own tests below.
+pub(in crate::execution) struct ReadTarget<'a> {
+    file: &'a File,
+}
+
+impl ReadTarget<'_> {
+    // Reads up to `buf.len()` bytes starting at `offset`, via
+    // `FileExt::read_at` -- no shared cursor, no `Seek`: independent of any
+    // `ActiveWriteTarget`/`Write` cursor on the same handle, and independent
+    // of any other `read_at()` call on this or another `ReadTarget` over the
+    // same handle. Ordinary `FileExt::read_at` semantics apply unchanged:
+    // EOF -> `Ok(0)`, a short read -> `Ok(n)` with `n < buf.len()`, a real
+    // I/O failure -> `Err`; no bespoke error type is introduced here.
+    //
+    // Deliberately does NOT clamp to any image `logical_size()`: unlike
+    // `image_source::ImageSource::read_at` (which knows, and enforces, the
+    // *image's* logical size), `ReadTarget` is a low-level capability over
+    // the *target device* and has no notion of how many bytes a particular
+    // Verify pass intends to read -- that bookkeeping belongs to whatever
+    // future Verify layer calls this, exactly as this module's write path
+    // never decides *whether* a write is safe (that is `core.rs`'s job).
+    #[allow(dead_code)] // not yet called from any non-test code path; exercised by this module's own tests below.
+    pub(in crate::execution) fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.file.read_at(buf, offset)
+    }
+}
+
 #[derive(Debug)]
 pub struct FdMetadata {
     pub major: u32,
@@ -124,8 +167,8 @@ pub struct FdMetadata {
 // user's own polkit agent (e.g. a graphical prompt) is answered or the
 // request times out/is denied.
 pub fn open_device(block_path: &str, mode: &str) -> Result<OpenedDeviceHandle, OpenDeviceError> {
-    let connection =
-        Connection::system().map_err(|error| OpenDeviceError::ConnectionFailed(error.to_string()))?;
+    let connection = Connection::system()
+        .map_err(|error| OpenDeviceError::ConnectionFailed(error.to_string()))?;
 
     let block = Proxy::new(
         &connection,
@@ -229,6 +272,20 @@ impl OpenedDeviceHandle {
         SyncTarget { file: &self.file }
     }
 
+    // Hands out a short-lived, read-only, offset-based borrow of the
+    // underlying File -- the one and only place in this crate where a read
+    // capability for a Gate-passed FD can be created. Takes `&self`
+    // (shared), exactly like `sync_target()` above: `FileExt::read_at` needs
+    // no exclusive access. `pub(in crate::execution)` keeps this inside the
+    // same module boundary as `writer_target()`/`sync_target()` --
+    // unreachable from `main.rs` or any other sibling module. See
+    // `ReadTarget`'s own doc comment for why no production caller exists
+    // yet.
+    #[allow(dead_code)] // not yet called from any non-test code path; exercised by this module's own tests below.
+    pub(in crate::execution) fn reader_target(&self) -> ReadTarget<'_> {
+        ReadTarget { file: &self.file }
+    }
+
     // Read-only metadata about the FD itself: no reads or writes of device
     // *contents* are performed, only kernel bookkeeping (fstat, ioctl,
     // /proc/self/fd).
@@ -294,5 +351,188 @@ pub(crate) fn assert_fd_closed_for_test(raw_fd: RawFd, target_before_drop: Optio
             Some(after.as_str()),
             "fd {raw_fd} still resolves to the same target ({after}) after drop -- it was not closed"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Collision-avoidance identical in spirit to the temp-file helpers in
+    // `core.rs`'s/`write_job.rs`'s/`image_source.rs`'s own test modules: PID
+    // + a process-global counter keeps the path unique across
+    // concurrently-running tests. Always a plain regular file under the OS
+    // temp directory -- never a block device, and every handle here is built
+    // via `from_file_for_test`, never `open_device`.
+    fn temp_file_path(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+
+        std::env::temp_dir().join(format!(
+            "linux-usb-writer-linux-access-test-{tag}-{}-{id}.tmp",
+            std::process::id()
+        ))
+    }
+
+    // Writes `data` to a fresh temp file and reopens it read-write (needed
+    // so both `reader_target()` and `writer_target()` can be exercised
+    // against the same `OpenedDeviceHandle` where a test needs both).
+    fn handle_with_content(tag: &str, data: &[u8]) -> (std::path::PathBuf, OpenedDeviceHandle) {
+        let path = temp_file_path(tag);
+        std::fs::write(&path, data).expect("write temp file for linux_access test");
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("reopen temp file read-write for linux_access test");
+        (path, OpenedDeviceHandle::from_file_for_test(file))
+    }
+
+    // 1. reader_target() reads from offset 0 correctly.
+    #[test]
+    fn reader_target_reads_from_offset_zero() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 250) as u8).collect();
+        let (path, handle) = handle_with_content("offset-zero", &data);
+
+        let mut buf = [0u8; 100];
+        let n = handle.reader_target().read_at(0, &mut buf).unwrap();
+
+        assert_eq!(n, 100);
+        assert_eq!(buf, data[..100]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 2. reader_target() reads from a non-zero, mid-file offset correctly.
+    #[test]
+    fn reader_target_reads_from_middle_offset() {
+        let data: Vec<u8> = (0..2000u32).map(|i| (i % 240) as u8).collect();
+        let (path, handle) = handle_with_content("middle-offset", &data);
+
+        let offset = 900u64;
+        let mut buf = [0u8; 100];
+        let n = handle.reader_target().read_at(offset, &mut buf).unwrap();
+
+        assert_eq!(n, 100);
+        assert_eq!(buf, data[900..1000]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 3. Near EOF, read_at() returns a short read of exactly the remaining
+    // bytes, not an error.
+    #[test]
+    fn reader_target_returns_a_short_read_near_eof() {
+        let data: Vec<u8> = (0..500u32).map(|i| (i % 200) as u8).collect();
+        let (path, handle) = handle_with_content("near-eof", &data);
+
+        let mut buf = [0u8; 200]; // requests past the file's end (500)
+        let n = handle.reader_target().read_at(400, &mut buf).unwrap();
+
+        assert_eq!(n, 100);
+        assert_eq!(&buf[..100], &data[400..500]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 4. offset == file size returns Ok(0), no error.
+    #[test]
+    fn reader_target_offset_equal_to_file_size_returns_zero() {
+        let (path, handle) = handle_with_content("offset-eq-size", &[1u8; 300]);
+
+        let mut buf = [0u8; 10];
+        let n = handle.reader_target().read_at(300, &mut buf).unwrap();
+
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 5. offset > file size returns Ok(0), no error.
+    #[test]
+    fn reader_target_offset_past_file_size_returns_zero() {
+        let (path, handle) = handle_with_content("offset-past-size", &[1u8; 300]);
+
+        let mut buf = [0u8; 10];
+        let n = handle.reader_target().read_at(10_000, &mut buf).unwrap();
+
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 6/7. Repeated, out-of-order read_at() calls at different offsets are
+    // fully independent -- there is no shared cursor for one call to
+    // disturb for another.
+    #[test]
+    fn multiple_read_at_calls_out_of_order_are_independent() {
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 230) as u8).collect();
+        let (path, handle) = handle_with_content("out-of-order", &data);
+        let target = handle.reader_target();
+
+        let mut buf_end = [0u8; 100];
+        let mut buf_start = [0u8; 100];
+        let mut buf_middle = [0u8; 100];
+
+        // Deliberately read out of order: end, then start, then middle.
+        target.read_at(2900, &mut buf_end).unwrap();
+        target.read_at(0, &mut buf_start).unwrap();
+        target.read_at(1500, &mut buf_middle).unwrap();
+
+        assert_eq!(buf_end, data[2900..3000]);
+        assert_eq!(buf_start, data[0..100]);
+        assert_eq!(buf_middle, data[1500..1600]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 8. reader_target()'s read_at() never disturbs writer_target()'s
+    // shared `Write`-cursor: a write, an interleaved read_at() at an
+    // unrelated offset, then a second write, must land the second write's
+    // bytes immediately after the first -- exactly as if the read had never
+    // happened -- proving read_at() performs no seek on the shared file
+    // description.
+    #[test]
+    fn reader_target_does_not_disturb_writer_target_cursor() {
+        let (path, mut handle) = handle_with_content("writer-cursor", &[0u8; 20]);
+
+        handle.writer_target().write_all(b"AAAAA").unwrap();
+
+        let mut first_half = [0u8; 5];
+        handle.reader_target().read_at(0, &mut first_half).unwrap();
+        assert_eq!(&first_half, b"AAAAA");
+
+        handle.writer_target().write_all(b"BBBBB").unwrap();
+
+        let mut whole = [0u8; 10];
+        handle.reader_target().read_at(0, &mut whole).unwrap();
+        assert_eq!(&whole, b"AAAAABBBBB");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 9. reader_target() and sync_target() can both be used against the
+    // same handle without interfering with one another.
+    #[test]
+    fn reader_target_and_sync_target_do_not_interfere() {
+        let data = vec![7u8; 50];
+        let (path, handle) = handle_with_content("sync-interop", &data);
+
+        let mut buf = [0u8; 50];
+        handle.reader_target().read_at(0, &mut buf).unwrap();
+        assert_eq!(buf.to_vec(), data);
+
+        handle
+            .sync_target()
+            .sync_all()
+            .expect("sync_all should succeed on a regular file");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // 10. An empty buffer returns Ok(0), never an error.
+    #[test]
+    fn reader_target_with_empty_buffer_returns_zero() {
+        let (path, handle) = handle_with_content("empty-buf", &[1u8; 10]);
+
+        let n = handle.reader_target().read_at(0, &mut []).unwrap();
+
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
     }
 }

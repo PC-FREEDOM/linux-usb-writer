@@ -42,6 +42,25 @@
 //       |  (sync(self): consumes Syncing, calls SyncTarget::sync_all() exactly once)
 //       v
 //   SyncSucceeded   |   Failed(stage = Syncing)
+//       |  (begin_verify(self, image, cancel): consumes SyncSucceeded --
+//       |   see below for the VerifyMode::None short-circuit and the
+//       |   Quick/Full pre-flight phases)
+//       v
+//   VerifyStart::Skipped(image, VerifySucceeded)   -- VerifyMode::None
+//   VerifyStart::Pending(PendingVerify)            -- VerifyMode::Quick/Full
+//       |  (check_target(self, refreshed): Identity/Instance/hazard re-check,
+//       |   via core::check_identity_instance_for_verify -- Step 3)
+//       v
+//   VerifyReadyToOpen
+//       |  (caller calls linux_access::open_device(block_path, "r"), outside
+//       |   this module; finalize(self, opened_handle, fd_metadata): FD
+//       |   binding check, via core::check_fd_binding -- the same anti-TOCTOU
+//       |   final check the write path already uses)
+//       v
+//   Verifying
+//       |  (run(self, on_progress): consumes Verifying, runs Quick or Full)
+//       v
+//   (SelectedImage, VerifyOutcome)   -- Succeeded | Failed | Cancelled
 //
 // `WriteSucceeded` is deliberately NOT a "Completed" outcome: a successful
 // `writer::write()` call (and its internal `Write::flush()`) says nothing
@@ -49,25 +68,56 @@
 // likewise NOT "Completed": `sync_all()` returning `Ok` is a *candidate*
 // durability signal (see `linux_access::SyncTarget`'s doc comment for the
 // block-device durability caveat -- this crate does not claim `sync_all()`
-// succeeding means data has physically reached USB/SD/NVMe media), and no
-// read-back verification has happened yet either way. Wiring
-// `SyncSucceeded -> Verifying -> Completed` is future work this module does
-// not implement yet -- see the doc comment on `SyncSucceeded` for how it
-// keeps that door open.
+// succeeding means data has physically reached USB/SD/NVMe media). Only
+// `VerifySucceeded`/`VerifyOutcome::Succeeded` (or an explicit
+// `VerifyMode::None`, which the user chose) says anything at all about
+// read-back content -- and even then, see `Verifying::run()`'s own doc
+// comment for the page-cache honesty caveat carried over from the design
+// phase.
+//
+// The write-mode FD is retired (dropped) the moment `begin_verify()` is
+// called, for every `VerifyMode` including `None` -- Verify never reuses the
+// write/sync capability (`core::ActiveWrite`/`ActiveWriteTarget`/
+// `SyncTarget`), even to merely hold it open. `VerifyMode::Quick`/`Full`
+// instead open a brand-new, independent, read-only FD via
+// `linux_access::open_device(block_path, "r")`, re-validated from scratch
+// (fresh `DeviceSnapshot`, Identity, Instance, hazard, FD binding) exactly
+// like the original write-mode open was -- this is "Approach B" from the
+// Built-in Verify design phase (reports/latest.md), chosen over reusing the
+// same FD or holding both FDs open simultaneously, specifically to keep the
+// write capability's lifetime as short as possible and to give Verify its
+// own, independently-checked TOCTOU defense rather than trusting the one
+// already performed for the write.
 //
 // NOT implemented in this revision (future, separate steps):
-//   - Verifying / Quick Verify / Full Verify
-//   - a final "Completed" type
+//   - a final "Completed" type unifying write+sync+verify into one summary
 //   - wiring a device-removal signal into `CancelHandle` (the handle itself
 //     is generic enough to support it later; nothing here talks to
 //     `linux_monitor`)
 //   - cancelling mid-sync (`File::sync_all()` is a single blocking syscall
 //     with no chunk loop to poll a cancel flag between iterations -- see
-//     `Syncing::sync()`'s doc comment)
+//     `Syncing::sync()`'s doc comment) -- Verify's own read loop IS
+//     cancellable, unlike sync, since it has a chunk loop to check between
+//     iterations (see `Verifying::run()`)
+//   - retrying a failed/cancelled Verify without a fresh write+sync:
+//     `begin_verify()` consumes `SyncSucceeded`, and neither
+//     `VerifyFailed`/`VerifyCancelled` nor a `VerifyStartError` exposes any
+//     way to reach a `Verifying` again -- a deliberate v0.1 simplicity
+//     choice, not an oversight (see reports/latest.md)
+//   - O_DIRECT / BLKFLSBUF / any other cache-bypassing read strategy for
+//     Verify -- a deliberate v0.1 safety/simplicity choice, see
+//     `Verifying::run()`'s doc comment
 //   - any connection from `main.rs` or any other production call site to
 //     this module -- everything here is exercised only by this module's own
 //     `#[cfg(test)]` tests, against plain regular temp files, never a real
-//     block device.
+//     block device. In particular, nothing in this module ever calls
+//     `linux_backend::collect_device_snapshot()` or
+//     `linux_access::open_device()` itself -- exactly like the existing
+//     write path, `check_target()`/`finalize()` (above) take their results
+//     as caller-supplied parameters, so a future `main.rs` Controller (not
+//     this step) is the one that actually performs those two D-Bus calls,
+//     the same way it already does for the write path's own
+//     `collect_device_snapshot`/`open_device("rw")` calls today.
 //
 // This whole module is therefore unreachable from any production code path
 // today (`main.rs` never names anything in it), which is why every public
@@ -84,8 +134,13 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
-use super::core::{ActiveWrite, AuthorizedWrite, VerifyMode};
-use crate::image_source::SelectedImage;
+use super::core::{
+    check_fd_binding, check_identity_instance_for_verify, ActiveWrite, AuthorizedWrite,
+    FdBindingCheck, VerifyMode, VerifyTargetCheckError,
+};
+use super::linux_access::{FdMetadata, OpenedDeviceHandle, ReadTarget};
+use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
+use crate::image_source::{ImageSourceAccess, SelectedImage};
 use crate::writer::{self, WriteError, WritePlan, WriteProgress};
 
 const CANCEL_NONE: u8 = 0;
@@ -211,9 +266,7 @@ fn target_may_be_modified_for_error(error: &WriteError) -> bool {
         // before ever touching `source` or `target`. In practice a
         // Gate-produced `WritePlan` should never trigger these here, but the
         // match must stay exhaustive.
-        WriteError::InvalidSize | WriteError::InvalidChunkSize | WriteError::ImageTooLarge => {
-            false
-        }
+        WriteError::InvalidSize | WriteError::InvalidChunkSize | WriteError::ImageTooLarge => false,
 
         // Cancelled/SourceTooShort report exactly how many bytes were
         // confirmed written before stopping. Zero means the very first
@@ -392,7 +445,11 @@ pub struct Writing<R: Read> {
 // module's own `#[cfg(test)]` tests (a plain-private `fn` is visible to a
 // module's descendants, and `mod tests` is one), never from any sibling
 // module such as `image_source.rs`.
-fn start_inner<R: Read>(authorized: AuthorizedWrite, source: R, cancel: CancelHandle) -> Writing<R> {
+fn start_inner<R: Read>(
+    authorized: AuthorizedWrite,
+    source: R,
+    cancel: CancelHandle,
+) -> Writing<R> {
     let (active, plan, verify_mode) = authorized.into_parts();
 
     Writing {
@@ -454,7 +511,10 @@ impl AuthorizedExecution {
     // comment) -- not content hashing, and not a guarantee that the two
     // values' underlying bytes are identical, only that they were minted
     // from the same explicit selection event.
-    pub fn bind(authorized: AuthorizedWrite, image: SelectedImage) -> Result<Self, ImageBindingError> {
+    pub fn bind(
+        authorized: AuthorizedWrite,
+        image: SelectedImage,
+    ) -> Result<Self, ImageBindingError> {
         if authorized.image_generation() != image.selection().image_generation() {
             return Err(ImageBindingError::GenerationMismatch);
         }
@@ -595,7 +655,10 @@ impl WritingExecution {
     // keeps it private with no accessor). The Raw Write Capability Boundary
     // (`pub(in crate::execution)` on `ActiveWrite::writer_target()` etc.) is
     // therefore unaffected by adding this method.
-    pub fn write(self, on_progress: impl FnMut(WriteProgress)) -> (SelectedImage, WriteAttemptOutcome) {
+    pub fn write(
+        self,
+        on_progress: impl FnMut(WriteProgress),
+    ) -> (SelectedImage, WriteAttemptOutcome) {
         let WritingExecution { writing, image } = self;
 
         (image, writing.write(on_progress))
@@ -743,10 +806,14 @@ impl WriteSucceeded {
 // reaching this value for "verified", or for "physically durable on real
 // media" beyond what the OS itself reported.
 //
-// Retains the consumed `ActiveWrite` privately, unwrapped and un-dropped,
-// for exactly the reason `WriteSucceeded` does: a future `Verifying` stage
-// needs to move the same fd further without reopening the device or
-// duplicating it.
+// Retains the consumed `ActiveWrite` privately, unwrapped and un-dropped --
+// not so a future `Verifying` stage can keep using the same fd (it does not:
+// `begin_verify()`, below, retires this exact fd by dropping `active` before
+// doing anything else, and opens a brand-new read-only fd for Verify --
+// "Approach B" from the Built-in Verify design phase), but so
+// `begin_verify()` itself can still read `active.baseline()` -- the
+// write-approved `DeviceSnapshot` Verify's own Identity/Instance re-check is
+// measured against -- one last time before that retirement happens.
 pub struct SyncSucceeded {
     pub image_size: u64,
     pub bytes_written: u64,
@@ -822,6 +889,742 @@ impl Syncing {
     }
 }
 
+// ---------------------------------------------------------------------
+// Built-in Verify (implementation step 4): SyncSucceeded -> begin_verify()
+// -> VerifyStart -> [Quick/Full pre-flight] -> Verifying -> run() ->
+// (SelectedImage, VerifyOutcome). See the module-level doc comment above for
+// the full state diagram and reports/latest.md for the design-phase
+// rationale this implementation follows.
+// ---------------------------------------------------------------------
+
+// Quick Verify's fixed sample-window size (design phase: "first 4 MiB,
+// middle 4 MiB, last 4 MiB"). A separate constant from
+// `writer::DEFAULT_CHUNK_SIZE`: the window size decides *how much* of the
+// image Quick Verify samples, while the chunk size (reused from `writer.rs`,
+// see `run_full_verify`/`run_quick_verify` below) decides how much is read
+// into memory at once -- two independent concerns that happen to both
+// default to a "MiB-scale" constant.
+const QUICK_VERIFY_WINDOW_SIZE: u64 = 4 * 1024 * 1024;
+
+// Why `PendingVerify::check_target()` refused to let a Quick/Full Verify
+// proceed past the Identity/Instance/hazard re-check, why
+// `VerifyReadyToOpen::finalize()` refused to let it proceed past the FD
+// binding re-check, or why the snapshot refresh/OpenDevice step itself
+// failed. Deliberately one flat enum for the whole pre-flight sequence
+// (rather than a separate type per phase): every variant here describes a
+// *pre-flight* rejection -- no byte has been read from the target when any
+// of these is produced, exactly mirroring `WriteGateError`'s own existing
+// precedent of covering write's entire multi-phase Gate (Identity/Instance/
+// Safety/size/confirmation/OpenDevice/FD-binding) in one flat type rather
+// than one per phase. `IdentityChanged`/`IdentityInsufficient`/
+// `InstanceRecreated`/`InstanceInsufficient`/`UnsafeTargetState` are a
+// direct relabeling of `core::VerifyTargetCheckError`'s own variants (see
+// `verify_start_error_from_target_check` below) -- not a re-implementation
+// of that check, just this module's own vocabulary for the same outcome,
+// exactly how `prepare_for_open` relabels `InvalidationReason` into
+// `WriteGateError` variants today. `OpenDeviceFailed`/`FdBindingMismatch`/
+// `FdBindingInsufficient` mirror `WriteGateError`'s own identically-named,
+// payload-less variants (the underlying `OpenDeviceError`/`FdBindingCheck`
+// detail is discarded at this same boundary in the write path already, so
+// this does the same, rather than introducing a new precedent).
+#[derive(Debug)]
+pub enum VerifyStartError {
+    SnapshotRefreshFailed,
+    IdentityChanged,
+    IdentityInsufficient,
+    InstanceRecreated,
+    InstanceInsufficient,
+    UnsafeTargetState,
+    OpenDeviceFailed,
+    FdBindingMismatch,
+    FdBindingInsufficient,
+}
+
+// Pure relabeling, no new logic: `core::check_identity_instance_for_verify`
+// (Step 3) already decided everything; this only translates its small,
+// `execution`-internal `VerifyTargetCheckError` into this module's own,
+// `pub` `VerifyStartError` vocabulary. See `VerifyStartError`'s own doc
+// comment for why this mirrors `prepare_for_open`'s existing
+// `InvalidationReason` -> `WriteGateError` relabeling.
+fn verify_start_error_from_target_check(error: VerifyTargetCheckError) -> VerifyStartError {
+    match error {
+        VerifyTargetCheckError::IdentityChanged => VerifyStartError::IdentityChanged,
+        VerifyTargetCheckError::IdentityInsufficient => VerifyStartError::IdentityInsufficient,
+        VerifyTargetCheckError::InstanceRecreated => VerifyStartError::InstanceRecreated,
+        VerifyTargetCheckError::InstanceInsufficient => VerifyStartError::InstanceInsufficient,
+        VerifyTargetCheckError::UnsafeTargetState => VerifyStartError::UnsafeTargetState,
+    }
+}
+
+// The result of calling `SyncSucceeded::begin_verify()`. `VerifyMode::None`
+// resolves immediately and synchronously -- no `DeviceSnapshot` refresh, no
+// D-Bus call, no FD ever opened, exactly as the design phase specified --
+// which is why this variant already carries the final
+// `(SelectedImage, VerifySucceeded)` pair rather than some intermediate
+// state. `VerifyMode::Quick`/`Full` instead need a fresh `DeviceSnapshot`
+// before anything else can be decided, so they produce a `PendingVerify` for
+// the caller to continue from.
+pub enum VerifyStart {
+    Skipped(SelectedImage, VerifySucceeded),
+    Pending(PendingVerify),
+}
+
+// The first pre-flight phase for `VerifyMode::Quick`/`Full`: everything
+// `begin_verify()` could decide *before* a fresh `DeviceSnapshot` exists.
+// Holds `baseline` -- the exact `DeviceSnapshot` this write was authorized
+// against (`core::ActiveWrite::baseline()`, itself the `ReadyToOpen.current`
+// the write Gate re-verified immediately before OpenDevice -- see
+// `core::PreparedWrite::baseline`'s doc comment) -- specifically because it
+// must NOT be a snapshot taken at Verify time: that would make a device
+// silently replaced between write and verify unverifiable, defeating the
+// entire point of re-checking Identity/Instance here at all.
+//
+// Deliberately does not itself perform the snapshot refresh (no D-Bus, no
+// I/O anywhere in this module -- see the module-level doc comment): the
+// caller fetches a fresh `DeviceSnapshot` for `block_path()` (in production,
+// via `linux_backend::collect_device_snapshot`, exactly as the write path's
+// own caller already does) and passes the result to `check_target()`.
+pub struct PendingVerify {
+    baseline: DeviceSnapshot,
+    image: SelectedImage,
+    mode: VerifyMode,
+    cancel: CancelHandle,
+}
+
+impl PendingVerify {
+    // The target to re-fetch a `DeviceSnapshot` for. `&str`, not
+    // `&DeviceSnapshot`: nothing outside this module needs any other field
+    // of `baseline` before the fresh snapshot exists, and this narrower
+    // return type cannot be mistaken for the fresh snapshot itself.
+    pub fn block_path(&self) -> &str {
+        &self.baseline.block_path
+    }
+
+    // Identity/Instance/hazard re-check (Step 3's
+    // `check_identity_instance_for_verify`) against a freshly re-fetched
+    // snapshot. On any rejection, `self.image` is returned alongside the
+    // error rather than silently dropped -- the same "never silently drop a
+    // caller-supplied resource" discipline `WritingExecution::write()`
+    // already established for the write path.
+    pub fn check_target(
+        self,
+        refreshed: SnapshotFetchOutcome,
+    ) -> Result<VerifyReadyToOpen, (SelectedImage, VerifyStartError)> {
+        let current = match refreshed {
+            SnapshotFetchOutcome::Found(snapshot) => snapshot,
+            SnapshotFetchOutcome::NotFound | SnapshotFetchOutcome::Error(_) => {
+                return Err((self.image, VerifyStartError::SnapshotRefreshFailed));
+            }
+        };
+
+        if let Err(error) = check_identity_instance_for_verify(&self.baseline, &current) {
+            return Err((self.image, verify_start_error_from_target_check(error)));
+        }
+
+        Ok(VerifyReadyToOpen {
+            current,
+            image: self.image,
+            mode: self.mode,
+            cancel: self.cancel,
+        })
+    }
+}
+
+// The second, and final, pre-flight phase: Identity/Instance/hazard already
+// passed against `current`; the caller must now call
+// `linux_access::open_device(block_path(), "r")` (outside this module -- see
+// the module-level doc comment) and pass the result to `finalize()`. Mirrors
+// `core::ReadyToOpen` exactly, one step later in the chain and for a
+// read-only open instead of a write-mode one.
+pub struct VerifyReadyToOpen {
+    current: DeviceSnapshot,
+    image: SelectedImage,
+    mode: VerifyMode,
+    cancel: CancelHandle,
+}
+
+impl VerifyReadyToOpen {
+    pub fn block_path(&self) -> &str {
+        &self.current.block_path
+    }
+
+    // FD binding check (`core::check_fd_binding`, the exact same anti-TOCTOU
+    // final check the write path already uses) against the just-opened
+    // read-only FD's own kernel-reported metadata -- independent of D-Bus,
+    // exactly like the write path's own final check. `opened_handle: None`
+    // means the caller's `open_device(..., "r")` call itself failed (there
+    // is no handle to check); `fd_metadata` must already have been read (by
+    // the caller, via `OpenedDeviceHandle::metadata()`) from that same
+    // handle before calling this, exactly mirroring
+    // `core::finalize_prepared_write`'s own contract. On any rejection, the
+    // handle (if any) is simply dropped at the end of this function's scope
+    // -- ordinary RAII closes the fd -- and `self.image` is returned
+    // alongside the error, never silently dropped.
+    pub fn finalize(
+        self,
+        opened_handle: Option<OpenedDeviceHandle>,
+        fd_metadata: Option<&FdMetadata>,
+    ) -> Result<Verifying, (SelectedImage, VerifyStartError)> {
+        let handle = match opened_handle {
+            Some(handle) => handle,
+            None => return Err((self.image, VerifyStartError::OpenDeviceFailed)),
+        };
+
+        match check_fd_binding(&self.current, fd_metadata) {
+            FdBindingCheck::Match => {}
+            FdBindingCheck::Mismatch => {
+                return Err((self.image, VerifyStartError::FdBindingMismatch))
+            }
+            FdBindingCheck::InsufficientInformation => {
+                return Err((self.image, VerifyStartError::FdBindingInsufficient));
+            }
+        }
+
+        Ok(Verifying {
+            handle,
+            image: self.image,
+            mode: self.mode,
+            cancel: self.cancel,
+        })
+    }
+}
+
+// Every condition needed to safely start reading the target for Verify has
+// now held: fresh Identity, fresh Instance, no hard hazard, and the
+// just-opened read-only FD is proven bound to the exact device node just
+// re-verified. `handle` is a brand-new, independent, read-only
+// `OpenedDeviceHandle` -- never the write-mode handle `begin_verify()`
+// already dropped (see the module-level doc comment for "Approach B").
+// Deliberately minimal, like `Writing<R>` before it: no
+// `ImageSourceAccess`/range pre-computation stored here -- `run()` (below)
+// computes what it needs (`quick_verify_ranges()` for `Quick`) from `image`
+// itself, so there is no risk of a stored, stale duplicate of information
+// `image`/`mode` already carry.
+pub struct Verifying {
+    handle: OpenedDeviceHandle,
+    image: SelectedImage,
+    mode: VerifyMode,
+    cancel: CancelHandle,
+}
+
+impl SyncSucceeded {
+    // The one and only way to begin Verify. Takes `self` by value (consumed,
+    // like every other stage transition in this module) plus the exact
+    // `SelectedImage` `AuthorizedExecution::bind()` originally bound this
+    // write to -- `SyncSucceeded` itself does not carry a `SelectedImage`
+    // (see `WritingExecution::write()`'s own doc comment for why: it is
+    // returned to the caller alongside `WriteAttemptOutcome` well before
+    // `Syncing`/`SyncSucceeded` exist, and the caller is the one expected to
+    // hold onto it across the sync stage, exactly as `main.rs`'s own
+    // `run_write_test` PoC already does with its local `selected_image`
+    // variable) -- so it must be supplied here.
+    //
+    // Retires the write-mode capability unconditionally, for every
+    // `VerifyMode` including `None`: `self.active` is dropped (after reading
+    // `baseline()` out of it, for `Quick`/`Full`) before this method returns
+    // anything at all. No FD is ever duplicated or reused across the
+    // write/sync stage and the verify stage -- see the module-level doc
+    // comment's "Approach B" note.
+    pub fn begin_verify(self, image: SelectedImage, cancel: CancelHandle) -> VerifyStart {
+        let SyncSucceeded {
+            active,
+            verify_mode,
+            ..
+        } = self;
+
+        match verify_mode {
+            VerifyMode::None => {
+                drop(active);
+
+                VerifyStart::Skipped(
+                    image,
+                    VerifySucceeded {
+                        mode: VerifyMode::None,
+                        verified_bytes: 0,
+                        skipped: true,
+                    },
+                )
+            }
+            mode @ (VerifyMode::Quick | VerifyMode::Full) => {
+                let baseline = active.baseline().clone();
+                drop(active);
+
+                VerifyStart::Pending(PendingVerify {
+                    baseline,
+                    image,
+                    mode,
+                    cancel,
+                })
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct VerifyProgress {
+    pub verified_bytes: u64,
+    pub total_bytes: u64,
+    pub mode: VerifyMode,
+}
+
+// `VerifyMode::None`: `mode == VerifyMode::None`, `verified_bytes == 0`,
+// `skipped == true`. `Quick`/`Full` success: `skipped == false`,
+// `verified_bytes` equal to the total this mode actually promised to check
+// (the full `image.logical_size()` for `Full`; the merged sample-range total
+// for `Quick` -- see `quick_verify_ranges()` -- never `image.logical_size()`
+// itself for `Quick`, so a caller can never mistake a Quick pass for having
+// checked the whole image).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifySucceeded {
+    pub mode: VerifyMode,
+    pub verified_bytes: u64,
+    pub skipped: bool,
+}
+
+// Why a Quick/Full Verify attempt failed, once byte reading had actually
+// started (contrast `VerifyStartError`, which covers everything that can go
+// wrong *before* any byte is read). `SourceUnexpectedEof`/
+// `TargetUnexpectedEof` are kept distinct from each other (rather than one
+// generic `UnexpectedEof`) because which side ran out is genuinely different
+// diagnostic information -- a short source usually means the same-inode
+// external-modification/shrink limitation `image_source.rs` already
+// documents, while a short target usually means the device shrank or was
+// otherwise not what it claimed to be -- but no further than that: this is
+// not split per-hazard the way it might be, matching `VerifyTargetCheckError
+// ::UnsafeTargetState`'s own precedent of not over-fragmenting a pre-check
+// error type. `Mismatch` keeps only the *first* mismatching byte -- see its
+// own field docs.
+#[derive(Debug)]
+pub enum VerifyFailureReason {
+    SourceReadError(io::Error),
+    TargetReadError(io::Error),
+    SourceUnexpectedEof,
+    TargetUnexpectedEof,
+    // The first byte at which source and target disagreed. Only the first
+    // is ever recorded -- collecting every mismatch would cost unbounded
+    // memory for a large image and provide no more diagnostic value than
+    // "verification failed, and here is where it first went wrong", which
+    // is exactly the design phase's stated goal.
+    Mismatch {
+        offset: u64,
+        expected: u8,
+        actual: u8,
+    },
+    // `VerifyMode::Quick` was requested against a `SelectedImage` whose
+    // `access()` is not `ImageSourceAccess::RandomAccess` (see
+    // `run_quick_verify()`). Deliberately a hard failure, not a silent
+    // fallback to sequential-read-and-discard or to `Full` -- see the design
+    // phase's reasoning: a silent fallback would either misrepresent Quick's
+    // actual performance characteristics, or silently do more work than the
+    // user asked for.
+    UnsupportedAccess,
+}
+
+#[derive(Debug)]
+pub struct VerifyFailed {
+    pub mode: VerifyMode,
+    pub verified_bytes: u64,
+    pub reason: VerifyFailureReason,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifyCancelled {
+    pub mode: VerifyMode,
+    pub verified_bytes: u64,
+}
+
+#[derive(Debug)]
+pub enum VerifyOutcome {
+    Succeeded(VerifySucceeded),
+    Failed(VerifyFailed),
+    Cancelled(VerifyCancelled),
+}
+
+impl Verifying {
+    // Consumes this `Verifying` to run the one Verify attempt it was set up
+    // for -- `VerifyMode::Quick` or `Full` only; `VerifyMode::None` never
+    // reaches this type at all (see `SyncSucceeded::begin_verify()`).
+    // Returns `self.image` back alongside the outcome, exactly like
+    // `WritingExecution::write()` returns `SelectedImage` alongside
+    // `WriteAttemptOutcome` -- on every path (`Succeeded`/`Failed`/
+    // `Cancelled`), never only on success, so a caller never loses the image
+    // it supplied regardless of how Verify ends.
+    //
+    // CACHE HONESTY CAVEAT (carried over from the design phase, see
+    // reports/latest.md): this reads the target via a freshly opened
+    // read-only FD, after `sync_all()` already succeeded during the Sync
+    // stage. Linux's page cache for a block device is keyed to the device
+    // itself, not to any one file descriptor, so this fresh FD does not, by
+    // itself, guarantee the bytes returned bypass all caching and come from
+    // physical media -- no `O_DIRECT`/`BLKFLSBUF` is used here, deliberately
+    // (see the module-level doc comment's "NOT implemented" list). This
+    // Verify confirms the OS reports back the same bytes that were written,
+    // via the same kernel/page-cache path an ordinary read would use --
+    // exactly the same class of evidence this project's own manual
+    // `sudo head -c <size> /dev/sdX | sha256sum` real-device tests already
+    // relied on, now automated and `sudo`-free.
+    pub fn run(self, on_progress: impl FnMut(VerifyProgress)) -> (SelectedImage, VerifyOutcome) {
+        let Verifying {
+            handle,
+            image,
+            mode,
+            cancel,
+        } = self;
+
+        let outcome = match mode {
+            VerifyMode::Full => run_full_verify(&handle, &image, &cancel, on_progress),
+            VerifyMode::Quick => run_quick_verify(&handle, &image, &cancel, on_progress),
+            VerifyMode::None => unreachable!(
+                "VerifyMode::None never reaches Verifying -- see SyncSucceeded::begin_verify()"
+            ),
+        };
+
+        (image, outcome)
+    }
+}
+
+// Reads until `buf` is full or the source is exhausted, retrying on
+// `Interrupted`. Deliberately re-implemented here rather than reused from
+// `writer.rs`: `writer::read_fully` is a private helper of that module (this
+// step's change scope does not extend to `writer.rs`), but the contract
+// needed on Verify's source side -- "a short read that is not an error means
+// true EOF, not 'try again'" -- is identical, so this is a small, independent
+// equivalent rather than a divergent one.
+fn read_fully<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut total = 0;
+
+    while total < buf.len() {
+        match reader.read(&mut buf[total..]) {
+            Ok(0) => break,
+            Ok(n) => total += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(total)
+}
+
+// The `read_at`-based counterpart to `read_fully` above, for
+// `ReadTarget::read_at`'s positional, no-shared-cursor interface: retries a
+// short read by advancing `offset` (never touching any shared file position,
+// since `read_at` has none) until `buf` is full or the target reports true
+// EOF (`Ok(0)`).
+fn read_at_fully(target: &ReadTarget<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+
+    while filled < buf.len() {
+        match target.read_at(offset + filled as u64, &mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(filled)
+}
+
+// The offset of the first byte at which `a` and `b` differ, within the
+// shared length of the two slices (both are always called here with equal
+// lengths -- see `run_full_verify`/`run_quick_verify`). `None` means the two
+// slices are identical.
+fn first_mismatch(a: &[u8], b: &[u8]) -> Option<usize> {
+    a.iter().zip(b.iter()).position(|(x, y)| x != y)
+}
+
+// Full Verify: reads `image.logical_size()` bytes from a *second*,
+// independent `open_reader()` call on `image` (never rewinding the
+// write-time reader `Writing::write()` already consumed -- see
+// `image_source.rs`'s own doc comment for why `SelectedImage` supports this)
+// and from `handle`'s read-only target, in lockstep, `writer::
+// DEFAULT_CHUNK_SIZE` (1 MiB, the same constant the write path already uses)
+// bytes at a time, comparing each chunk and stopping at the very first
+// mismatching byte. Checks `cancel` once before any I/O and once per chunk
+// thereafter -- no chunk is read after a cancellation request is observed.
+fn run_full_verify(
+    handle: &OpenedDeviceHandle,
+    image: &SelectedImage,
+    cancel: &CancelHandle,
+    mut on_progress: impl FnMut(VerifyProgress),
+) -> VerifyOutcome {
+    if cancel.is_requested() {
+        return VerifyOutcome::Cancelled(VerifyCancelled {
+            mode: VerifyMode::Full,
+            verified_bytes: 0,
+        });
+    }
+
+    let image_size = image.logical_size();
+
+    let mut source = match image.open_reader() {
+        Ok(reader) => reader,
+        Err(error) => {
+            return VerifyOutcome::Failed(VerifyFailed {
+                mode: VerifyMode::Full,
+                verified_bytes: 0,
+                reason: VerifyFailureReason::SourceReadError(error),
+            });
+        }
+    };
+
+    let target = handle.reader_target();
+    let chunk_size = writer::DEFAULT_CHUNK_SIZE;
+    let mut source_buf = vec![0u8; chunk_size];
+    let mut target_buf = vec![0u8; chunk_size];
+    let mut offset: u64 = 0;
+
+    while offset < image_size {
+        if cancel.is_requested() {
+            return VerifyOutcome::Cancelled(VerifyCancelled {
+                mode: VerifyMode::Full,
+                verified_bytes: offset,
+            });
+        }
+
+        let remaining = image_size - offset;
+        let want = remaining.min(chunk_size as u64) as usize;
+
+        let n_src = match read_fully(&mut *source, &mut source_buf[..want]) {
+            Ok(n) => n,
+            Err(error) => {
+                return VerifyOutcome::Failed(VerifyFailed {
+                    mode: VerifyMode::Full,
+                    verified_bytes: offset,
+                    reason: VerifyFailureReason::SourceReadError(error),
+                });
+            }
+        };
+
+        if n_src < want {
+            return VerifyOutcome::Failed(VerifyFailed {
+                mode: VerifyMode::Full,
+                verified_bytes: offset,
+                reason: VerifyFailureReason::SourceUnexpectedEof,
+            });
+        }
+
+        let n_tgt = match read_at_fully(&target, offset, &mut target_buf[..want]) {
+            Ok(n) => n,
+            Err(error) => {
+                return VerifyOutcome::Failed(VerifyFailed {
+                    mode: VerifyMode::Full,
+                    verified_bytes: offset,
+                    reason: VerifyFailureReason::TargetReadError(error),
+                });
+            }
+        };
+
+        if n_tgt < want {
+            return VerifyOutcome::Failed(VerifyFailed {
+                mode: VerifyMode::Full,
+                verified_bytes: offset,
+                reason: VerifyFailureReason::TargetUnexpectedEof,
+            });
+        }
+
+        if let Some(index) = first_mismatch(&source_buf[..want], &target_buf[..want]) {
+            return VerifyOutcome::Failed(VerifyFailed {
+                mode: VerifyMode::Full,
+                verified_bytes: offset,
+                reason: VerifyFailureReason::Mismatch {
+                    offset: offset + index as u64,
+                    expected: source_buf[index],
+                    actual: target_buf[index],
+                },
+            });
+        }
+
+        offset += want as u64;
+
+        on_progress(VerifyProgress {
+            verified_bytes: offset,
+            total_bytes: image_size,
+            mode: VerifyMode::Full,
+        });
+    }
+
+    VerifyOutcome::Succeeded(VerifySucceeded {
+        mode: VerifyMode::Full,
+        verified_bytes: offset,
+        skipped: false,
+    })
+}
+
+// Computes the byte ranges Quick Verify samples for an image of
+// `image_size` bytes: first `QUICK_VERIFY_WINDOW_SIZE`, middle
+// `QUICK_VERIFY_WINDOW_SIZE`, last `QUICK_VERIFY_WINDOW_SIZE`, each clamped
+// to `image_size`, then sorted and merged so overlapping or adjacent windows
+// collapse into one. For `image_size <= 3 * QUICK_VERIFY_WINDOW_SIZE` (or
+// smaller), the three windows overlap enough that this naturally collapses
+// to a single `(0, image_size)` range -- Quick Verify's actual coverage
+// becomes identical to Full's for a small enough image, exactly as the
+// design phase specified, with no special-cased "small image" branch needed
+// here: the merge logic alone produces that result. Pure, no I/O, no
+// allocation beyond the small `Vec` returned -- trivially unit-testable on
+// its own (see this module's tests).
+fn quick_verify_ranges(image_size: u64) -> Vec<(u64, u64)> {
+    if image_size == 0 {
+        return Vec::new();
+    }
+
+    let window = QUICK_VERIFY_WINDOW_SIZE.min(image_size);
+
+    let first = (0u64, window);
+    let last = (image_size - window, window);
+    let middle_start = (image_size / 2)
+        .saturating_sub(window / 2)
+        .min(image_size - window);
+    let middle = (middle_start, window);
+
+    let mut ranges = [first, middle, last];
+    ranges.sort_by_key(|&(offset, _)| offset);
+
+    let mut merged: Vec<(u64, u64)> = Vec::new();
+    for (offset, len) in ranges {
+        let end = offset + len;
+
+        if let Some(last_range) = merged.last_mut() {
+            let (last_offset, last_len) = *last_range;
+            let last_end = last_offset + last_len;
+
+            if offset <= last_end {
+                *last_range = (last_offset, end.max(last_end) - last_offset);
+                continue;
+            }
+        }
+
+        merged.push((offset, len));
+    }
+
+    merged
+}
+
+// Quick Verify: refuses to start against a `SelectedImage` whose `access()`
+// is not `ImageSourceAccess::RandomAccess` (see `VerifyFailureReason::
+// UnsupportedAccess`'s own doc comment for why this is a hard failure, not a
+// silent fallback) -- checked first, before any I/O. Otherwise, reads each
+// merged sample range (`quick_verify_ranges()`) via `SelectedImage::
+// read_at()` on the source side and `ReadTarget::read_at()` on the target
+// side, `writer::DEFAULT_CHUNK_SIZE`-sized pieces at a time within each range
+// (never the whole 4 MiB window as one buffer, to keep memory use the same
+// as Full Verify's), comparing as it goes and stopping at the first
+// mismatch. `total_bytes` for progress is the sum of the merged ranges'
+// lengths, never `image.logical_size()` -- see `VerifyProgress`'s own doc
+// comment.
+fn run_quick_verify(
+    handle: &OpenedDeviceHandle,
+    image: &SelectedImage,
+    cancel: &CancelHandle,
+    mut on_progress: impl FnMut(VerifyProgress),
+) -> VerifyOutcome {
+    if image.access() != ImageSourceAccess::RandomAccess {
+        return VerifyOutcome::Failed(VerifyFailed {
+            mode: VerifyMode::Quick,
+            verified_bytes: 0,
+            reason: VerifyFailureReason::UnsupportedAccess,
+        });
+    }
+
+    if cancel.is_requested() {
+        return VerifyOutcome::Cancelled(VerifyCancelled {
+            mode: VerifyMode::Quick,
+            verified_bytes: 0,
+        });
+    }
+
+    let ranges = quick_verify_ranges(image.logical_size());
+    let total_bytes: u64 = ranges.iter().map(|&(_, len)| len).sum();
+
+    let target = handle.reader_target();
+    let chunk_size = writer::DEFAULT_CHUNK_SIZE;
+    let mut source_buf = vec![0u8; chunk_size];
+    let mut target_buf = vec![0u8; chunk_size];
+    let mut verified_bytes: u64 = 0;
+
+    for (range_offset, range_len) in ranges {
+        let mut inner_offset: u64 = 0;
+
+        while inner_offset < range_len {
+            if cancel.is_requested() {
+                return VerifyOutcome::Cancelled(VerifyCancelled {
+                    mode: VerifyMode::Quick,
+                    verified_bytes,
+                });
+            }
+
+            let remaining_in_range = range_len - inner_offset;
+            let want = remaining_in_range.min(chunk_size as u64) as usize;
+            let absolute_offset = range_offset + inner_offset;
+
+            let n_src = match image.read_at(absolute_offset, &mut source_buf[..want]) {
+                Ok(n) => n,
+                Err(error) => {
+                    return VerifyOutcome::Failed(VerifyFailed {
+                        mode: VerifyMode::Quick,
+                        verified_bytes,
+                        reason: VerifyFailureReason::SourceReadError(error),
+                    });
+                }
+            };
+
+            if n_src < want {
+                return VerifyOutcome::Failed(VerifyFailed {
+                    mode: VerifyMode::Quick,
+                    verified_bytes,
+                    reason: VerifyFailureReason::SourceUnexpectedEof,
+                });
+            }
+
+            let n_tgt = match read_at_fully(&target, absolute_offset, &mut target_buf[..want]) {
+                Ok(n) => n,
+                Err(error) => {
+                    return VerifyOutcome::Failed(VerifyFailed {
+                        mode: VerifyMode::Quick,
+                        verified_bytes,
+                        reason: VerifyFailureReason::TargetReadError(error),
+                    });
+                }
+            };
+
+            if n_tgt < want {
+                return VerifyOutcome::Failed(VerifyFailed {
+                    mode: VerifyMode::Quick,
+                    verified_bytes,
+                    reason: VerifyFailureReason::TargetUnexpectedEof,
+                });
+            }
+
+            if let Some(index) = first_mismatch(&source_buf[..want], &target_buf[..want]) {
+                return VerifyOutcome::Failed(VerifyFailed {
+                    mode: VerifyMode::Quick,
+                    verified_bytes,
+                    reason: VerifyFailureReason::Mismatch {
+                        offset: absolute_offset + index as u64,
+                        expected: source_buf[index],
+                        actual: target_buf[index],
+                    },
+                });
+            }
+
+            inner_offset += want as u64;
+            verified_bytes += want as u64;
+
+            on_progress(VerifyProgress {
+                verified_bytes,
+                total_bytes,
+                mode: VerifyMode::Quick,
+            });
+        }
+    }
+
+    VerifyOutcome::Succeeded(VerifySucceeded {
+        mode: VerifyMode::Quick,
+        verified_bytes,
+        skipped: false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -835,8 +1638,7 @@ mod tests {
         DeviceSnapshot {
             device: "/dev/sdx".to_string(),
             block_path: "/org/freedesktop/UDisks2/block_devices/sdx".to_string(),
-            drive_path: "/org/freedesktop/UDisks2/drives/Test_Model_TEST-SERIAL-0001"
-                .to_string(),
+            drive_path: "/org/freedesktop/UDisks2/drives/Test_Model_TEST-SERIAL-0001".to_string(),
             major: 8,
             minor: 0,
             diskseq: Some(12),
@@ -994,11 +1796,14 @@ mod tests {
         let image_size = SOURCE.len() as u64;
         let target_size = image_size + 100;
 
-        let (path, authorized) =
-            gate_pass_active_write("success", image_size, target_size, true);
+        let (path, authorized) = gate_pass_active_write("success", image_size, target_size, true);
         let path = path.expect("persistent temp file path");
 
-        let writing = start_inner(authorized, Cursor::new(SOURCE.to_vec()), CancelHandle::new());
+        let writing = start_inner(
+            authorized,
+            Cursor::new(SOURCE.to_vec()),
+            CancelHandle::new(),
+        );
         let outcome = writing.write(|_| {});
 
         let succeeded = match outcome {
@@ -1031,7 +1836,11 @@ mod tests {
         let cancel = CancelHandle::new();
         cancel.request_cancel(CancelReason::UserRequested);
 
-        let writing = start_inner(authorized, Cursor::new(vec![1u8; image_size as usize]), cancel);
+        let writing = start_inner(
+            authorized,
+            Cursor::new(vec![1u8; image_size as usize]),
+            cancel,
+        );
         let outcome = writing.write(|_| {});
 
         let cancelled = match outcome {
@@ -1154,8 +1963,7 @@ mod tests {
             .expect("reopen temp file read-only");
         let handle = OpenedDeviceHandle::from_file_for_test(read_only_file);
 
-        let prepared =
-            core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let prepared = core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
         let authorized = prepared.begin();
 
         let source = Cursor::new(vec![7u8; image_size as usize]);
@@ -1312,8 +2120,7 @@ mod tests {
         let handle = OpenedDeviceHandle::from_file_for_test(file);
         let raw_fd = handle.raw_fd_for_test();
 
-        let prepared =
-            core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let prepared = core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
         let authorized = prepared.begin();
 
         let data = vec![8u8; image_size as usize];
@@ -1347,7 +2154,10 @@ mod tests {
         drop(synced);
 
         // J: closed once SyncSucceeded is dropped.
-        crate::execution::linux_access::assert_fd_closed_for_test(raw_fd, target_before_drop.as_deref());
+        crate::execution::linux_access::assert_fd_closed_for_test(
+            raw_fd,
+            target_before_drop.as_deref(),
+        );
     }
 
     // ---------------------------------------------------------------------
@@ -1571,7 +2381,10 @@ mod tests {
         assert!(result.is_err());
 
         let target_contents = std::fs::read(&target_path).expect("reopen target temp file");
-        assert!(target_contents.is_empty(), "no bytes should have reached the target");
+        assert!(
+            target_contents.is_empty(),
+            "no bytes should have reached the target"
+        );
         let _ = std::fs::remove_file(&target_path);
     }
 
@@ -1640,7 +2453,10 @@ mod tests {
             original_generation
         );
         assert_eq!(returned_image.logical_size(), original_logical_size);
-        assert!(!progress_log.is_empty(), "on_progress should be called at least once");
+        assert!(
+            !progress_log.is_empty(),
+            "on_progress should be called at least once"
+        );
 
         let succeeded = match outcome {
             WriteAttemptOutcome::Succeeded(s) => s,
@@ -1738,8 +2554,7 @@ mod tests {
             .expect("reopen temp file read-only");
         let handle = OpenedDeviceHandle::from_file_for_test(read_only_file);
 
-        let prepared =
-            core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
+        let prepared = core::finalize_prepared_write(ready, Some(handle), Some(&metadata)).unwrap();
         let authorized = prepared.begin();
 
         let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
@@ -1762,5 +2577,1024 @@ mod tests {
             failed.cause,
             WriteJobFailureCause::Write(WriteError::TargetWrite(_))
         ));
+    }
+
+    // ---------------------------------------------------------------------
+    // Built-in Verify (implementation step 4)
+    // ---------------------------------------------------------------------
+
+    // Drives the full production chain -- Gate -> AuthorizedExecution::bind()
+    // -> begin_write() -> write() -> begin_sync() -> sync() -- from a real
+    // `SelectedImage`/`FileImageSource` (unlike `gate_pass_write_succeeded`
+    // above, which uses a raw in-memory `Cursor`), because Full/Quick Verify
+    // need a genuine `open_reader()`/`read_at()`-capable source, never a
+    // block device. Returns the target path (always persistent -- Verify
+    // tests need to reopen, and sometimes corrupt, it afterward), the same
+    // `SelectedImage` `WritingExecution::write()` handed back, the resulting
+    // `SyncSucceeded`, and the `DeviceSnapshot` used as the Gate's baseline
+    // (so a test can build a deliberately-modified "fresh" snapshot from it).
+    fn gate_pass_sync_succeeded(
+        tag: &str,
+        source_data: &[u8],
+        target_size: u64,
+        verify_mode: VerifyMode,
+    ) -> (
+        std::path::PathBuf,
+        SelectedImage,
+        SyncSucceeded,
+        DeviceSnapshot,
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
+
+        let source_path = write_temp_image_file(&format!("verify-source-{tag}"), source_data);
+        let source = FileImageSource::new(&source_path).expect("open source image for verify test");
+        let selected_image = SelectedImage::new(Box::new(source));
+
+        let snapshot = base_device(target_size);
+        let state = core::select(snapshot.clone()).unwrap();
+        let intent = core::write_intent_for_test(
+            &snapshot,
+            selected_image.selection(),
+            core::selection_generation_of(&state),
+            verify_mode,
+        );
+        let confirmation = ConfirmationToken::confirm(intent);
+
+        let ready = core::prepare_for_open(
+            &state,
+            SnapshotFetchOutcome::Found(snapshot.clone()),
+            selected_image.selection(),
+            verify_mode,
+            Some(&confirmation),
+        )
+        .expect("prepare_for_open should succeed for a freshly matching snapshot/confirmation");
+
+        let metadata = fd_metadata_matching(&snapshot);
+
+        let target_path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-write-job-verify-test-{tag}-{}-{id}.tmp",
+            std::process::id()
+        ));
+        let target_file =
+            std::fs::File::create(&target_path).expect("create target temp file for verify test");
+        let handle = OpenedDeviceHandle::from_file_for_test(target_file);
+
+        let prepared = core::finalize_prepared_write(ready, Some(handle), Some(&metadata))
+            .expect("finalize_prepared_write should succeed with matching FD metadata");
+        let authorized = prepared.begin();
+
+        let execution = AuthorizedExecution::bind(authorized, selected_image)
+            .expect("bind should succeed for a freshly minted SelectedImage");
+        let writing_execution = execution
+            .begin_write(CancelHandle::new())
+            .expect("begin_write should succeed for a freshly opened reader");
+
+        let (selected_image, outcome) = writing_execution.write(|_| {});
+        let write_succeeded = match outcome {
+            WriteAttemptOutcome::Succeeded(s) => s,
+            other => {
+                panic!("expected write to succeed while setting up a verify test, got {other:?}")
+            }
+        };
+
+        let sync_outcome = write_succeeded.begin_sync().sync();
+        let sync_succeeded = match sync_outcome {
+            SyncAttemptOutcome::Succeeded(s) => s,
+            other => {
+                panic!("expected sync to succeed while setting up a verify test, got {other:?}")
+            }
+        };
+
+        (target_path, selected_image, sync_succeeded, snapshot)
+    }
+
+    // Drives `sync_succeeded` all the way to a `Verifying`, using
+    // `target_snapshot` as the "freshly re-fetched" snapshot (identical to
+    // the Gate's own baseline for every test that isn't specifically
+    // exercising Identity/Instance/hazard rejection) and reopening
+    // `target_path` read-only as the "just-opened read-only FD"
+    // `linux_access::open_device(block_path, "r")` would have produced in
+    // production. Panics loudly (with the actual error) if either
+    // pre-flight phase unexpectedly rejects -- exactly what a test setup
+    // helper should do, since an unexpected rejection here means the test
+    // itself is broken, not the thing under test.
+    fn verifying_from_sync_succeeded(
+        sync_succeeded: SyncSucceeded,
+        image: SelectedImage,
+        cancel: CancelHandle,
+        target_snapshot: &DeviceSnapshot,
+        target_path: &std::path::Path,
+    ) -> Verifying {
+        let pending = match sync_succeeded.begin_verify(image, cancel) {
+            VerifyStart::Pending(pending) => pending,
+            VerifyStart::Skipped(..) => {
+                panic!("expected Pending for a Quick/Full verify_mode, got Skipped")
+            }
+        };
+
+        let ready = pending
+            .check_target(SnapshotFetchOutcome::Found(target_snapshot.clone()))
+            .unwrap_or_else(|(_, error)| {
+                panic!("check_target should succeed for a matching fresh snapshot, got {error:?}")
+            });
+
+        let read_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(target_path)
+            .expect("reopen target file read-only for verify test");
+        let read_handle = OpenedDeviceHandle::from_file_for_test(read_file);
+        let metadata = fd_metadata_matching(target_snapshot);
+
+        ready
+            .finalize(Some(read_handle), Some(&metadata))
+            .unwrap_or_else(|(_, error)| {
+                panic!("finalize should succeed for a matching FD, got {error:?}")
+            })
+    }
+
+    // Overwrites the byte at `offset` in the file at `path` -- used to
+    // simulate a post-write corruption (bit rot, a bad sector, wrong target,
+    // ...) for the Full/Quick mismatch-detection tests below. Never touches
+    // any other byte, so tests can reason exactly about which single offset
+    // should be reported as the first mismatch.
+    fn corrupt_byte_at(path: &std::path::Path, offset: u64, new_byte: u8) {
+        use std::io::{Seek, SeekFrom, Write as _};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("reopen target file to corrupt a byte for verify test");
+        file.seek(SeekFrom::Start(offset))
+            .expect("seek to corruption offset");
+        file.write_all(&[new_byte]).expect("write corrupted byte");
+    }
+
+    // A minimal `ImageSource` whose reader yields `fail_after` real bytes and
+    // then a genuine `io::Error` -- used only to exercise Full/Quick Verify's
+    // `SourceReadError` path. `FileImageSource` cannot be made to fail a
+    // read on demand (same reasoning as `FailingImageSource` above, which
+    // covers the *open* failure case instead), so this is a small,
+    // independent test-only source.
+    struct FailingAfterNBytesSource {
+        logical_size: u64,
+        fail_after: usize,
+    }
+
+    struct FailingAfterNBytesReader {
+        remaining_ok: usize,
+    }
+
+    impl Read for FailingAfterNBytesReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining_ok == 0 {
+                return Err(io::Error::other("simulated source read failure"));
+            }
+            let to_write = buf.len().min(self.remaining_ok);
+            for byte in &mut buf[..to_write] {
+                *byte = 0xAA;
+            }
+            self.remaining_ok -= to_write;
+            Ok(to_write)
+        }
+    }
+
+    impl ImageSource for FailingAfterNBytesSource {
+        fn logical_size(&self) -> u64 {
+            self.logical_size
+        }
+
+        fn access(&self) -> ImageSourceAccess {
+            ImageSourceAccess::SequentialReplay
+        }
+
+        fn open_reader(&self) -> io::Result<Box<dyn Read>> {
+            Ok(Box::new(FailingAfterNBytesReader {
+                remaining_ok: self.fail_after,
+            }))
+        }
+    }
+
+    // V1 (VerifyMode::None). begin_verify() with VerifyMode::None resolves
+    // immediately to Skipped(image, VerifySucceeded{mode:None,
+    // verified_bytes:0, skipped:true}) -- no DeviceSnapshot, no
+    // OpenedDeviceHandle, no FdMetadata is ever constructed or passed in
+    // this test, which is itself the proof that begin_verify() cannot need
+    // any of them for this mode (there is no other way for this test to
+    // even compile if it did).
+    #[test]
+    fn verify_mode_none_produces_immediate_skipped_success_without_any_handle() {
+        let (_path, _image, sync_succeeded) = {
+            let (path, image, sync_succeeded, _snapshot) =
+                gate_pass_sync_succeeded("none-mode", b"hello verify", 100, VerifyMode::None);
+            (path, image, sync_succeeded)
+        };
+
+        let start = sync_succeeded.begin_verify(_image, CancelHandle::new());
+
+        let (returned_image, succeeded) = match start {
+            VerifyStart::Skipped(image, succeeded) => (image, succeeded),
+            VerifyStart::Pending(_) => panic!("expected Skipped for VerifyMode::None"),
+        };
+
+        assert_eq!(succeeded.mode, VerifyMode::None);
+        assert_eq!(succeeded.verified_bytes, 0);
+        assert!(succeeded.skipped);
+        assert_eq!(returned_image.logical_size(), 12);
+
+        let _ = std::fs::remove_file(&_path);
+    }
+
+    // V2 (Full success). Exact match: Full Verify succeeds,
+    // verified_bytes == image_size, and progress's final report also equals
+    // image_size.
+    #[test]
+    fn full_verify_exact_match_succeeds_with_progress_reaching_image_size() {
+        let data = b"full verify exact match test data, several chunks worth".repeat(20_000);
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "full-exact-match",
+            &data,
+            data.len() as u64,
+            VerifyMode::Full,
+        );
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let mut progress_log = Vec::new();
+        let (_image, outcome) = verifying.run(|p| progress_log.push(p));
+
+        let _ = std::fs::remove_file(&target_path);
+
+        let succeeded = match outcome {
+            VerifyOutcome::Succeeded(s) => s,
+            other => panic!("expected Succeeded, got {other:?}"),
+        };
+        assert_eq!(succeeded.mode, VerifyMode::Full);
+        assert_eq!(succeeded.verified_bytes, data.len() as u64);
+        assert!(!succeeded.skipped);
+        assert_eq!(
+            progress_log.last().unwrap().verified_bytes,
+            data.len() as u64
+        );
+        assert_eq!(progress_log.last().unwrap().total_bytes, data.len() as u64);
+    }
+
+    // V3 (Full mismatch at first byte). A corruption at offset 0 is
+    // detected with the exact offset/expected/actual bytes, and
+    // verified_bytes reflects how far comparison got before stopping (0,
+    // since the very first chunk's compare already failed).
+    #[test]
+    fn full_verify_detects_mismatch_at_first_byte() {
+        let data = vec![0x11u8; 5000];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "full-mismatch-first",
+            &data,
+            data.len() as u64,
+            VerifyMode::Full,
+        );
+        corrupt_byte_at(&target_path, 0, 0x99);
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert_eq!(failed.verified_bytes, 0);
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::Mismatch {
+                offset: 0,
+                expected: 0x11,
+                actual: 0x99
+            }
+        ));
+    }
+
+    // V4 (Full mismatch in the middle). The reported offset is the exact
+    // absolute byte, and verified_bytes equals the chunk-aligned amount
+    // already confirmed matching before the mismatching chunk.
+    #[test]
+    fn full_verify_detects_mismatch_in_the_middle_with_correct_offset() {
+        let image_size = 3 * writer::DEFAULT_CHUNK_SIZE as u64;
+        let data = vec![0x22u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("full-mismatch-middle", &data, image_size, VerifyMode::Full);
+        let corrupt_offset = writer::DEFAULT_CHUNK_SIZE as u64 + 500;
+        corrupt_byte_at(&target_path, corrupt_offset, 0x77);
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert_eq!(failed.verified_bytes, writer::DEFAULT_CHUNK_SIZE as u64);
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::Mismatch { offset, expected: 0x22, actual: 0x77 }
+                if offset == corrupt_offset
+        ));
+    }
+
+    // V5 (Full mismatch at the last byte). The final byte of a
+    // non-chunk-aligned image is compared and correctly reported.
+    #[test]
+    fn full_verify_detects_mismatch_at_last_byte() {
+        let image_size = writer::DEFAULT_CHUNK_SIZE as u64 + 777;
+        let data = vec![0x33u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("full-mismatch-last", &data, image_size, VerifyMode::Full);
+        let last_offset = image_size - 1;
+        corrupt_byte_at(&target_path, last_offset, 0x44);
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::Mismatch { offset, expected: 0x33, actual: 0x44 }
+                if offset == last_offset
+        ));
+    }
+
+    // V6 (target shorter than image). The target file is truncated shorter
+    // than image_size after write/sync (simulating the device somehow
+    // reporting less data than expected) -- Full Verify reports
+    // TargetUnexpectedEof, not a silent short success.
+    #[test]
+    fn full_verify_target_shorter_than_image_is_target_unexpected_eof() {
+        let image_size = 5000u64;
+        let data = vec![0x55u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("full-target-short", &data, image_size, VerifyMode::Full);
+
+        {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&target_path)
+                .expect("reopen target to truncate it");
+            file.set_len(3000).expect("truncate target file");
+        }
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::TargetUnexpectedEof
+        ));
+    }
+
+    // V7 (source read error). The source errors genuinely (not merely runs
+    // short) partway through -- reported as SourceReadError, distinct from
+    // SourceUnexpectedEof. Uses a normal, working write/sync setup for the
+    // target (via `gate_pass_sync_succeeded`), then swaps in a deliberately
+    // failing `SelectedImage` only for the `begin_verify()` call itself --
+    // `begin_verify()`/`PendingVerify`/`Verifying` never re-check that the
+    // image passed to them is the same one `AuthorizedExecution::bind()`
+    // used at write time (that binding only matters for starting a write),
+    // so this is a legitimate, minimal way to exercise Verify's own
+    // source-read-error path in isolation, without needing a whole second
+    // Gate/write/sync sequence to fail on purpose.
+    #[test]
+    fn full_verify_source_read_error_is_reported() {
+        let image_size = 5000u64;
+        let (target_path, _working_image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "full-source-error",
+            &vec![0u8; image_size as usize],
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let failing_image = SelectedImage::new(Box::new(FailingAfterNBytesSource {
+            logical_size: image_size,
+            fail_after: 2000,
+        }));
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            failing_image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::SourceReadError(_)
+        ));
+    }
+
+    // V8 (target read error). Opening the "read-only" handle without read
+    // permission (write-only) forces a genuine EBADF on the first
+    // `read_at()` call -- reported as TargetReadError.
+    #[test]
+    fn full_verify_target_read_error_is_reported() {
+        let image_size = 4000u64;
+        let data = vec![0x66u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("full-target-error", &data, image_size, VerifyMode::Full);
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+        let ready = pending
+            .check_target(SnapshotFetchOutcome::Found(snapshot.clone()))
+            .unwrap_or_else(|(_, e)| panic!("check_target should succeed, got {e:?}"));
+
+        // Write-only, no read permission -- read_at() on this handle must
+        // fail with a genuine I/O error, not merely a short read.
+        let write_only_file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&target_path)
+            .expect("reopen target write-only for target-read-error test");
+        let handle = OpenedDeviceHandle::from_file_for_test(write_only_file);
+        let metadata = fd_metadata_matching(&snapshot);
+
+        let verifying = ready
+            .finalize(Some(handle), Some(&metadata))
+            .unwrap_or_else(|(_, e)| panic!("finalize should succeed, got {e:?}"));
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::TargetReadError(_)
+        ));
+    }
+
+    // V9. quick_verify_ranges() for a large image produces three distinct,
+    // non-overlapping first/middle/last ranges, and their total matches the
+    // sum QuickVerify's own progress total would report.
+    #[test]
+    fn quick_verify_ranges_for_large_image_produces_distinct_ranges() {
+        let image_size = 100 * 1024 * 1024u64;
+        let ranges = quick_verify_ranges(image_size);
+
+        assert_eq!(ranges.len(), 3);
+        for &(offset, len) in &ranges {
+            assert_eq!(len, QUICK_VERIFY_WINDOW_SIZE);
+            assert!(offset + len <= image_size);
+        }
+        // Ranges are sorted and non-overlapping.
+        assert!(ranges[0].0 + ranges[0].1 <= ranges[1].0);
+        assert!(ranges[1].0 + ranges[1].1 <= ranges[2].0);
+
+        let total: u64 = ranges.iter().map(|&(_, len)| len).sum();
+        assert_eq!(total, 3 * QUICK_VERIFY_WINDOW_SIZE);
+    }
+
+    // V10. quick_verify_ranges() for a small image (<= 3 windows) merges
+    // into a single range covering the entire image -- Quick's coverage
+    // becomes identical to Full's.
+    #[test]
+    fn quick_verify_ranges_for_small_image_merges_to_full_coverage() {
+        let image_size = 5 * 1024 * 1024u64; // < 3 * 4 MiB
+        let ranges = quick_verify_ranges(image_size);
+
+        assert_eq!(ranges, vec![(0, image_size)]);
+    }
+
+    // V11 (Quick success). An exact match passes Quick Verify, and
+    // verified_bytes/progress total equal the merged sample total, never
+    // image.logical_size().
+    #[test]
+    fn quick_verify_exact_match_succeeds_with_sampled_total_bytes() {
+        let image_size = 20 * 1024 * 1024u64; // large enough for 3 distinct windows
+        let data = vec![0x88u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("quick-exact-match", &data, image_size, VerifyMode::Quick);
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let mut progress_log = Vec::new();
+        let (_image, outcome) = verifying.run(|p| progress_log.push(p));
+        let _ = std::fs::remove_file(&target_path);
+
+        let succeeded = match outcome {
+            VerifyOutcome::Succeeded(s) => s,
+            other => panic!("expected Succeeded, got {other:?}"),
+        };
+        let expected_total = 3 * QUICK_VERIFY_WINDOW_SIZE;
+        assert_eq!(succeeded.verified_bytes, expected_total);
+        assert_ne!(expected_total, image_size, "sanity: sampled total must differ from the full image size for this test to be meaningful");
+        assert_eq!(progress_log.last().unwrap().total_bytes, expected_total);
+        assert_eq!(progress_log.last().unwrap().verified_bytes, expected_total);
+    }
+
+    // V12 (Quick sampled mismatch). A corruption placed inside the first
+    // sample window is detected.
+    #[test]
+    fn quick_verify_detects_mismatch_in_a_sampled_region() {
+        let image_size = 20 * 1024 * 1024u64;
+        let data = vec![0x99u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "quick-sampled-mismatch",
+            &data,
+            image_size,
+            VerifyMode::Quick,
+        );
+        // Offset 10 is within the first 4 MiB window.
+        corrupt_byte_at(&target_path, 10, 0x00);
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::Mismatch {
+                offset: 10,
+                expected: 0x99,
+                actual: 0x00
+            }
+        ));
+    }
+
+    // V13 (Quick's documented limitation, pinned). A corruption placed
+    // strictly between the sampled windows is NOT detected -- Quick Verify
+    // still reports Succeeded. This is not a bug: it is the exact,
+    // documented boundary of what Quick Verify promises (see
+    // `VerifyFailureReason`'s and the module-level doc comment's own
+    // discussion). This test exists so a future change to the sampling
+    // algorithm cannot silently make Quick secretly-Full (or vice versa)
+    // without this test failing to flag the behavior change.
+    #[test]
+    fn quick_verify_does_not_detect_mismatch_in_an_unsampled_region() {
+        let image_size = 20 * 1024 * 1024u64;
+        let data = vec![0xAAu8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "quick-unsampled-mismatch",
+            &data,
+            image_size,
+            VerifyMode::Quick,
+        );
+
+        // Confirm this offset really does fall strictly outside every
+        // sampled range before relying on that fact.
+        let ranges = quick_verify_ranges(image_size);
+        // For a 20 MiB image the three 4 MiB windows sit at [0,4), [8,12),
+        // [16,20) MiB -- 6 MiB falls squarely in the [4,8) MiB gap between
+        // the first and middle windows.
+        let corrupt_offset = 6 * 1024 * 1024u64;
+        assert!(
+            ranges
+                .iter()
+                .all(|&(offset, len)| corrupt_offset < offset || corrupt_offset >= offset + len),
+            "test setup bug: corruption offset falls inside a sampled range"
+        );
+        corrupt_byte_at(&target_path, corrupt_offset, 0xFF);
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        assert!(
+            matches!(outcome, VerifyOutcome::Succeeded(_)),
+            "expected Quick Verify to succeed despite the unsampled corruption, got {outcome:?}"
+        );
+    }
+
+    // V14. Quick Verify against a non-RandomAccess `SelectedImage` fails
+    // immediately with UnsupportedAccess, rather than silently falling back
+    // to a sequential read-and-discard or to Full.
+    #[test]
+    fn quick_verify_refuses_a_non_random_access_source() {
+        let image_size = 20 * 1024 * 1024u64;
+        let data = vec![0xBBu8; image_size as usize];
+        let (target_path, _image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "quick-unsupported-access",
+            &data,
+            image_size,
+            VerifyMode::Quick,
+        );
+
+        // A `FailingAfterNBytesSource` with a huge `fail_after` never
+        // actually fails a read in this test -- it exists here purely
+        // because it reports `SequentialReplay`, unlike `FileImageSource`.
+        let sequential_image = SelectedImage::new(Box::new(FailingAfterNBytesSource {
+            logical_size: image_size,
+            fail_after: usize::MAX,
+        }));
+
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            sequential_image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let failed = match outcome {
+            VerifyOutcome::Failed(f) => f,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(matches!(
+            failed.reason,
+            VerifyFailureReason::UnsupportedAccess
+        ));
+        assert_eq!(failed.verified_bytes, 0);
+    }
+
+    // V15 (Full cancellation before any chunk). Requesting cancellation
+    // before `run()` is even called yields Cancelled with verified_bytes ==
+    // 0, and no chunk comparison is ever attempted.
+    #[test]
+    fn full_verify_cancel_before_any_chunk_is_cancelled_with_zero_verified_bytes() {
+        let image_size = 5000u64;
+        let data = vec![0xCCu8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("full-cancel-immediate", &data, image_size, VerifyMode::Full);
+
+        let cancel = CancelHandle::new();
+        cancel.request_cancel(CancelReason::UserRequested);
+
+        let verifying =
+            verifying_from_sync_succeeded(sync_succeeded, image, cancel, &snapshot, &target_path);
+
+        let (_image, outcome) = verifying.run(|_| {});
+        let _ = std::fs::remove_file(&target_path);
+
+        let cancelled = match outcome {
+            VerifyOutcome::Cancelled(c) => c,
+            other => panic!("expected Cancelled, got {other:?}"),
+        };
+        assert_eq!(cancelled.mode, VerifyMode::Full);
+        assert_eq!(cancelled.verified_bytes, 0);
+    }
+
+    // V16 (Full cancellation partway). Cancelling after the first chunk
+    // leaves 0 < verified_bytes < image_size.
+    #[test]
+    fn full_verify_cancel_partway_reports_partial_verified_bytes() {
+        let image_size = 3 * writer::DEFAULT_CHUNK_SIZE as u64;
+        let data = vec![0xDDu8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("full-cancel-partial", &data, image_size, VerifyMode::Full);
+
+        let cancel = CancelHandle::new();
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            cancel.clone(),
+            &snapshot,
+            &target_path,
+        );
+
+        let mut chunks_seen = 0;
+        let (_image, outcome) = verifying.run(|_progress| {
+            chunks_seen += 1;
+            if chunks_seen == 1 {
+                cancel.request_cancel(CancelReason::UserRequested);
+            }
+        });
+        let _ = std::fs::remove_file(&target_path);
+
+        let cancelled = match outcome {
+            VerifyOutcome::Cancelled(c) => c,
+            other => panic!("expected Cancelled, got {other:?}"),
+        };
+        assert!(cancelled.verified_bytes > 0);
+        assert!(cancelled.verified_bytes < image_size);
+    }
+
+    // V17 (Quick cancellation partway). Cancelling after the first chunk of
+    // the first sample range leaves 0 < verified_bytes < the sampled total.
+    #[test]
+    fn quick_verify_cancel_partway_reports_partial_verified_bytes() {
+        let image_size = 20 * 1024 * 1024u64;
+        let data = vec![0xEEu8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("quick-cancel-partial", &data, image_size, VerifyMode::Quick);
+
+        let cancel = CancelHandle::new();
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            cancel.clone(),
+            &snapshot,
+            &target_path,
+        );
+
+        let mut chunks_seen = 0;
+        let (_image, outcome) = verifying.run(|_progress| {
+            chunks_seen += 1;
+            if chunks_seen == 1 {
+                cancel.request_cancel(CancelReason::UserRequested);
+            }
+        });
+        let _ = std::fs::remove_file(&target_path);
+
+        let cancelled = match outcome {
+            VerifyOutcome::Cancelled(c) => c,
+            other => panic!("expected Cancelled, got {other:?}"),
+        };
+        let expected_total = 3 * QUICK_VERIFY_WINDOW_SIZE;
+        assert!(cancelled.verified_bytes > 0);
+        assert!(cancelled.verified_bytes < expected_total);
+    }
+
+    // V18 (Verify start: Identity changed). A freshly re-fetched snapshot
+    // with a different serial is rejected before any FD is ever opened.
+    #[test]
+    fn begin_verify_check_target_rejects_identity_changed() {
+        let image_size = 1000u64;
+        let data = vec![1u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-identity-changed",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let mut changed = snapshot.clone();
+        changed.serial = "DIFFERENT-SERIAL".to_string();
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(changed));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected identity-changed rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::IdentityChanged));
+    }
+
+    // V19 (Verify start: Instance recreated). A freshly re-fetched snapshot
+    // with a different diskseq is rejected.
+    #[test]
+    fn begin_verify_check_target_rejects_instance_recreated() {
+        let image_size = 1000u64;
+        let data = vec![2u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-instance-recreated",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let mut changed = snapshot.clone();
+        changed.diskseq = Some(99999);
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(changed));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected instance-recreated rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::InstanceRecreated));
+    }
+
+    // V20 (the key regression test). A freshly re-fetched snapshot whose
+    // mount_points grew from empty to non-empty -- exactly the real
+    // post-write auto-mount scenario observed with the MyPocketOS Hybrid ISO
+    // -- does NOT block Verify. This is Built-in Verify implementation step
+    // 3's entire reason for existing, now confirmed all the way through
+    // step 4's actual `check_target()` call site.
+    #[test]
+    fn begin_verify_check_target_allows_newly_mounted_filesystem() {
+        let image_size = 1000u64;
+        let data = vec![3u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-mount-increase",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let mut mounted = snapshot.clone();
+        mounted.mount_points = vec!["/media/example".to_string()];
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(mounted));
+        let _ = std::fs::remove_file(&target_path);
+
+        assert!(
+            result.is_ok(),
+            "expected Verify to still be allowed after a benign mount-state change"
+        );
+    }
+
+    // V21 (Verify start: unsafe target state). A freshly re-fetched
+    // snapshot reporting the target as a system disk is rejected.
+    #[test]
+    fn begin_verify_check_target_rejects_unsafe_target_state() {
+        let image_size = 1000u64;
+        let data = vec![4u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-unsafe-state",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let mut unsafe_snapshot = snapshot.clone();
+        unsafe_snapshot.hint_system = true;
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(unsafe_snapshot));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected unsafe-target-state rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::UnsafeTargetState));
+    }
+
+    // V22 (Verify start: FD binding mismatch). A read-only handle whose
+    // kernel-reported size disagrees with the freshly re-verified snapshot
+    // is rejected before any byte is read.
+    #[test]
+    fn begin_verify_finalize_rejects_fd_binding_mismatch() {
+        let image_size = 1000u64;
+        let data = vec![5u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-fd-mismatch",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+        let ready = pending
+            .check_target(SnapshotFetchOutcome::Found(snapshot.clone()))
+            .unwrap_or_else(|(_, e)| panic!("check_target should succeed, got {e:?}"));
+
+        let read_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(&target_path)
+            .expect("reopen target read-only");
+        let handle = OpenedDeviceHandle::from_file_for_test(read_file);
+
+        let mut mismatched_metadata = fd_metadata_matching(&snapshot);
+        mismatched_metadata.size = Some(snapshot.size + 1);
+
+        let result = ready.finalize(Some(handle), Some(&mismatched_metadata));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected FD binding mismatch rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::FdBindingMismatch));
+    }
+
+    // V23 (write FD retirement). begin_verify() closes the write-mode fd
+    // for every VerifyMode, including None -- confirmed via the same
+    // /proc/self/fd-target-comparison technique `sync_succeeded_holds_moved
+    // _fd_until_dropped` above already uses for the write/sync path.
+    #[test]
+    fn begin_verify_drops_the_write_fd_for_every_verify_mode() {
+        for mode in [VerifyMode::None, VerifyMode::Quick, VerifyMode::Full] {
+            let image_size = 1000u64;
+            let data = vec![6u8; image_size as usize];
+            let (target_path, image, sync_succeeded, _snapshot) =
+                gate_pass_sync_succeeded("verify-fd-retirement", &data, image_size, mode);
+
+            // `SyncSucceeded` has no public accessor for the raw fd (by
+            // design -- see `ActiveWrite`'s own doc comment), so this test
+            // captures the fd number and its /proc target *before* calling
+            // begin_verify() by reaching into the same module-private
+            // structure this test module already has access to.
+            let raw_fd = sync_succeeded_raw_fd_for_test(&sync_succeeded);
+            let target_before = crate::execution::linux_access::fd_proc_target_for_test(raw_fd);
+
+            let start = sync_succeeded.begin_verify(image, CancelHandle::new());
+            // Whichever branch this is, the write fd must already be closed
+            // by the time begin_verify() returns.
+            crate::execution::linux_access::assert_fd_closed_for_test(
+                raw_fd,
+                target_before.as_deref(),
+            );
+
+            match start {
+                VerifyStart::Skipped(_, _) => {}
+                VerifyStart::Pending(_) => {}
+            }
+
+            let _ = std::fs::remove_file(&target_path);
+        }
+    }
+
+    // Thin wrapper around `core::ActiveWrite::raw_fd_for_test()`, since
+    // `SyncSucceeded.active` is a private field of this module -- exists so
+    // `begin_verify_drops_the_write_fd_for_every_verify_mode` above can
+    // reach it without exposing the field itself any more broadly.
+    fn sync_succeeded_raw_fd_for_test(succeeded: &SyncSucceeded) -> std::os::fd::RawFd {
+        succeeded.active.raw_fd_for_test()
     }
 }

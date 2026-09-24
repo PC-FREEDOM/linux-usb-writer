@@ -884,6 +884,23 @@ pub struct PreparedWrite {
     plan: WritePlan,
     verify_mode: VerifyMode,
     image_generation: ImageGeneration,
+    // The exact `DeviceSnapshot` re-verified by `prepare_for_open`/
+    // `finalize_prepared_write` immediately before this write was allowed to
+    // proceed (`ReadyToOpen`'s own `current`, cloned once here) -- carried
+    // through to `ActiveWrite`/`WriteSucceeded`/`Syncing`/`SyncSucceeded`
+    // unchanged, for a future Built-in Verify stage to compare a freshly
+    // re-fetched snapshot against (see `write_job.rs`'s Verify state
+    // machine). Deliberately private, unlike `target_block_path`/
+    // `target_size`/`image_size` above: those three are read-only
+    // diagnostics whose accuracy does not affect safety (the real authority
+    // is `handle`, already FD-bound-checked), but `baseline` is the anchor
+    // Verify's own Identity/Instance re-check is measured against --
+    // letting a caller freely overwrite it (as a `pub` field would allow)
+    // would defeat exactly the device-replacement detection this field
+    // exists to preserve. No setter exists anywhere on this struct or on
+    // `ActiveWrite` below; the only way to obtain one is the clone taken
+    // here, from the value `prepare_for_open` itself already verified.
+    baseline: DeviceSnapshot,
     #[allow(dead_code)]
     handle: OpenedDeviceHandle,
 }
@@ -1007,6 +1024,12 @@ pub fn finalize_prepared_write(
         }
     }
 
+    // Cloned before any field of `ready.current` is partially moved out
+    // below -- see `PreparedWrite::baseline`'s own doc comment for why this
+    // must be the exact snapshot the Gate just re-verified, not a fresh
+    // re-fetch taken later.
+    let baseline = ready.current.clone();
+
     Ok(PreparedWrite {
         target_block_path: ready.current.block_path,
         target_size: ready.current.size,
@@ -1014,6 +1037,7 @@ pub fn finalize_prepared_write(
         plan: ready.plan,
         verify_mode: ready.verify_mode,
         image_generation: ready.image_generation,
+        baseline,
         handle,
     })
 }
@@ -1051,6 +1075,10 @@ pub struct ActiveWrite {
     pub target_block_path: String,
     pub target_size: u64,
     pub image_size: u64,
+    // See `PreparedWrite::baseline`'s doc comment for why this is private
+    // (unlike the three `pub` fields above) and only reachable via the
+    // `baseline()` getter below.
+    baseline: DeviceSnapshot,
     handle: OpenedDeviceHandle,
 }
 
@@ -1089,6 +1117,7 @@ impl PreparedWrite {
             target_block_path: self.target_block_path,
             target_size: self.target_size,
             image_size: self.image_size,
+            baseline: self.baseline,
             handle: self.handle,
         };
 
@@ -1178,6 +1207,39 @@ impl ActiveWrite {
     #[allow(dead_code)] // exercised by this module's/write_job.rs's tests today; not yet called from main.rs.
     pub(in crate::execution) fn sync_target(&self) -> SyncTarget<'_> {
         self.handle.sync_target()
+    }
+
+    // The exact `DeviceSnapshot` this write was authorized against (see
+    // `PreparedWrite::baseline`'s doc comment for the full rationale and why
+    // it is deliberately not a `pub` field). Returns a borrow, not a clone:
+    // every caller of this today (`write_job.rs`'s Verify state machine)
+    // only needs to compare it against a freshly re-fetched snapshot via
+    // `check_identity_instance_for_verify`, which itself takes
+    // `&DeviceSnapshot` -- no owned copy is required merely to read it.
+    // `pub(crate)`, matching `AuthorizedWrite::image_generation()`/
+    // `image_size()` above: the only legitimate reader is this crate's own
+    // `write_job.rs`, not `main.rs` or any other sibling module (nothing
+    // about `baseline` itself is a raw write/read capability the way
+    // `writer_target()`/`sync_target()` are, so the narrower
+    // `pub(in crate::execution)` used for those two is not required here --
+    // `pub(crate)` already matches this type's own precedent for
+    // non-capability, read-only data).
+    pub(crate) fn baseline(&self) -> &DeviceSnapshot {
+        &self.baseline
+    }
+
+    // Test-only: exposes the raw fd number this `ActiveWrite` still holds
+    // (never the `File`/`OpenedDeviceHandle` itself), purely so a test can
+    // independently confirm -- via `/proc/self/fd/<n>`, exactly like
+    // `OpenedDeviceHandle::raw_fd_for_test()`'s own precedent -- that
+    // dropping whatever owns this `ActiveWrite` actually closed the
+    // underlying fd. `write_job.rs`'s own tests use this to confirm
+    // `SyncSucceeded::begin_verify()` retires the write-mode fd for every
+    // `VerifyMode`, including `None`. `#[cfg(test)]` keeps this out of any
+    // real build, same as `OpenedDeviceHandle::raw_fd_for_test()`.
+    #[cfg(test)]
+    pub(crate) fn raw_fd_for_test(&self) -> std::os::fd::RawFd {
+        self.handle.raw_fd_for_test()
     }
 }
 

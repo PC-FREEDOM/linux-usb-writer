@@ -92,22 +92,26 @@ pub enum ImageSourceError {
 
 // The kind of repeated access an `ImageSource` can honestly provide,
 // beyond the baseline "call `open_reader()` again for a fresh full replay"
-// every implementation must support. This exists purely so a future Quick
-// Verify design has something to branch on -- no Quick Verify algorithm is
-// decided or implemented here.
+// every implementation must support. This exists so a future Quick Verify
+// has something to branch on -- no Quick Verify algorithm is decided or
+// implemented here, only the capability query it would use.
 //
-// `#[allow(dead_code)]`: `RandomAccess` is not constructed by anything in
-// this revision (this trait exposes no seek/offset-based read method for
-// an implementation to honestly claim it), mirroring `VerifyMode`'s
-// `Quick`/`Full` variants -- the shape is declared now so a future
-// capability (e.g. an `open_reader_at(offset)` method, or a `Seek`-bound
-// variant of `open_reader()`) has a variant to report through without a
-// breaking API change.
-#[allow(dead_code)]
+// `RandomAccess` is now backed by a real capability (`ImageSource::read_at`,
+// above) rather than being a declared-but-unusable shape: `FileImageSource`
+// (below) implements `read_at` honestly and reports `RandomAccess`
+// accordingly. A future non-seekable source (e.g. a streaming decompressor)
+// that cannot honor `read_at` should keep reporting `SequentialReplay` and
+// is expected to make `read_at` return an error for any non-trivial
+// request -- this enum does not itself enforce that, the same way nothing
+// here stops a caller from ignoring `access()` and calling `read_at`
+// anyway; deciding how a future caller should react to a `SequentialReplay`
+// source's `read_at` failing is left to that future work, not decided here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageSourceAccess {
-    // The only access pattern any implementation below actually provides:
-    // `open_reader()` can be called repeatedly, and each call replays the
+    // The only access pattern `FileImageSource` provided before this
+    // revision, and still the only one some future `ImageSource` (e.g. a
+    // non-seekable stream) may ever honestly support: `open_reader()` can
+    // be called repeatedly, and each call replays the
     // image from the beginning, but there is no way to jump to an
     // arbitrary offset within a single reader.
     SequentialReplay,
@@ -160,6 +164,58 @@ pub trait ImageSource {
     // every consumer of this trait already works with `io::Result` via
     // `std::io::Read` elsewhere in this crate.
     fn open_reader(&self) -> io::Result<Box<dyn Read>>;
+
+    // Reads up to `buf.len()` bytes starting at `offset`, independent of
+    // any `open_reader()` reader's position and independent of any other
+    // `read_at()` call -- there is no shared cursor here, exactly like
+    // `FileExt::read_at` itself.
+    //
+    // Provided, not required: the first candidate considered here was a
+    // required method (no default), on the reasoning that a Quick Verify
+    // built on this needs genuine, cheap random access to actually be
+    // quick, and a silent sequential-read-and-discard fallback would
+    // misrepresent that as an implementation detail rather than a real
+    // performance cliff. Checking the existing code surfaced a concrete
+    // reason that plan does not fit today: `execution::write_job`'s own
+    // test suite already defines a second, test-only `ImageSource`
+    // implementor (`FailingImageSource`, used to simulate an `open_reader`
+    // failure) that legitimately has no random-access story at all and
+    // correctly reports `access() == ImageSourceAccess::SequentialReplay`
+    // -- a required method would force that unrelated test file to grow an
+    // `read_at` implementation it will never exercise, for no benefit,
+    // which is out of scope for this change (see this module's own
+    // constraints). The default below -- returning an `Unsupported` error
+    // -- keeps the trait honest without forcing that: any source that
+    // cannot honor random access simply inherits it, `access()` already
+    // told a well-behaved caller not to call this in the first place (see
+    // `ImageSourceAccess`'s own doc comment), and `FileImageSource` (below)
+    // still overrides it with a real, cheap implementation. This is
+    // deliberately NOT a sequential-read-and-discard fallback (that was
+    // rejected for the reason above); a default that quietly "worked" by
+    // discarding bytes could hide the exact performance cliff this method
+    // exists to avoid.
+    //
+    // Must never read past `logical_size()`, regardless of how large the
+    // underlying storage has grown since this source was constructed (see
+    // `FileImageSource`'s own doc comment for why): `offset >= logical_size()`
+    // returns `Ok(0)`, and a `buf` that would extend past `logical_size()`
+    // is clamped so only the bytes up to `logical_size()` are read/reported,
+    // even if more physical bytes exist and could otherwise have been read.
+    // A `buf` shorter than the remaining logical bytes is filled as far as
+    // it goes -- a partial read (fewer bytes than requested, but more than
+    // zero) is permitted and is not itself an error; distinguishing a
+    // legitimate partial read from a same-underlying-file shrink (an
+    // unexpectedly short read considered a failure) is left to the caller,
+    // exactly as it already is for `open_reader()`'s readers. These rules
+    // bind any overriding implementation (see `FileImageSource::read_at`);
+    // they are vacuously satisfied by this default, which never returns a
+    // successful read at all.
+    fn read_at(&self, _offset: u64, _buf: &mut [u8]) -> io::Result<usize> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "this ImageSource does not support offset-based reads",
+        ))
+    }
 }
 
 // The only `ImageSource` implementation in this revision: a plain regular
@@ -264,13 +320,13 @@ impl ImageSource for FileImageSource {
         self.logical_size
     }
 
-    // Only `SequentialReplay`: this implementation exposes no seek/offset
-    // API (see the trait's own doc comment), even though `read_at` is used
-    // internally -- what matters here is what this abstraction actually
-    // promises callers (a `Box<dyn Read>`, nothing more), not what the
-    // implementation happens to use underneath.
+    // `RandomAccess`: `read_at` (below) genuinely reads at an arbitrary
+    // offset via `FileExt::read_at`, independent of any `open_reader()`
+    // reader's position and of any other `read_at()` call -- this is an
+    // honest capability claim, not merely a reflection of what the
+    // implementation happens to use internally elsewhere.
     fn access(&self) -> ImageSourceAccess {
-        ImageSourceAccess::SequentialReplay
+        ImageSourceAccess::RandomAccess
     }
 
     // Hands out a `FileImageReader` sharing this source's already-open
@@ -285,6 +341,34 @@ impl ImageSource for FileImageSource {
             position: 0,
             logical_size: self.logical_size,
         }))
+    }
+
+    // Delegates straight to the already-open `self.file`'s `FileExt::read_at`
+    // -- no `File::open(&self.path)` call, exactly like `open_reader()`
+    // above, so this shares every TOCTOU property `FileImageSource`'s own
+    // doc comment already claims (path replacement/unlink do not affect
+    // it; growth past `logical_size` is ignored; shrink surfaces as a short
+    // or empty read, not a special error).
+    //
+    // Clamps to `logical_size` before ever calling `read_at` on the
+    // underlying file: `offset >= logical_size` returns `Ok(0)` without
+    // touching `self.file` at all, and a `buf` that would otherwise read
+    // past `logical_size` is shortened first, so the underlying file's
+    // current real extent (which may have grown since construction) can
+    // never leak additional bytes beyond what this source reported as its
+    // logical size. `checked_add`/`min`/`saturating_sub` throughout --
+    // `offset` and `buf.len()` are both attacker/caller-controlled-ish
+    // values (a Verify layer computing sample windows), so this must not
+    // panic or wrap on a pathological combination of the two.
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        if offset >= self.logical_size || buf.is_empty() {
+            return Ok(0);
+        }
+
+        let remaining = self.logical_size - offset;
+        let to_read = (buf.len() as u64).min(remaining) as usize;
+
+        self.file.read_at(&mut buf[..to_read], offset)
     }
 }
 
@@ -400,6 +484,28 @@ impl SelectedImage {
     // different `SelectedImage`/`ImageSource` values.
     pub fn open_reader(&self) -> io::Result<Box<dyn Read>> {
         self.source.open_reader()
+    }
+
+    // Delegates to `self.source.read_at()` -- the minimal capability a
+    // future Quick Verify (in `execution::write_job`) needs to sample a few
+    // small windows of the image without paying for a full sequential
+    // read-and-discard. `pub(crate)`, not `pub`: unlike
+    // `selection()`/`logical_size()`/`access()`/`open_reader()` above,
+    // nothing outside this crate's own future `execution` module has a
+    // reason to call this, so it is kept one notch narrower than this
+    // type's existing public surface rather than following it by default.
+    // (This crate has no library target -- see `Cargo.toml` -- so
+    // `pub(in crate::execution)` is not expressible here: `execution` and
+    // `image_source` are sibling modules, and `pub(in path)` requires
+    // `path` to be an ancestor of this method's own module; `pub(crate)` is
+    // the narrowest visibility Rust's module system actually offers for a
+    // cross-sibling-module call site like this one.)
+    //
+    // No `source()` getter is added anywhere on this type to provide this
+    // some other way -- see this struct's own doc comment for why a raw
+    // `&dyn ImageSource` must never be handed out.
+    pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.source.read_at(offset, buf)
     }
 }
 
@@ -565,14 +671,15 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // I. access() reports SequentialReplay for FileImageSource, matching
-    // what its API actually provides (no seek/offset method).
+    // I. access() reports RandomAccess for FileImageSource, matching what
+    // its API actually provides now that read_at() is a real, honest
+    // offset-based read capability.
     #[test]
-    fn file_image_source_reports_sequential_replay_access() {
+    fn file_image_source_reports_random_access() {
         let path = write_temp_file("access-kind", b"abc");
         let source = FileImageSource::new(&path).unwrap();
 
-        assert_eq!(source.access(), ImageSourceAccess::SequentialReplay);
+        assert_eq!(source.access(), ImageSourceAccess::RandomAccess);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -685,6 +792,343 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
+    // ImageSource::read_at -- default (provided) implementation
+    // ---------------------------------------------------------------------
+
+    // A minimal `ImageSource` that only implements the methods that were
+    // required before this revision, deliberately leaving `read_at`
+    // unoverridden -- exactly the shape `execution::write_job`'s own
+    // test-only `FailingImageSource` has today (see the trait method's own
+    // doc comment for why that mattered to this design).
+    struct SequentialOnlySource {
+        logical_size: u64,
+    }
+
+    impl ImageSource for SequentialOnlySource {
+        fn logical_size(&self) -> u64 {
+            self.logical_size
+        }
+
+        fn access(&self) -> ImageSourceAccess {
+            ImageSourceAccess::SequentialReplay
+        }
+
+        fn open_reader(&self) -> io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(vec![
+                0u8;
+                self.logical_size
+                    as usize
+            ])))
+        }
+    }
+
+    // O1. A source that does not override read_at() inherits the default,
+    // which reports Unsupported rather than silently succeeding with a
+    // sequential-read-and-discard fallback.
+    #[test]
+    fn default_read_at_reports_unsupported_for_a_sequential_only_source() {
+        let source = SequentialOnlySource { logical_size: 1000 };
+
+        let mut buf = [0u8; 10];
+        let error = source.read_at(0, &mut buf).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    }
+
+    // ---------------------------------------------------------------------
+    // ImageSource::read_at (FileImageSource)
+    // ---------------------------------------------------------------------
+
+    // N1. read_at at offset 0 reads the first bytes correctly.
+    #[test]
+    fn read_at_offset_zero_reads_from_the_start() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 250) as u8).collect();
+        let path = write_temp_file("read-at-zero", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let mut buf = [0u8; 100];
+        let n = source.read_at(0, &mut buf).unwrap();
+
+        assert_eq!(n, 100);
+        assert_eq!(buf, data[..100]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N2. read_at at a non-zero, mid-file offset reads exactly the bytes
+    // located there -- also covers "non-zero offset returns correct bytes".
+    #[test]
+    fn read_at_middle_offset_reads_correct_bytes() {
+        let data: Vec<u8> = (0..5000u32).map(|i| (i % 253) as u8).collect();
+        let path = write_temp_file("read-at-middle", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let offset = 2000u64;
+        let mut buf = [0u8; 300];
+        let n = source.read_at(offset, &mut buf).unwrap();
+
+        assert_eq!(n, 300);
+        assert_eq!(buf, data[offset as usize..offset as usize + 300]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N3. read_at near EOF returns a short read (fewer bytes than
+    // requested) containing exactly the tail of the image, not an error.
+    #[test]
+    fn read_at_near_eof_returns_a_short_read_of_the_tail() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 200) as u8).collect();
+        let path = write_temp_file("read-at-near-eof", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let offset = 900u64;
+        let mut buf = [0u8; 500]; // requests past logical_size (1000)
+        let n = source.read_at(offset, &mut buf).unwrap();
+
+        assert_eq!(n, 100);
+        assert_eq!(&buf[..100], &data[900..1000]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N4. offset == logical_size returns Ok(0), no error.
+    #[test]
+    fn read_at_offset_equal_to_logical_size_returns_zero() {
+        let path = write_temp_file("read-at-eq-size", &[1u8; 500]);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let mut buf = [0u8; 10];
+        let n = source.read_at(source.logical_size(), &mut buf).unwrap();
+
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N5. offset > logical_size returns Ok(0), no error.
+    #[test]
+    fn read_at_offset_past_logical_size_returns_zero() {
+        let path = write_temp_file("read-at-past-size", &[1u8; 500]);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let mut buf = [0u8; 10];
+        let n = source
+            .read_at(source.logical_size() + 1000, &mut buf)
+            .unwrap();
+
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N6. A buffer extending past logical_size is clamped: only the bytes
+    // up to logical_size are read/reported, even though the request asked
+    // for more.
+    #[test]
+    fn read_at_buffer_extending_past_logical_size_is_clamped() {
+        let data = vec![9u8; 200];
+        let path = write_temp_file("read-at-clamped", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let offset = 150u64;
+        let mut buf = [0u8; 100]; // 150 + 100 = 250 > logical_size (200)
+        let n = source.read_at(offset, &mut buf).unwrap();
+
+        assert_eq!(n, 50); // only up to logical_size
+        assert_eq!(&buf[..50], &data[150..200]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N7. Repeated read_at calls at different offsets do not affect one
+    // another -- there is no shared cursor to disturb.
+    #[test]
+    fn multiple_read_at_calls_do_not_affect_each_other() {
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 240) as u8).collect();
+        let path = write_temp_file("read-at-independent-calls", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let mut buf_a = [0u8; 100];
+        let mut buf_b = [0u8; 100];
+        let mut buf_c = [0u8; 100];
+
+        // Deliberately read out of order: end, then start, then middle.
+        source.read_at(2900, &mut buf_a).unwrap();
+        source.read_at(0, &mut buf_b).unwrap();
+        source.read_at(1500, &mut buf_c).unwrap();
+
+        assert_eq!(buf_a, data[2900..3000]);
+        assert_eq!(buf_b, data[0..100]);
+        assert_eq!(buf_c, data[1500..1600]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N8. Fully consuming an open_reader() to EOF has no effect on a
+    // subsequent read_at() call -- they share the underlying `Arc<File>`
+    // but never a position.
+    #[test]
+    fn read_at_is_unaffected_by_a_previously_consumed_open_reader() {
+        let data: Vec<u8> = (0..2000u32).map(|i| (i % 230) as u8).collect();
+        let path = write_temp_file("read-at-after-open-reader", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let drained = read_all(source.open_reader().unwrap());
+        assert_eq!(drained, data);
+
+        let mut buf = [0u8; 100];
+        let n = source.read_at(500, &mut buf).unwrap();
+
+        assert_eq!(n, 100);
+        assert_eq!(buf, data[500..600]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N9. A read_at() call has no effect on a later open_reader() -- it
+    // still starts at byte 0 and reads the full content.
+    #[test]
+    fn open_reader_after_read_at_still_reads_from_the_start() {
+        let data: Vec<u8> = (0..2000u32).map(|i| (i % 230) as u8).collect();
+        let path = write_temp_file("open-reader-after-read-at", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let mut buf = [0u8; 100];
+        source.read_at(1000, &mut buf).unwrap();
+
+        let read_back = read_all(source.open_reader().unwrap());
+
+        assert_eq!(read_back, data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N10. An empty buffer returns Ok(0), never an error.
+    #[test]
+    fn read_at_with_empty_buffer_returns_zero() {
+        let path = write_temp_file("read-at-empty-buf", &[1u8; 100]);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let n = source.read_at(10, &mut []).unwrap();
+
+        assert_eq!(n, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N11. A zero-byte image's read_at always returns Ok(0), regardless of
+    // offset.
+    #[test]
+    fn read_at_on_zero_byte_image_always_returns_zero() {
+        let path = write_temp_file("read-at-zero-byte-image", &[]);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let mut buf = [0u8; 10];
+        assert_eq!(source.read_at(0, &mut buf).unwrap(), 0);
+        assert_eq!(source.read_at(5, &mut buf).unwrap(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N12 (TOCTOU: path replacement). After the path is made to point at a
+    // completely different file (rename over it), read_at still reads the
+    // ORIGINAL content -- it never re-resolves `path`.
+    #[test]
+    fn read_at_reads_original_content_after_path_is_replaced() {
+        let original = b"original content selected by the user".to_vec();
+        let replacement = b"a completely different file now at the same path!!".to_vec();
+
+        let path = write_temp_file("read-at-path-replaced", &original);
+        let source = FileImageSource::new(&path).unwrap();
+
+        let replacement_path = write_temp_file("read-at-path-replaced-incoming", &replacement);
+        std::fs::rename(&replacement_path, &path)
+            .expect("rename replacement file over the original path");
+
+        let mut buf = vec![0u8; original.len()];
+        let n = source.read_at(0, &mut buf).unwrap();
+
+        assert_eq!(&buf[..n], &original[..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N13 (TOCTOU: unlink). After the path is removed entirely, read_at can
+    // still read the original content.
+    #[test]
+    fn read_at_reads_original_content_after_path_is_unlinked() {
+        let data: Vec<u8> = (0..1000u32).map(|i| (i % 240) as u8).collect();
+        let path = write_temp_file("read-at-unlinked", &data);
+        let source = FileImageSource::new(&path).unwrap();
+
+        std::fs::remove_file(&path).expect("unlink original path");
+
+        let mut buf = [0u8; 200];
+        let n = source.read_at(300, &mut buf).unwrap();
+
+        assert_eq!(n, 200);
+        assert_eq!(buf, data[300..500]);
+    }
+
+    // N14 (TOCTOU: growth). The same underlying file grows past the
+    // recorded logical_size. read_at must never read into the grown
+    // region: an offset at or beyond the original logical_size returns
+    // Ok(0), even though the file itself now has more real bytes there.
+    #[test]
+    fn read_at_never_reads_past_logical_size_after_the_file_grows() {
+        let original: Vec<u8> = (0..1000u32).map(|i| (i % 200) as u8).collect();
+        let appended = vec![0xEEu8; 500];
+
+        let path = write_temp_file("read-at-grows", &original);
+        let source = FileImageSource::new(&path).unwrap();
+        let recorded_logical_size = source.logical_size();
+
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .expect("reopen the same file to append to it");
+            file.write_all(&appended).expect("append growth bytes");
+        }
+
+        // A read starting exactly at the old logical_size must see nothing.
+        let mut buf = [0u8; 100];
+        let n = source.read_at(recorded_logical_size, &mut buf).unwrap();
+        assert_eq!(n, 0);
+
+        // A read whose buffer would otherwise extend into the grown region
+        // is clamped to the original logical_size.
+        let mut buf2 = [0u8; 200];
+        let n2 = source
+            .read_at(recorded_logical_size - 100, &mut buf2)
+            .unwrap();
+        assert_eq!(n2, 100);
+        assert_eq!(&buf2[..100], &original[900..1000]);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // N15 (TOCTOU: shrink). The same underlying file is truncated smaller
+    // than the recorded logical_size. read_at surfaces this as a short (or
+    // empty) read via ordinary `FileExt::read_at`/EOF semantics -- this
+    // layer does not invent a special error for it (that interpretation is
+    // left to a future Verify layer).
+    #[test]
+    fn read_at_returns_a_short_read_after_the_file_shrinks() {
+        let original: Vec<u8> = (0..2000u32).map(|i| (i % 200) as u8).collect();
+        let shrink_to: u64 = 500;
+
+        let path = write_temp_file("read-at-shrinks", &original);
+        let source = FileImageSource::new(&path).unwrap();
+        assert_eq!(source.logical_size(), original.len() as u64);
+
+        {
+            let file = OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .expect("reopen the same file to truncate it");
+            file.set_len(shrink_to).expect("truncate file");
+        }
+
+        // A request starting before the new real end still reads what
+        // remains, and no further.
+        let mut buf = [0u8; 1000]; // would read up to logical_size (2000) if not shrunk
+        let n = source.read_at(300, &mut buf).unwrap();
+
+        assert!((n as u64) < 1000);
+        assert_eq!(&buf[..n], &original[300..300 + n]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
     // SelectedImage
     // ---------------------------------------------------------------------
 
@@ -773,6 +1217,47 @@ mod tests {
 
         assert_eq!(selected.logical_size(), 0);
         assert_eq!(selected.selection().image_size(), 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // SelectedImage F. read_at() delegates straight through to the
+    // underlying source, exactly like open_reader() already does.
+    #[test]
+    fn selected_image_read_at_delegates_to_the_underlying_source() {
+        let data: Vec<u8> = (0..2000u32).map(|i| (i % 233) as u8).collect();
+        let path = write_temp_file("selected-read-at", &data);
+        let source = FileImageSource::new(&path).unwrap();
+        let selected = SelectedImage::new(Box::new(source));
+
+        let mut buf = [0u8; 100];
+        let n = selected.read_at(500, &mut buf).unwrap();
+
+        assert_eq!(n, 100);
+        assert_eq!(buf, data[500..600]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // SelectedImage G. read_at() on a SelectedImage is independent of
+    // open_reader() called on the same value, in both directions -- the
+    // same guarantee already proven for the underlying ImageSource alone
+    // (tests N8/N9 above), now confirmed through the SelectedImage wrapper.
+    #[test]
+    fn selected_image_read_at_and_open_reader_are_mutually_independent() {
+        let data: Vec<u8> = (0..1500u32).map(|i| (i % 217) as u8).collect();
+        let path = write_temp_file("selected-read-at-independent", &data);
+        let source = FileImageSource::new(&path).unwrap();
+        let selected = SelectedImage::new(Box::new(source));
+
+        let drained = read_all(selected.open_reader().unwrap());
+        assert_eq!(drained, data);
+
+        let mut buf = [0u8; 100];
+        let n = selected.read_at(700, &mut buf).unwrap();
+        assert_eq!(n, 100);
+        assert_eq!(buf, data[700..800]);
+
+        let read_back_again = read_all(selected.open_reader().unwrap());
+        assert_eq!(read_back_again, data);
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -45,20 +45,38 @@ fn main() -> zbus::Result<()> {
             return run_prepare_test(target);
         }
         Some("write-test") => {
+            const USAGE: &str =
+                "usage: cargo run -- write-test <image-path> <udisks2-block-object-path> [verify-mode]\n\
+                 verify-mode: none (default) | quick | full";
+
             let Some(image_path) = args.next() else {
-                eprintln!(
-                    "usage: cargo run -- write-test <image-path> <udisks2-block-object-path>"
-                );
+                eprintln!("{USAGE}");
                 return Ok(());
             };
             let Some(target) = args.next() else {
-                eprintln!(
-                    "usage: cargo run -- write-test <image-path> <udisks2-block-object-path>"
-                );
+                eprintln!("{USAGE}");
                 return Ok(());
             };
 
-            return run_write_test(image_path, target);
+            // Absent -> `VerifyMode::None` (see `parse_verify_mode`'s own
+            // doc comment for why that default was chosen). Present but
+            // unrecognized -> a usage error with a non-zero exit, never a
+            // silent fallback to `None` or to any other mode.
+            let verify_mode = match args.next() {
+                None => core::VerifyMode::None,
+                Some(mode_str) => match parse_verify_mode(&mode_str) {
+                    Some(mode) => mode,
+                    None => {
+                        eprintln!(
+                            "write-test: invalid verify-mode '{mode_str}' (expected: none | quick | full)"
+                        );
+                        eprintln!("{USAGE}");
+                        std::process::exit(1);
+                    }
+                },
+            };
+
+            return run_write_test(image_path, target, verify_mode);
         }
         Some("writer-test") => return run_writer_test(),
         _ => {}
@@ -73,11 +91,7 @@ fn main() -> zbus::Result<()> {
 
         println!();
         println!("Device:      {}", snapshot.device);
-        println!(
-            "Model:       {} {}",
-            snapshot.vendor,
-            snapshot.model
-        );
+        println!("Model:       {} {}", snapshot.vendor, snapshot.model);
         println!("Size:        {} bytes", snapshot.size);
         println!("Bus:         {}", snapshot.connection_bus);
         println!("Removable:   {}", snapshot.removable);
@@ -188,10 +202,7 @@ fn run_monitor() -> zbus::Result<()> {
                 for snapshot in &snapshots {
                     println!(
                         "  {} diskseq={:?} media_available={} size={}",
-                        snapshot.device,
-                        snapshot.diskseq,
-                        snapshot.media_available,
-                        snapshot.size
+                        snapshot.device, snapshot.diskseq, snapshot.media_available, snapshot.size
                     );
                 }
             }
@@ -499,7 +510,9 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
                 "prepare-test: PreparedWrite established for {} (target_size={} image_size={})",
                 prepared.target_block_path, prepared.target_size, prepared.image_size
             );
-            println!("prepare-test: WRITE NOT PERFORMED (writer::write() is not called by this PoC)");
+            println!(
+                "prepare-test: WRITE NOT PERFORMED (writer::write() is not called by this PoC)"
+            );
 
             // Demonstrate the next ownership stage: PreparedWrite -> AuthorizedWrite.
             // `begin()` consumes `prepared` by value -- the fd moves once,
@@ -602,7 +615,11 @@ fn confirmation_matches(input: &str, expected_device: &str) -> bool {
 // as a consequence of where the human prompt is placed, now runs *after*
 // whatever time the operator took to read the summary and type the
 // confirmation -- not before it.
-fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
+fn run_write_test(
+    image_path: String,
+    block_path: String,
+    verify_mode: core::VerifyMode,
+) -> zbus::Result<()> {
     let mut state = attempt_select(&block_path);
 
     if let core::SelectionState::Selected { baseline, .. } = &state {
@@ -668,7 +685,11 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
     println!("  DiskSeq:     {:?}", baseline.diskseq);
     println!("Image:");
     println!("  Path:        {image_path}");
-    println!("  Size:        {}", format_size(selected_image.logical_size()));
+    println!(
+        "  Size:        {}",
+        format_size(selected_image.logical_size())
+    );
+    println!("Verification mode: {verify_mode:?}");
     println!();
     println!("WARNING: Writing will overwrite the target device.");
     println!("ALL EXISTING DATA ON THIS DEVICE MAY BE DESTROYED. This cannot be undone.");
@@ -693,21 +714,23 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
 
     println!("write-test: confirmation accepted for {expected_device}");
 
-    // This PoC never implements Verify itself (see CLAUDE.md/reports) --
-    // `VerifyMode::None` here only means "no verify policy was chosen yet".
-    let verify_mode = core::VerifyMode::None;
-
-    let intent = match core::WriteIntent::from_selection(
-        &state,
-        selected_image.selection(),
-        verify_mode,
-    ) {
-        Ok(intent) => intent,
-        Err(error) => {
-            println!("write-test: WriteIntent construction rejected: {error:?}");
-            return Ok(());
-        }
-    };
+    // `verify_mode` is the CLI's own choice (see the `write-test` dispatch in
+    // `main()`), frozen into the `ConfirmationToken`/`WritePlan` below via
+    // the same `WriteIntent`/Gate path the target/image/generation already
+    // go through -- there is no separate, second place this value is
+    // threaded into later. `SyncSucceeded` (produced far below, after a
+    // successful write+sync) carries this exact value forward unchanged,
+    // which is what `SyncSucceeded::begin_verify()` branches on to decide
+    // None/Quick/Full -- see the Built-in Verify wiring later in this
+    // function.
+    let intent =
+        match core::WriteIntent::from_selection(&state, selected_image.selection(), verify_mode) {
+            Ok(intent) => intent,
+            Err(error) => {
+                println!("write-test: WriteIntent construction rejected: {error:?}");
+                return Ok(());
+            }
+        };
     let confirmation = core::ConfirmationToken::confirm(intent);
     println!(
         "write-test: confirmation created for {} (image_size={} bytes, verify_mode={:?})",
@@ -819,7 +842,9 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
         Ok(writing_execution) => writing_execution,
         Err(error) => {
             println!("write-test: begin_write() failed to open the image reader: {error}");
-            println!("write-test: AuthorizedExecution dropped -- FD closed via RAII, 0 bytes written");
+            println!(
+                "write-test: AuthorizedExecution dropped -- FD closed via RAII, 0 bytes written"
+            );
             return Ok(());
         }
     };
@@ -853,6 +878,157 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
                         "write-test: sync succeeded -- write + sync completed ({} bytes)",
                         sync_succeeded.bytes_written
                     );
+
+                    // ---- Built-in Verify (self-contained: this arm always
+                    // returns, so `selected_image` being consumed here --
+                    // via `begin_verify()` -- never conflicts with the
+                    // trailing print below, which only the *other* three
+                    // arms (which never touch `selected_image`) can reach.
+                    // No UI exists yet to request cancellation, exactly like
+                    // the write's own `cancel` above -- a fresh,
+                    // never-cancelled handle is all this CLI PoC needs. ----
+                    let verify_cancel = write_job::CancelHandle::new();
+
+                    match sync_succeeded.begin_verify(selected_image, verify_cancel) {
+                        write_job::VerifyStart::Skipped(image, succeeded) => {
+                            println!("write-test: {}", format_verify_succeeded(&succeeded));
+                            println!(
+                                "write-test: SelectedImage identity preserved after verification (image_size={})",
+                                image.logical_size()
+                            );
+                        }
+                        write_job::VerifyStart::Pending(pending) => {
+                            match verify_mode {
+                                core::VerifyMode::Quick => println!(
+                                    "write-test: Quick verification checks selected regions only. It does not verify the entire image."
+                                ),
+                                core::VerifyMode::Full => println!(
+                                    "write-test: Full verification reads back the entire written image."
+                                ),
+                                core::VerifyMode::None => unreachable!(
+                                    "VerifyMode::None always produces VerifyStart::Skipped, never Pending"
+                                ),
+                            }
+
+                            println!(
+                                "write-test: requesting a fresh DeviceSnapshot for verification on {}.",
+                                pending.block_path()
+                            );
+                            let refreshed_for_verify =
+                                collect_device_snapshot(pending.block_path());
+
+                            let ready = match pending.check_target(refreshed_for_verify) {
+                                Ok(ready) => ready,
+                                Err((image, error)) => {
+                                    println!("write-test: write + sync completed successfully.");
+                                    println!("write-test: verification could not start: {error:?}");
+                                    println!(
+                                        "write-test: SelectedImage identity preserved (image_size={})",
+                                        image.logical_size()
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                            println!(
+                                "write-test: requesting OpenDevice(mode=\"r\") on {} for verification.",
+                                ready.block_path()
+                            );
+                            println!(
+                                "If a polkit authentication prompt appears, please complete it yourself -- \
+                                 this program will not use sudo or any other privilege bypass."
+                            );
+
+                            let open_result = linux_access::open_device(ready.block_path(), "r");
+
+                            let (handle_opt, metadata) = match open_result {
+                                Ok(handle) => {
+                                    println!("write-test: OpenDevice(mode=\"r\"): success");
+                                    let metadata = handle.metadata();
+                                    (Some(handle), metadata)
+                                }
+                                Err(error) => {
+                                    println!(
+                                        "write-test: OpenDevice(mode=\"r\"): failed ({error:?})"
+                                    );
+                                    (None, None)
+                                }
+                            };
+
+                            if let Some(meta) = &metadata {
+                                println!(
+                                    "write-test: verify FD major:minor={}:{} size={:?}",
+                                    meta.major, meta.minor, meta.size
+                                );
+                            }
+
+                            let verifying = match ready.finalize(handle_opt, metadata.as_ref()) {
+                                // Reaching `Ok` here already proves
+                                // `check_fd_binding` (core.rs) returned
+                                // `FdBindingCheck::Match` -- same reasoning
+                                // as the write path's own "FD binding:
+                                // Match" line above.
+                                Ok(verifying) => {
+                                    println!("write-test: verify FD binding: Match");
+                                    verifying
+                                }
+                                Err((image, error)) => {
+                                    println!("write-test: write + sync completed successfully.");
+                                    println!("write-test: verification could not start: {error:?}");
+                                    println!(
+                                        "write-test: SelectedImage identity preserved (image_size={})",
+                                        image.logical_size()
+                                    );
+                                    return Ok(());
+                                }
+                            };
+
+                            println!("write-test: verification started");
+
+                            let (image, verify_outcome) = verifying.run(|progress| {
+                                let percent = if progress.total_bytes > 0 {
+                                    (progress.verified_bytes as f64 / progress.total_bytes as f64)
+                                        * 100.0
+                                } else {
+                                    100.0
+                                };
+                                println!(
+                                    "write-test: verify progress {}/{} bytes ({percent:.1}%)",
+                                    progress.verified_bytes, progress.total_bytes
+                                );
+                            });
+
+                            match verify_outcome {
+                                write_job::VerifyOutcome::Succeeded(succeeded) => {
+                                    println!("write-test: {}", format_verify_succeeded(&succeeded));
+                                }
+                                write_job::VerifyOutcome::Failed(failed) => {
+                                    println!("write-test: write + sync completed successfully.");
+                                    println!(
+                                        "write-test: verification failed: {}",
+                                        format_verify_failure_reason(&failed.reason)
+                                    );
+                                    println!(
+                                        "write-test: verified_bytes={} before failure (mode={:?})",
+                                        failed.verified_bytes, failed.mode
+                                    );
+                                }
+                                write_job::VerifyOutcome::Cancelled(cancelled) => {
+                                    println!(
+                                        "write-test: verification cancelled after {} bytes",
+                                        cancelled.verified_bytes
+                                    );
+                                }
+                            }
+
+                            println!(
+                                "write-test: SelectedImage identity preserved after verification (image_size={})",
+                                image.logical_size()
+                            );
+                        }
+                    }
+
+                    return Ok(());
                 }
                 write_job::SyncAttemptOutcome::Failed(failed) => {
                     println!("write-test: sync FAILED: {failed:?}");
@@ -879,18 +1055,84 @@ fn run_write_test(image_path: String, block_path: String) -> zbus::Result<()> {
         }
     }
 
-    // `selected_image` (the exact same value bind() was given, handed back
-    // unchanged by `WritingExecution::write()`) is kept alive only as proof
-    // that its identity survived the whole write -- a future Verify stage
-    // would reach it here for a second, verify-time `open_reader()` call.
-    // Not implemented this revision; see CLAUDE.md/reports. This PoC does
-    // not start a new write, re-bind, or retry with it.
+    // Reached only by the write-Failed, write-Cancelled, and sync-Failed
+    // paths above -- the sync-Succeeded path always returns from within its
+    // own arm (see above), together with `selected_image`, before control
+    // flow can ever reach here. `selected_image` is therefore guaranteed to
+    // still be owned by this scope on every path that reaches this line.
     println!(
-        "write-test: SelectedImage identity preserved after write (image_size={}); Verify not implemented this revision",
+        "write-test: SelectedImage identity preserved (image_size={})",
         selected_image.logical_size()
     );
 
     Ok(())
+}
+
+// Parses a CLI verify-mode argument (`none` | `quick` | `full`, lowercase
+// only -- this PoC does not attempt case-insensitive matching). `None` means
+// the argument itself did not match any known mode; the caller is
+// responsible for rejecting that with a usage message and a non-zero exit,
+// never for silently falling back to a default (a default is only ever
+// applied when the argument is *absent* -- see the `write-test` CLI dispatch
+// in `main()`).
+fn parse_verify_mode(value: &str) -> Option<core::VerifyMode> {
+    match value {
+        "none" => Some(core::VerifyMode::None),
+        "quick" => Some(core::VerifyMode::Quick),
+        "full" => Some(core::VerifyMode::Full),
+        _ => None,
+    }
+}
+
+// Formats a successful Verify outcome for the CLI. Shared by both
+// `VerifyStart::Skipped` (VerifyMode::None) and a completed
+// `Verifying::run()` (Quick/Full) -- both ultimately produce a
+// `write_job::VerifySucceeded`, so this one function is the single place
+// that decides how each mode's success is worded, rather than duplicating
+// the match between the two call sites.
+fn format_verify_succeeded(succeeded: &write_job::VerifySucceeded) -> String {
+    match succeeded.mode {
+        core::VerifyMode::None => "Verification: skipped".to_string(),
+        core::VerifyMode::Quick => format!(
+            "Quick verification succeeded ({} bytes sampled)",
+            succeeded.verified_bytes
+        ),
+        core::VerifyMode::Full => format!(
+            "Full verification succeeded ({} bytes verified)",
+            succeeded.verified_bytes
+        ),
+    }
+}
+
+// Formats a `VerifyFailureReason` for the CLI, distinguishing source vs.
+// target for both the I/O-error and unexpected-EOF cases -- which side
+// failed is genuinely different diagnostic information (see
+// `write_job.rs`'s own doc comment on `VerifyFailureReason`).
+fn format_verify_failure_reason(reason: &write_job::VerifyFailureReason) -> String {
+    match reason {
+        write_job::VerifyFailureReason::Mismatch {
+            offset,
+            expected,
+            actual,
+        } => format!(
+            "mismatch at offset {offset}\n  expected: 0x{expected:02x}\n  actual:   0x{actual:02x}"
+        ),
+        write_job::VerifyFailureReason::SourceUnexpectedEof => {
+            "the image source ended before all expected bytes could be read".to_string()
+        }
+        write_job::VerifyFailureReason::TargetUnexpectedEof => {
+            "the target device ended before all expected bytes could be read".to_string()
+        }
+        write_job::VerifyFailureReason::SourceReadError(error) => {
+            format!("failed to read the image source: {error}")
+        }
+        write_job::VerifyFailureReason::TargetReadError(error) => {
+            format!("failed to read the target device: {error}")
+        }
+        write_job::VerifyFailureReason::UnsupportedAccess => {
+            "quick verification requires an image source with random-access support, which this image does not provide".to_string()
+        }
+    }
 }
 
 // PoC mode: Writer self-test (`cargo run -- writer-test`). Exercises the
@@ -937,7 +1179,10 @@ fn run_writer_test_inner(temp_path: &std::path::Path) -> Result<(), String> {
     )
     .map_err(|error| format!("plan rejected: {error:?}"))?;
 
-    println!("writer-test: temporary target file: {}", temp_path.display());
+    println!(
+        "writer-test: temporary target file: {}",
+        temp_path.display()
+    );
     println!(
         "writer-test: image size = {} bytes, chunk size = {} bytes",
         data.len(),
@@ -983,6 +1228,9 @@ fn run_writer_test_inner(temp_path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::confirmation_matches;
+    use super::{format_verify_failure_reason, format_verify_succeeded, parse_verify_mode};
+    use crate::execution::core::VerifyMode;
+    use crate::execution::write_job::{VerifyFailureReason, VerifySucceeded};
 
     // A. Exact match -> true.
     #[test]
@@ -1019,5 +1267,117 @@ mod tests {
     fn empty_input_does_not_confirm() {
         assert!(!confirmation_matches("", "/dev/sdb"));
         assert!(!confirmation_matches("\n", "/dev/sdb"));
+    }
+
+    // ---------------------------------------------------------------------
+    // parse_verify_mode / format_verify_succeeded / format_verify_failure_reason
+    // (Built-in Verify implementation step 5: write-test CLI wiring)
+    // ---------------------------------------------------------------------
+
+    // F. Each of the three documented CLI names parses to the matching
+    // VerifyMode.
+    #[test]
+    fn parse_verify_mode_accepts_the_three_known_names() {
+        assert_eq!(parse_verify_mode("none"), Some(VerifyMode::None));
+        assert_eq!(parse_verify_mode("quick"), Some(VerifyMode::Quick));
+        assert_eq!(parse_verify_mode("full"), Some(VerifyMode::Full));
+    }
+
+    // G. Unknown values are rejected with None, never a silent fallback to
+    // any particular mode.
+    #[test]
+    fn parse_verify_mode_rejects_unknown_values() {
+        assert_eq!(parse_verify_mode("foo"), None);
+        assert_eq!(parse_verify_mode("fast"), None);
+        assert_eq!(parse_verify_mode("sha256"), None);
+        assert_eq!(parse_verify_mode(""), None);
+    }
+
+    // H. Case sensitivity policy: lowercase only, fixed deliberately (see
+    // `parse_verify_mode`'s own doc comment) -- any other casing is rejected
+    // exactly like any other unknown value, not accepted as a convenience.
+    #[test]
+    fn parse_verify_mode_rejects_non_lowercase_casing() {
+        assert_eq!(parse_verify_mode("None"), None);
+        assert_eq!(parse_verify_mode("QUICK"), None);
+        assert_eq!(parse_verify_mode("Full"), None);
+    }
+
+    // I. VerifyMode::None success formats as the documented "skipped"
+    // message.
+    #[test]
+    fn format_verify_succeeded_none_reports_skipped() {
+        let succeeded = VerifySucceeded {
+            mode: VerifyMode::None,
+            verified_bytes: 0,
+            skipped: true,
+        };
+        assert_eq!(format_verify_succeeded(&succeeded), "Verification: skipped");
+    }
+
+    // J. Quick success reports the sampled byte count, worded as "sampled"
+    // -- never implying the whole image was checked.
+    #[test]
+    fn format_verify_succeeded_quick_reports_sampled_bytes() {
+        let succeeded = VerifySucceeded {
+            mode: VerifyMode::Quick,
+            verified_bytes: 12_582_912,
+            skipped: false,
+        };
+        assert_eq!(
+            format_verify_succeeded(&succeeded),
+            "Quick verification succeeded (12582912 bytes sampled)"
+        );
+    }
+
+    // K. Full success reports the verified byte count, worded as
+    // "verified".
+    #[test]
+    fn format_verify_succeeded_full_reports_verified_bytes() {
+        let succeeded = VerifySucceeded {
+            mode: VerifyMode::Full,
+            verified_bytes: 1_828_716_544,
+            skipped: false,
+        };
+        assert_eq!(
+            format_verify_succeeded(&succeeded),
+            "Full verification succeeded (1828716544 bytes verified)"
+        );
+    }
+
+    // L. A Mismatch failure's formatted text includes the offset and both
+    // the expected and actual byte values.
+    #[test]
+    fn format_verify_failure_reason_mismatch_reports_offset_and_bytes() {
+        let reason = VerifyFailureReason::Mismatch {
+            offset: 123456,
+            expected: 0x12,
+            actual: 0x34,
+        };
+        let formatted = format_verify_failure_reason(&reason);
+        assert!(formatted.contains("123456"));
+        assert!(formatted.contains("0x12"));
+        assert!(formatted.contains("0x34"));
+    }
+
+    // M. Source vs. target EOF/read-error messages are distinguishable from
+    // one another -- a user (or a future automated triage) should be able to
+    // tell which side failed from the text alone.
+    #[test]
+    fn format_verify_failure_reason_distinguishes_source_and_target_eof() {
+        let source = format_verify_failure_reason(&VerifyFailureReason::SourceUnexpectedEof);
+        let target = format_verify_failure_reason(&VerifyFailureReason::TargetUnexpectedEof);
+        assert!(source.contains("image source"));
+        assert!(target.contains("target device"));
+        assert_ne!(source, target);
+    }
+
+    // N. UnsupportedAccess's message makes clear that Quick specifically
+    // needs random-access support, so a user understands why Quick (and not
+    // necessarily Full) failed for this image.
+    #[test]
+    fn format_verify_failure_reason_unsupported_access_mentions_random_access() {
+        let formatted = format_verify_failure_reason(&VerifyFailureReason::UnsupportedAccess);
+        assert!(formatted.to_lowercase().contains("random"));
     }
 }

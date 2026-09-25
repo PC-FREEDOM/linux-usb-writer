@@ -108,7 +108,16 @@ fn main() -> zbus::Result<()> {
                 }
             };
 
-            return run_write_test(image_path, target, verify_mode, test_pause_before_verify);
+            let exit = run_write_test(image_path, target, verify_mode, test_pause_before_verify)?;
+            // `std::process::exit` only here, at the very top level, and only
+            // after `run_write_test` has already returned normally -- every
+            // FD/state cleanup it triggers has already happened via ordinary
+            // Rust `Drop` by this point (see `write_test_exit_code`'s own
+            // doc comment).
+            if let Some(code) = write_test_exit_code(exit) {
+                std::process::exit(code);
+            }
+            return Ok(());
         }
         Some("writer-test") => return run_writer_test(),
         _ => {}
@@ -607,6 +616,64 @@ fn confirmation_matches(input: &str, expected_device: &str) -> bool {
     input.trim() == expected_device
 }
 
+// How `run_write_test` finished, for `main()` to turn into a process exit
+// code -- see `write_test_exit_code` below. Deliberately not richer than
+// this (no byte counts, no phase): every message a human needs has already
+// been printed by `run_write_test` itself by the time this is returned;
+// this exists only to answer the one question `main()` still needs
+// answered afterward -- "did the user cancel this run?"
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteTestExit {
+    Completed,
+    Cancelled,
+}
+
+// Pure: no I/O, no `std::process::exit` -- `main()` is the only place that
+// actually calls `std::process::exit`, and only after `run_write_test` has
+// already returned normally (see the `write-test` dispatch in `main()`),
+// so every FD/state cleanup `run_write_test` triggers via ordinary Rust
+// `Drop` has already happened by the time this decision is acted on. `None`
+// means "let `main` return `Ok(())` and exit 0 the ordinary way"; `Some`
+// carries the exit code `main` should pass to `std::process::exit` instead.
+// 130 (128 + SIGINT) is the conventional Unix exit code for a
+// signal-interrupted process, distinguishing a deliberate user cancellation
+// from both success (0) and a genuine error (1, `zbus::Result`'s own
+// `Err` path).
+fn write_test_exit_code(exit: WriteTestExit) -> Option<i32> {
+    match exit {
+        WriteTestExit::Completed => None,
+        WriteTestExit::Cancelled => Some(130),
+    }
+}
+
+// Installs the process-wide Ctrl+C (SIGINT) handler that lets a user
+// actually cancel an in-progress `write-test` write or Verify -- the
+// missing "last mile" identified by the v0.1 audit: `write_job::CancelHandle`
+// itself, and every write/Verify loop's use of it, already existed and were
+// already unit-tested; nothing anywhere in this crate could ever trigger
+// `request_cancel()` from a real user action until this function existed.
+//
+// The handler does exactly one thing: `cancel.request_cancel(UserRequested)`.
+// Nothing else runs inside it -- no `println!`/`eprintln!`, no allocation
+// beyond what capturing `cancel` itself already required, no D-Bus call, no
+// file or USB I/O, no `std::process::exit`, no panic, no lock, no shell
+// command, no sleep. `ctrlc` (unlike a hand-rolled `libc`/`nix` `sigaction`)
+// runs this closure outside the raw OS signal context (on its own internal
+// dispatch thread), which is what makes it safe to call ordinary, non-
+// `async-signal-safe` Rust code such as `request_cancel()` (an `AtomicU8`
+// store) here at all -- see reports/latest.md's "Cancel機能 Ctrl+C実配線 設計"
+// for the fuller comparison against `signal-hook`/raw `libc` that led to
+// this choice.
+//
+// Deliberately a small, named function rather than an inline closure at the
+// call site: this is the one and only place in this crate that touches
+// `ctrlc` at all, so isolating it here keeps that fact easy to audit.
+fn install_cancel_handler(cancel: write_job::CancelHandle) -> Result<(), ctrlc::Error> {
+    ctrlc::set_handler(move || {
+        cancel.request_cancel(write_job::CancelReason::UserRequested);
+    })
+}
+
 // TEST-ONLY diagnostic pause, enabled only by the explicit
 // `--test-pause-before-verify` CLI flag (see the `write-test` dispatch in
 // `main()`). Exists solely to let a real-device test manually mount a child
@@ -695,7 +762,7 @@ fn run_write_test(
     block_path: String,
     verify_mode: core::VerifyMode,
     test_pause_before_verify: bool,
-) -> zbus::Result<()> {
+) -> zbus::Result<WriteTestExit> {
     let mut state = attempt_select(&block_path);
 
     if let core::SelectionState::Selected { baseline, .. } = &state {
@@ -707,7 +774,7 @@ fn run_write_test(
 
     if !core::is_ready_to_open(&state) {
         println!("\nwrite-test: Selection invalid -- stopping before the Write Gate.");
-        return Ok(());
+        return Ok(WriteTestExit::Completed);
     }
 
     let core::SelectionState::Selected {
@@ -727,7 +794,7 @@ fn run_write_test(
         Ok(source) => source,
         Err(error) => {
             println!("write-test: failed to open image {image_path}: {error:?}");
-            return Ok(());
+            return Ok(WriteTestExit::Completed);
         }
     };
     let selected_image = image_source::SelectedImage::new(Box::new(source));
@@ -785,10 +852,30 @@ fn run_write_test(
 
     if !confirmed {
         println!("write-test: confirmation failed; no device was opened and nothing was written");
-        return Ok(());
+        return Ok(WriteTestExit::Completed);
     }
 
     println!("write-test: confirmation accepted for {expected_device}");
+
+    // Cancel wiring (Ctrl+C -> CancelHandle): one shared handle, created and
+    // wired to Ctrl+C only now that a destructive operation is genuinely
+    // about to happen -- not at process startup, and not before this point,
+    // so Ctrl+C during argument parsing, device enumeration, or this very
+    // confirmation prompt keeps its ordinary "just terminate the process"
+    // behavior (nothing has been opened or written yet, so there is nothing
+    // to clean up). The same `cancel` is cloned into `begin_write()` below
+    // and, further down, into `begin_verify()` -- one Ctrl+C anywhere from
+    // here through the end of Verify is honored by whichever phase happens
+    // to be running, instead of being scoped to only one of them.
+    let cancel = write_job::CancelHandle::new();
+
+    if let Err(error) = install_cancel_handler(cancel.clone()) {
+        println!("write-test: failed to install the Ctrl+C handler: {error:?}");
+        println!(
+            "write-test: refusing to start a destructive write without a working cancel path."
+        );
+        return Ok(WriteTestExit::Completed);
+    }
 
     // `verify_mode` is the CLI's own choice (see the `write-test` dispatch in
     // `main()`), frozen into the `ConfirmationToken`/`WritePlan` below via
@@ -804,7 +891,7 @@ fn run_write_test(
             Ok(intent) => intent,
             Err(error) => {
                 println!("write-test: WriteIntent construction rejected: {error:?}");
-                return Ok(());
+                return Ok(WriteTestExit::Completed);
             }
         };
     let confirmation = core::ConfirmationToken::confirm(intent);
@@ -827,7 +914,7 @@ fn run_write_test(
         Ok(ready) => ready,
         Err(error) => {
             println!("write-test: Write Gate rejected before OpenDevice: {error:?}");
-            return Ok(());
+            return Ok(WriteTestExit::Completed);
         }
     };
 
@@ -883,7 +970,7 @@ fn run_write_test(
         Err(error) => {
             println!("write-test: Write Gate rejected after OpenDevice: {error:?}");
             println!("write-test: FD (if any was opened) was already closed via RAII inside the Write Gate");
-            return Ok(());
+            return Ok(WriteTestExit::Completed);
         }
     };
 
@@ -905,28 +992,43 @@ fn run_write_test(
         Err(error) => {
             println!("write-test: AuthorizedExecution::bind() rejected: {error:?}");
             println!("write-test: AuthorizedWrite dropped -- FD closed via RAII");
-            return Ok(());
+            return Ok(WriteTestExit::Completed);
         }
     };
     println!("write-test: AuthorizedExecution bound (image_generation/image_size match confirmed)");
 
-    // No UI exists yet to request cancellation from another thread; a fresh,
-    // never-cancelled handle is all this CLI PoC needs.
-    let cancel = write_job::CancelHandle::new();
-
-    let writing_execution = match execution.begin_write(cancel) {
+    // `cancel.clone()`, not `cancel`: the shared handle created after Human
+    // Confirmation above must survive this call so it can also be handed to
+    // `begin_verify()` later (and read from the write progress callback
+    // below) -- see that handle's own doc comment.
+    let writing_execution = match execution.begin_write(cancel.clone()) {
         Ok(writing_execution) => writing_execution,
         Err(error) => {
             println!("write-test: begin_write() failed to open the image reader: {error}");
             println!(
                 "write-test: AuthorizedExecution dropped -- FD closed via RAII, 0 bytes written"
             );
-            return Ok(());
+            return Ok(WriteTestExit::Completed);
         }
     };
     println!("write-test: write started");
 
+    // `cancellation_notice_shown`: this progress callback is a convenient,
+    // already-existing place to tell the user their Ctrl+C was seen, the
+    // *first* time it's observed -- but it is only a best-effort, early
+    // notice. It is not guaranteed to run at all (e.g. cancellation
+    // requested after the last chunk already completed) and is never the
+    // thing that decides whether the write actually stopped -- that is
+    // `WriteAttemptOutcome::Cancelled` below, unconditionally.
+    let mut cancellation_notice_shown = false;
+
     let (selected_image, outcome) = writing_execution.write(|progress| {
+        if cancel.is_requested() && !cancellation_notice_shown {
+            cancellation_notice_shown = true;
+            println!(
+                "write-test: cancellation requested -- waiting for the current operation to stop safely."
+            );
+        }
         let percent = if progress.total_bytes > 0 {
             (progress.bytes_written as f64 / progress.total_bytes as f64) * 100.0
         } else {
@@ -938,7 +1040,7 @@ fn run_write_test(
         );
     });
 
-    match outcome {
+    let write_test_exit = match outcome {
         write_job::WriteAttemptOutcome::Succeeded(succeeded) => {
             println!(
                 "write-test: write succeeded ({} of {} bytes written)",
@@ -960,18 +1062,21 @@ fn run_write_test(
                     // via `begin_verify()` -- never conflicts with the
                     // trailing print below, which only the *other* three
                     // arms (which never touch `selected_image`) can reach.
-                    // No UI exists yet to request cancellation, exactly like
-                    // the write's own `cancel` above -- a fresh,
-                    // never-cancelled handle is all this CLI PoC needs. ----
-                    let verify_cancel = write_job::CancelHandle::new();
-
-                    match sync_succeeded.begin_verify(selected_image, verify_cancel) {
+                    // `cancel.clone()`, the same shared handle Ctrl+C was
+                    // wired to after Human Confirmation -- a cancellation
+                    // requested at any point up to now (during write, during
+                    // the blocking `sync_all()` above, or simply while the
+                    // user was reading these messages) is still honored: see
+                    // the early cancel check right after the TEST PAUSE
+                    // block below. ----
+                    match sync_succeeded.begin_verify(selected_image, cancel.clone()) {
                         write_job::VerifyStart::Skipped(image, succeeded) => {
                             println!("write-test: {}", format_verify_succeeded(&succeeded));
                             println!(
                                 "write-test: SelectedImage identity preserved after verification (image_size={})",
                                 image.logical_size()
                             );
+                            return Ok(WriteTestExit::Completed);
                         }
                         write_job::VerifyStart::Pending(pending) => {
                             match verify_mode {
@@ -1013,7 +1118,28 @@ fn run_write_test(
                                 println!(
                                     "write-test: write + sync already completed successfully; verification was not attempted."
                                 );
-                                return Ok(());
+                                return Ok(WriteTestExit::Completed);
+                            }
+
+                            // Cancel wiring: a Ctrl+C requested at any point
+                            // up to here (during write, during sync's
+                            // blocking `sync_all()`, during the TEST PAUSE
+                            // above, or simply while reading these messages)
+                            // must be honored now, before any further D-Bus
+                            // call or FD is opened for Verify.
+                            // `begin_verify()` itself does not check this
+                            // (it only branches on `VerifyMode` -- see its
+                            // own doc comment in `write_job.rs`), so this is
+                            // the one place that closes that gap, entirely
+                            // within `main.rs`. `pause_before_verify_for_test`
+                            // itself is not made "signal aware" -- whatever
+                            // it returned above, this check runs
+                            // unconditionally right after it.
+                            if cancel.is_requested() {
+                                for line in format_verify_cancelled_before_start() {
+                                    println!("write-test: {line}");
+                                }
+                                return Ok(WriteTestExit::Cancelled);
                             }
 
                             println!(
@@ -1060,7 +1186,7 @@ fn run_write_test(
                                         "write-test: SelectedImage identity preserved (image_size={})",
                                         image.logical_size()
                                     );
-                                    return Ok(());
+                                    return Ok(WriteTestExit::Completed);
                                 }
                             };
 
@@ -1126,13 +1252,31 @@ fn run_write_test(
                                         "write-test: SelectedImage identity preserved (image_size={})",
                                         image.logical_size()
                                     );
-                                    return Ok(());
+                                    return Ok(WriteTestExit::Completed);
                                 }
                             };
 
                             println!("write-test: verification started");
 
+                            // See the write progress callback's own comment
+                            // above for why `cancellation_notice_shown` is
+                            // only a best-effort notice. `last_verify_total_bytes`
+                            // caches the same `total_bytes` the progress
+                            // lines already display, purely so the final
+                            // Cancelled message below can report "X of Y"
+                            // without `write_job.rs` needing to expose a
+                            // separate way to compute Quick's sampled total.
+                            let mut cancellation_notice_shown = false;
+                            let mut last_verify_total_bytes: u64 = 0;
+
                             let (image, verify_outcome) = verifying.run(|progress| {
+                                last_verify_total_bytes = progress.total_bytes;
+                                if cancel.is_requested() && !cancellation_notice_shown {
+                                    cancellation_notice_shown = true;
+                                    println!(
+                                        "write-test: cancellation requested -- waiting for the current operation to stop safely."
+                                    );
+                                }
                                 let percent = if progress.total_bytes > 0 {
                                     (progress.verified_bytes as f64 / progress.total_bytes as f64)
                                         * 100.0
@@ -1145,9 +1289,10 @@ fn run_write_test(
                                 );
                             });
 
-                            match verify_outcome {
+                            let verify_exit = match verify_outcome {
                                 write_job::VerifyOutcome::Succeeded(succeeded) => {
                                     println!("write-test: {}", format_verify_succeeded(&succeeded));
+                                    WriteTestExit::Completed
                                 }
                                 write_job::VerifyOutcome::Failed(failed) => {
                                     println!("write-test: write + sync completed successfully.");
@@ -1159,23 +1304,26 @@ fn run_write_test(
                                         "write-test: verified_bytes={} before failure (mode={:?})",
                                         failed.verified_bytes, failed.mode
                                     );
+                                    WriteTestExit::Completed
                                 }
                                 write_job::VerifyOutcome::Cancelled(cancelled) => {
-                                    println!(
-                                        "write-test: verification cancelled after {} bytes",
-                                        cancelled.verified_bytes
-                                    );
+                                    for line in
+                                        format_verify_cancelled(&cancelled, last_verify_total_bytes)
+                                    {
+                                        println!("write-test: {line}");
+                                    }
+                                    WriteTestExit::Cancelled
                                 }
-                            }
+                            };
 
                             println!(
                                 "write-test: SelectedImage identity preserved after verification (image_size={})",
                                 image.logical_size()
                             );
+
+                            return Ok(verify_exit);
                         }
                     }
-
-                    return Ok(());
                 }
                 write_job::SyncAttemptOutcome::Failed(failed) => {
                     println!("write-test: sync FAILED: {failed:?}");
@@ -1183,6 +1331,7 @@ fn run_write_test(
                         "write-test: retry_requires_fresh_gate={} -- not retrying automatically",
                         failed.retry_requires_fresh_gate
                     );
+                    WriteTestExit::Completed
                 }
             }
         }
@@ -1192,15 +1341,19 @@ fn run_write_test(
                 "write-test: not syncing -- retry_requires_fresh_gate={}",
                 failed.retry_requires_fresh_gate
             );
+            WriteTestExit::Completed
         }
         write_job::WriteAttemptOutcome::Cancelled(cancelled) => {
-            println!("write-test: write CANCELLED: {cancelled:?}");
+            for line in format_write_cancelled(&cancelled) {
+                println!("write-test: {line}");
+            }
             println!(
                 "write-test: not syncing -- retry_requires_fresh_gate={}",
                 cancelled.retry_requires_fresh_gate
             );
+            WriteTestExit::Cancelled
         }
-    }
+    };
 
     // Reached only by the write-Failed, write-Cancelled, and sync-Failed
     // paths above -- the sync-Succeeded path always returns from within its
@@ -1212,7 +1365,7 @@ fn run_write_test(
         selected_image.logical_size()
     );
 
-    Ok(())
+    Ok(write_test_exit)
 }
 
 // Parses a CLI verify-mode argument (`none` | `quick` | `full`, lowercase
@@ -1496,6 +1649,76 @@ fn format_verify_diagnostics_unavailable() -> Vec<String> {
     vec!["no fresh device snapshot was available for diagnostics".to_string()]
 }
 
+// ---------------------------------------------------------------------
+// Cancel (Ctrl+C) CLI messaging (Cancel機能 Ctrl+C実配線 implementation).
+// Pure formatters, matching the existing `format_verify_diagnostics_*`
+// pattern: no `println!` here, only line content for the caller to prefix.
+// ---------------------------------------------------------------------
+
+// A cancelled write is never a success: `target may contain a partial
+// image` and `verification was not attempted` are stated unconditionally,
+// regardless of `bytes_written` -- even a cancellation observed before any
+// chunk completed must not be worded as if the target were untouched
+// (`writer::write()`'s own pre-loop cancel check can still report
+// `bytes_written == 0`, which is still "cancelled", not "nothing to worry
+// about").
+fn format_write_cancelled(cancelled: &write_job::Cancelled) -> Vec<String> {
+    vec![
+        format!(
+            "write cancelled after {} of {} bytes",
+            cancelled.bytes_written, cancelled.image_size
+        ),
+        "target may contain a partial image".to_string(),
+        "verification was not attempted".to_string(),
+    ]
+}
+
+// Unlike a write cancellation, a Verify cancellation never implies the
+// target itself is suspect: Verify is read-only, and by the time it can run
+// at all, write+sync have already succeeded -- see `format_verify_cancelled`'s
+// caller for why this reads "written image remains on the target" rather
+// than any wording implying the target is now in doubt. `total_bytes` is the
+// last value observed from the Verify progress callback (the same
+// `total_bytes` the ordinary progress lines already display), not
+// `image.logical_size()` -- for `VerifyMode::Quick` those two differ, and
+// this must report the same "sampled total" Quick was actually checking
+// against, never the full image size.
+fn format_verify_cancelled(
+    cancelled: &write_job::VerifyCancelled,
+    total_bytes: u64,
+) -> Vec<String> {
+    let mode_label = match cancelled.mode {
+        core::VerifyMode::Quick => "Quick",
+        core::VerifyMode::Full => "Full",
+        core::VerifyMode::None => {
+            unreachable!(
+                "VerifyMode::None never reaches Verifying -- see SyncSucceeded::begin_verify()"
+            )
+        }
+    };
+
+    vec![
+        format!(
+            "{mode_label} verification cancelled after {} of {} bytes",
+            cancelled.verified_bytes, total_bytes
+        ),
+        "written image remains on the target".to_string(),
+    ]
+}
+
+// Shown when `cancel.is_requested()` is already `true` by the time
+// `VerifyStart::Pending` is reached -- before `collect_device_snapshot()`,
+// `check_target()`, or `OpenDevice(mode="r")` are ever called (see the early
+// cancel check in `run_write_test`). Deliberately does not claim any FD/D-Bus
+// state was opened-then-closed: none of it was ever opened at all.
+fn format_verify_cancelled_before_start() -> Vec<String> {
+    vec![
+        "verification was cancelled before it could start.".to_string(),
+        "write + sync already completed successfully; the target was not re-opened for verification."
+            .to_string(),
+    ]
+}
+
 // PoC mode: Writer self-test (`cargo run -- writer-test`). Exercises the
 // Writer Core (src/writer.rs) end to end against a throwaway *regular file*
 // only — never a block device. The target path is always chosen by this
@@ -1591,13 +1814,17 @@ mod tests {
     use super::confirmation_matches;
     use super::{
         format_hard_hazards, format_identity_comparison, format_instance_comparison,
+        format_verify_cancelled, format_verify_cancelled_before_start,
         format_verify_diagnostics_summary, format_verify_diagnostics_unavailable,
-        format_verify_failure_reason, format_verify_succeeded, parse_verify_mode,
-        parse_write_test_trailing_args, WriteTestArgsError,
+        format_verify_failure_reason, format_verify_succeeded, format_write_cancelled,
+        parse_verify_mode, parse_write_test_trailing_args, write_test_exit_code,
+        WriteTestArgsError, WriteTestExit,
     };
     use crate::device::DeviceSnapshot;
     use crate::execution::core::{self, HardHazardReason, VerifyMode};
-    use crate::execution::write_job::{VerifyFailureReason, VerifySucceeded};
+    use crate::execution::write_job::{
+        CancelReason, Cancelled, VerifyCancelled, VerifyFailureReason, VerifySucceeded,
+    };
     use crate::identity::{IdentityComparison, InstanceComparison};
 
     // A. Exact match -> true.
@@ -2016,5 +2243,119 @@ mod tests {
             parse_write_test_trailing_args(Some("bogus"), Some("--test-pause-before-verify")),
             Err(WriteTestArgsError::InvalidVerifyMode)
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Cancel (Ctrl+C) CLI messaging and exit code (Cancel機能 Ctrl+C実配線
+    // implementation). Shared-`CancelHandle` behavior itself (clone sees the
+    // same `request_cancel()`) is already covered extensively by
+    // `execution::write_job`'s own tests (e.g.
+    // `cancel_partway_through_multiple_chunks_reports_partial_progress`,
+    // which clones a handle into the write loop and calls `request_cancel()`
+    // from the original) -- not duplicated here.
+    // ---------------------------------------------------------------------
+
+    // Z1. A write cancelled after a partial write reports the exact
+    // bytes_written/image_size pair, and unconditionally states that the
+    // target may be partial and that verification was not attempted.
+    #[test]
+    fn format_write_cancelled_reports_partial_bytes_and_no_verification() {
+        let cancelled = Cancelled {
+            image_size: 1_000_000,
+            bytes_written: 400_000,
+            reason: CancelReason::UserRequested,
+            target_may_be_modified: true,
+            retry_requires_fresh_gate: true,
+        };
+
+        assert_eq!(
+            format_write_cancelled(&cancelled),
+            vec![
+                "write cancelled after 400000 of 1000000 bytes".to_string(),
+                "target may contain a partial image".to_string(),
+                "verification was not attempted".to_string(),
+            ]
+        );
+    }
+
+    // Z2. A write cancelled before any chunk completed (bytes_written == 0)
+    // is still reported as a cancellation, never implying nothing happened.
+    #[test]
+    fn format_write_cancelled_reports_zero_bytes_before_any_chunk() {
+        let cancelled = Cancelled {
+            image_size: 1_000_000,
+            bytes_written: 0,
+            reason: CancelReason::UserRequested,
+            target_may_be_modified: false,
+            retry_requires_fresh_gate: true,
+        };
+
+        let lines = format_write_cancelled(&cancelled);
+        assert_eq!(lines[0], "write cancelled after 0 of 1000000 bytes");
+    }
+
+    // Z3. A cancelled Full Verify reports "Full", the bytes actually
+    // verified, and the caller-supplied total (not `image.logical_size()`
+    // directly, since Quick's total legitimately differs -- see Z4) -- and
+    // states that the already-written image remains on the target.
+    #[test]
+    fn format_verify_cancelled_reports_full_mode_and_total() {
+        let cancelled = VerifyCancelled {
+            mode: VerifyMode::Full,
+            verified_bytes: 500_000,
+        };
+
+        assert_eq!(
+            format_verify_cancelled(&cancelled, 1_000_000),
+            vec![
+                "Full verification cancelled after 500000 of 1000000 bytes".to_string(),
+                "written image remains on the target".to_string(),
+            ]
+        );
+    }
+
+    // Z4. A cancelled Quick Verify reports "Quick" and the sampled total
+    // (e.g. 12 MiB for a 16 MiB image), never the full image size.
+    #[test]
+    fn format_verify_cancelled_reports_quick_mode_and_sampled_total() {
+        let cancelled = VerifyCancelled {
+            mode: VerifyMode::Quick,
+            verified_bytes: 4_194_304,
+        };
+
+        let lines = format_verify_cancelled(&cancelled, 12_582_912);
+        assert_eq!(
+            lines[0],
+            "Quick verification cancelled after 4194304 of 12582912 bytes"
+        );
+    }
+
+    // Z5. The pre-verify early-cancel message never implies any FD or D-Bus
+    // state was opened and then closed -- nothing was ever opened.
+    #[test]
+    fn format_verify_cancelled_before_start_does_not_mention_fd_or_opendevice() {
+        let lines = format_verify_cancelled_before_start();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("cancelled before it could start"));
+        assert!(lines[1].contains("write + sync already completed successfully"));
+        for line in &lines {
+            assert!(!line.to_lowercase().contains("opendevice"));
+            assert!(!line.to_lowercase().contains("fd"));
+        }
+    }
+
+    // Z6. `WriteTestExit::Cancelled` maps to exit code 130 (128 + SIGINT),
+    // the conventional Unix code for a signal-interrupted process.
+    #[test]
+    fn write_test_exit_code_maps_cancelled_to_130() {
+        assert_eq!(write_test_exit_code(WriteTestExit::Cancelled), Some(130));
+    }
+
+    // Z7. `WriteTestExit::Completed` maps to `None`, telling the caller to
+    // let `main` exit the ordinary way (code 0) rather than calling
+    // `std::process::exit` at all.
+    #[test]
+    fn write_test_exit_code_maps_completed_to_none() {
+        assert_eq!(write_test_exit_code(WriteTestExit::Completed), None);
     }
 }

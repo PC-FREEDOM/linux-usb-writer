@@ -334,15 +334,27 @@ fn verify_target_hard_hazards(current: &DeviceSnapshot) -> Vec<HardHazardReason>
 // Fields are private, not `pub`: nothing outside this module should be able
 // to construct one from independently-sourced parts (the same rationale as
 // `ImageSelection`/`WriteIntent` above) -- `diagnose_identity_instance_for_verify`
-// is the only constructor. `pub(in crate::execution)`, matching
-// `HardHazardReason`/`VerifyTargetCheckError`: no production caller outside
-// this module exists yet (a future `write_job.rs` Verify state machine is
-// the intended one), so this stays no more exposed than it needs to be
-// today. `Debug, Clone` only -- `DeviceSnapshot` itself does not derive
+// is the only constructor. `pub(crate)`, not the narrower `pub(in
+// crate::execution)` this type started implementation step 1+2 with: Verify
+// Pre-flight Diagnostics implementation step 3+4 threads this type through
+// `write_job::PendingVerify::check_target()`'s public, `pub(crate)`-reachable
+// return type, and `main.rs` (outside `crate::execution`) must call that
+// method -- Rust requires a `pub`/`pub(crate)` function's return type to be
+// at least as visible as the function itself at every call site that can
+// actually reach it (confirmed the hard way: `pub(in crate::execution)`
+// here produced a hard "private type" error at the `main.rs` call site, not
+// merely a lint, once `main.rs` was updated to match `check_target()`'s new
+// three-element error tuple). `main.rs` still does not read any field of
+// this type or call any of its accessors today -- it only discards the
+// value (`Err((image, error, _diagnostics))`) to keep compiling against the
+// new shape -- so this widening is the minimum Rust's own privacy rules
+// leave available, not a step toward exposing the type's contents; whether
+// `main.rs` should actually read from it is still Step 5's decision, not
+// this one's. `Debug, Clone` only -- `DeviceSnapshot` itself does not derive
 // `Copy`/`PartialEq`/`Eq`, so neither can this type without first changing
 // `device.rs`, which is out of scope for this step.
 #[derive(Debug, Clone)]
-pub(in crate::execution) struct VerifyTargetDiagnostics {
+pub(crate) struct VerifyTargetDiagnostics {
     baseline: DeviceSnapshot,
     current: DeviceSnapshot,
     identity: IdentityComparison,
@@ -434,22 +446,28 @@ pub(in crate::execution) fn diagnose_identity_instance_for_verify(
 // Pure: no D-Bus, no file I/O, no global state -- takes only the two
 // snapshots already in the caller's hand, exactly like
 // `check_identity_instance_safety`.
-#[allow(dead_code)] // no production caller yet; a future Verify state machine (write_job.rs) is the intended one. Exercised by this module's own tests below.
-pub(in crate::execution) fn check_identity_instance_for_verify(
-    baseline: &DeviceSnapshot,
-    current: &DeviceSnapshot,
+// The *only* place the Identity -> Instance -> hazards priority order for
+// Verify's pre-flight decision is encoded. Introduced so that
+// `check_identity_instance_for_verify` (below, this module) and
+// `write_job::PendingVerify::check_target()` (a sibling module) can both
+// reach the exact same allow/reject decision from an already-computed
+// `VerifyTargetDiagnostics` value, without either one re-implementing this
+// priority order independently -- two independent copies of "which error
+// wins when more than one condition applies" were found to drift into being
+// exactly that risk during Verify Pre-flight Diagnostics implementation
+// step 3+4, which is why this helper exists as the single, shared decision
+// point instead. Pure: reads only the fields of `diagnostics` already
+// computed by `diagnose_identity_instance_for_verify` -- no comparison is
+// performed here, only a priority selection over results computed exactly
+// once by the caller.
+//
+// `pub(in crate::execution)`, matching `VerifyTargetCheckError`/
+// `VerifyTargetDiagnostics`: `write_job.rs` (a sibling module inside
+// `execution`) is the intended caller for the failure-path/success-path
+// diagnostics-carrying case; nothing outside `execution` needs this.
+pub(in crate::execution) fn verify_target_check_from_diagnostics(
+    diagnostics: &VerifyTargetDiagnostics,
 ) -> Result<(), VerifyTargetCheckError> {
-    // Single source of truth: the diagnostics below are the one and only
-    // place Identity/Instance/hazards are computed for this check. A future
-    // diagnostic log line reads the exact same `VerifyTargetDiagnostics`
-    // value (via `diagnose_identity_instance_for_verify`) that this decision
-    // is based on -- never a second, independently recomputed copy.
-    let diagnostics = diagnose_identity_instance_for_verify(baseline, current);
-
-    // Priority order preserved unchanged from the pre-diagnostics
-    // implementation: Identity, then Instance, then hazards. This is a
-    // regression-sensitive ordering (see this module's own
-    // `verify_target_check_*` tests below), not an incidental one.
     match diagnostics.identity {
         IdentityComparison::Changed => return Err(VerifyTargetCheckError::IdentityChanged),
         IdentityComparison::InsufficientIdentity => {
@@ -471,6 +489,22 @@ pub(in crate::execution) fn check_identity_instance_for_verify(
     }
 
     Ok(())
+}
+
+#[allow(dead_code)] // no production caller yet; a future Verify state machine (write_job.rs) is the intended one. Exercised by this module's own tests below.
+pub(in crate::execution) fn check_identity_instance_for_verify(
+    baseline: &DeviceSnapshot,
+    current: &DeviceSnapshot,
+) -> Result<(), VerifyTargetCheckError> {
+    // Single source of truth: the diagnostics below are the one and only
+    // place Identity/Instance/hazards are computed for this check. A future
+    // diagnostic log line reads the exact same `VerifyTargetDiagnostics`
+    // value (via `diagnose_identity_instance_for_verify`) that this decision
+    // is based on -- never a second, independently recomputed copy. The
+    // priority order itself lives in `verify_target_check_from_diagnostics`
+    // above, shared with `write_job::PendingVerify::check_target()`.
+    let diagnostics = diagnose_identity_instance_for_verify(baseline, current);
+    verify_target_check_from_diagnostics(&diagnostics)
 }
 
 // The narrow set of `DeviceSnapshot` conditions that block Verify, read
@@ -3702,6 +3736,144 @@ mod tests {
         assert_eq!(
             check_identity_instance_for_verify(&baseline, &current),
             Err(VerifyTargetCheckError::InstanceInsufficient)
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // verify_target_check_from_diagnostics (Verify Pre-flight Diagnostics,
+    // implementation step 3+4): the shared Identity -> Instance -> hazards
+    // priority order, now the single place both this module's own
+    // `check_identity_instance_for_verify` and `write_job::PendingVerify::
+    // check_target()` reach their allow/reject decision from. Exercised
+    // here directly against hand-built `VerifyTargetDiagnostics` values
+    // (independent of `diagnose_identity_instance_for_verify`'s own
+    // comparison logic, already covered by the D1-D11 tests above), so the
+    // priority order itself is pinned regardless of how the diagnostics
+    // were produced.
+    // ---------------------------------------------------------------------
+
+    fn diagnostics_for_test(
+        identity: IdentityComparison,
+        instance: InstanceComparison,
+        hazards: Vec<HardHazardReason>,
+    ) -> VerifyTargetDiagnostics {
+        VerifyTargetDiagnostics {
+            baseline: base_device(),
+            current: base_device(),
+            identity,
+            instance,
+            hazards,
+        }
+    }
+
+    // P1. Clean diagnostics (Same/SameInstance/no hazards) are allowed.
+    #[test]
+    fn verify_target_check_from_diagnostics_allows_clean_diagnostics() {
+        let diagnostics = diagnostics_for_test(
+            IdentityComparison::Same,
+            InstanceComparison::SameInstance,
+            Vec::new(),
+        );
+
+        assert_eq!(verify_target_check_from_diagnostics(&diagnostics), Ok(()));
+    }
+
+    // P2. Identity::Changed takes priority even when Instance and hazards
+    // are both also wrong at the same time.
+    #[test]
+    fn verify_target_check_from_diagnostics_identity_changed_takes_priority() {
+        let diagnostics = diagnostics_for_test(
+            IdentityComparison::Changed,
+            InstanceComparison::Recreated,
+            vec![HardHazardReason::SystemDevice],
+        );
+
+        assert_eq!(
+            verify_target_check_from_diagnostics(&diagnostics),
+            Err(VerifyTargetCheckError::IdentityChanged)
+        );
+    }
+
+    // P3. Identity::InsufficientIdentity also takes priority over Instance
+    // and hazards.
+    #[test]
+    fn verify_target_check_from_diagnostics_identity_insufficient_takes_priority() {
+        let diagnostics = diagnostics_for_test(
+            IdentityComparison::InsufficientIdentity,
+            InstanceComparison::Recreated,
+            vec![HardHazardReason::SystemDevice],
+        );
+
+        assert_eq!(
+            verify_target_check_from_diagnostics(&diagnostics),
+            Err(VerifyTargetCheckError::IdentityInsufficient)
+        );
+    }
+
+    // P4. With Identity Same, Instance::Recreated takes priority over a
+    // simultaneous hazard.
+    #[test]
+    fn verify_target_check_from_diagnostics_instance_recreated_takes_priority_over_hazards() {
+        let diagnostics = diagnostics_for_test(
+            IdentityComparison::Same,
+            InstanceComparison::Recreated,
+            vec![HardHazardReason::ActiveSwap],
+        );
+
+        assert_eq!(
+            verify_target_check_from_diagnostics(&diagnostics),
+            Err(VerifyTargetCheckError::InstanceRecreated)
+        );
+    }
+
+    // P5. With Identity Same, Instance::InsufficientInformation also takes
+    // priority over a simultaneous hazard.
+    #[test]
+    fn verify_target_check_from_diagnostics_instance_insufficient_takes_priority_over_hazards() {
+        let diagnostics = diagnostics_for_test(
+            IdentityComparison::Same,
+            InstanceComparison::InsufficientInformation,
+            vec![HardHazardReason::ActiveSwap],
+        );
+
+        assert_eq!(
+            verify_target_check_from_diagnostics(&diagnostics),
+            Err(VerifyTargetCheckError::InstanceInsufficient)
+        );
+    }
+
+    // P6. With Identity Same and Instance SameInstance, a single hazard is
+    // reported as UnsafeTargetState.
+    #[test]
+    fn verify_target_check_from_diagnostics_reports_unsafe_target_state_for_a_hazard() {
+        let diagnostics = diagnostics_for_test(
+            IdentityComparison::Same,
+            InstanceComparison::SameInstance,
+            vec![HardHazardReason::MediaUnavailable],
+        );
+
+        assert_eq!(
+            verify_target_check_from_diagnostics(&diagnostics),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // P7. Multiple simultaneous hazards still collapse to a single
+    // UnsafeTargetState -- the flat error type is unchanged by this step.
+    #[test]
+    fn verify_target_check_from_diagnostics_collapses_multiple_hazards_to_unsafe_target_state() {
+        let diagnostics = diagnostics_for_test(
+            IdentityComparison::Same,
+            InstanceComparison::SameInstance,
+            vec![
+                HardHazardReason::ActiveSwap,
+                HardHazardReason::ComplexStorage,
+            ],
+        );
+
+        assert_eq!(
+            verify_target_check_from_diagnostics(&diagnostics),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
         );
     }
 }

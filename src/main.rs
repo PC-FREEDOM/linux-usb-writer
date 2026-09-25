@@ -919,7 +919,15 @@ fn run_write_test(
 
                             let ready = match pending.check_target(refreshed_for_verify) {
                                 Ok(ready) => ready,
-                                Err((image, error)) => {
+                                // `_diagnostics` (Verify Pre-flight Diagnostics
+                                // implementation step 3+4): `check_target()` now also
+                                // returns the `VerifyTargetDiagnostics` that produced
+                                // this rejection, for a future diagnostic log line to
+                                // use. Not displayed yet -- that CLI wiring is a
+                                // separate, later step -- so it is discarded here for
+                                // now, purely to keep this call site compiling against
+                                // the new return shape.
+                                Err((image, error, _diagnostics)) => {
                                     println!("write-test: write + sync completed successfully.");
                                     println!("write-test: verification could not start: {error:?}");
                                     println!(

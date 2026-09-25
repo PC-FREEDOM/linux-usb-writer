@@ -135,8 +135,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 
 use super::core::{
-    check_fd_binding, check_identity_instance_for_verify, ActiveWrite, AuthorizedWrite,
-    FdBindingCheck, VerifyMode, VerifyTargetCheckError,
+    check_fd_binding, diagnose_identity_instance_for_verify, verify_target_check_from_diagnostics,
+    ActiveWrite, AuthorizedWrite, FdBindingCheck, VerifyMode, VerifyTargetCheckError,
+    VerifyTargetDiagnostics,
 };
 use super::linux_access::{FdMetadata, OpenedDeviceHandle, ReadTarget};
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
@@ -940,11 +941,17 @@ pub enum VerifyStartError {
     FdBindingInsufficient,
 }
 
-// Pure relabeling, no new logic: `core::check_identity_instance_for_verify`
-// (Step 3) already decided everything; this only translates its small,
-// `execution`-internal `VerifyTargetCheckError` into this module's own,
-// `pub` `VerifyStartError` vocabulary. See `VerifyStartError`'s own doc
-// comment for why this mirrors `prepare_for_open`'s existing
+// Pure relabeling, no new logic: `core::verify_target_check_from_diagnostics`
+// (Verify Pre-flight Diagnostics implementation step 3+4) already decided
+// everything, from a `VerifyTargetDiagnostics` value `check_target()` (below)
+// computed via a single `diagnose_identity_instance_for_verify()` call. This
+// module never re-implements the Identity -> Instance -> hazards priority
+// order itself -- that decision now lives in exactly one place,
+// `core::verify_target_check_from_diagnostics`, shared by this module and by
+// `core::check_identity_instance_for_verify`. This function only translates
+// its small, `execution`-internal `VerifyTargetCheckError` into this
+// module's own, `pub` `VerifyStartError` vocabulary -- see `VerifyStartError`'s
+// own doc comment for why this mirrors `prepare_for_open`'s existing
 // `InvalidationReason` -> `WriteGateError` relabeling.
 fn verify_start_error_from_target_check(error: VerifyTargetCheckError) -> VerifyStartError {
     match error {
@@ -1001,28 +1008,68 @@ impl PendingVerify {
     }
 
     // Identity/Instance/hazard re-check (Step 3's
-    // `check_identity_instance_for_verify`) against a freshly re-fetched
-    // snapshot. On any rejection, `self.image` is returned alongside the
-    // error rather than silently dropped -- the same "never silently drop a
-    // caller-supplied resource" discipline `WritingExecution::write()`
-    // already established for the write path.
+    // `check_identity_instance_for_verify`, now reached via
+    // `core::diagnose_identity_instance_for_verify` +
+    // `core::verify_target_check_from_diagnostics` -- the same shared
+    // priority order that function itself uses, see its doc comment for
+    // why this module cannot call `check_identity_instance_for_verify`
+    // directly without recomputing the diagnostics a second time) against a
+    // freshly re-fetched snapshot. On any rejection, `self.image` is
+    // returned alongside the error rather than silently dropped -- the same
+    // "never silently drop a caller-supplied resource" discipline
+    // `WritingExecution::write()` already established for the write path.
+    //
+    // Verify Pre-flight Diagnostics (implementation step 3+4): the freshly
+    // computed `VerifyTargetDiagnostics` is now returned to the caller on
+    // every path but one. On success it travels inside the returned
+    // `VerifyReadyToOpen` (see that struct's own doc comment); on an
+    // Identity/Instance/hazard rejection it is the third element of the
+    // error tuple, `Some(diagnostics)` -- the caller (a future `main.rs`
+    // diagnostic log line, not this step) can inspect exactly which
+    // comparison/hazard produced the rejection. The one exception is
+    // `SnapshotRefreshFailed`: there is no fresh `DeviceSnapshot` to compare
+    // against in that case (the refresh itself failed), so no diagnostics
+    // value can exist -- the third element is `None`, never a diagnostics
+    // built from a stale or fabricated `current`.
     pub fn check_target(
         self,
         refreshed: SnapshotFetchOutcome,
-    ) -> Result<VerifyReadyToOpen, (SelectedImage, VerifyStartError)> {
+    ) -> Result<
+        VerifyReadyToOpen,
+        (
+            SelectedImage,
+            VerifyStartError,
+            Option<VerifyTargetDiagnostics>,
+        ),
+    > {
         let current = match refreshed {
             SnapshotFetchOutcome::Found(snapshot) => snapshot,
             SnapshotFetchOutcome::NotFound | SnapshotFetchOutcome::Error(_) => {
-                return Err((self.image, VerifyStartError::SnapshotRefreshFailed));
+                return Err((self.image, VerifyStartError::SnapshotRefreshFailed, None));
             }
         };
 
-        if let Err(error) = check_identity_instance_for_verify(&self.baseline, &current) {
-            return Err((self.image, verify_start_error_from_target_check(error)));
+        // Single source of truth: one `diagnose_identity_instance_for_verify`
+        // call computes Identity/Instance/hazards exactly once. The
+        // allow/reject decision (`core::verify_target_check_from_diagnostics`
+        // -- the same shared priority order `core::check_identity_instance_for_verify`
+        // itself uses) and the diagnostics value returned to the caller (on
+        // every path) both come from this same value -- never a second,
+        // independently recomputed one, and never a second, independently
+        // implemented priority order.
+        let diagnostics = diagnose_identity_instance_for_verify(&self.baseline, &current);
+
+        if let Err(error) = verify_target_check_from_diagnostics(&diagnostics) {
+            return Err((
+                self.image,
+                verify_start_error_from_target_check(error),
+                Some(diagnostics),
+            ));
         }
 
         Ok(VerifyReadyToOpen {
             current,
+            diagnostics,
             image: self.image,
             mode: self.mode,
             cancel: self.cancel,
@@ -1036,8 +1083,23 @@ impl PendingVerify {
 // the module-level doc comment) and pass the result to `finalize()`. Mirrors
 // `core::ReadyToOpen` exactly, one step later in the chain and for a
 // read-only open instead of a write-mode one.
+//
+// `diagnostics` (Verify Pre-flight Diagnostics, implementation step 3+4):
+// the exact `VerifyTargetDiagnostics` `check_target()` computed to decide
+// this pass was clean, carried through unchanged rather than dropped now
+// that the decision has been made. Private, like `current`/`image`/`mode`/
+// `cancel` above it: the only way to obtain one is the value `check_target()`
+// itself already verified -- there is no constructor or setter anywhere that
+// would let a caller substitute an arbitrary, unverified
+// `VerifyTargetDiagnostics` here (no "arbitrary diagnostics injection", per
+// this step's own constraint). No accessor is added this step either: this
+// module's own tests reach the field directly (ordinary same-module access),
+// and no production caller outside `write_job.rs` exists yet -- a future
+// `main.rs` wiring step (not this one) is the one that would need a public
+// accessor, and that step is the right place to decide its visibility.
 pub struct VerifyReadyToOpen {
     current: DeviceSnapshot,
+    diagnostics: VerifyTargetDiagnostics,
     image: SelectedImage,
     mode: VerifyMode,
     cancel: CancelHandle,
@@ -1629,8 +1691,9 @@ fn run_quick_verify(
 mod tests {
     use super::*;
     use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
-    use crate::execution::core::{self, ConfirmationToken};
+    use crate::execution::core::{self, ConfirmationToken, HardHazardReason};
     use crate::execution::linux_access::{FdMetadata, OpenedDeviceHandle};
+    use crate::identity::{IdentityComparison, InstanceComparison};
     use crate::image_source::{FileImageSource, ImageSource, ImageSourceAccess};
     use std::io::Cursor;
 
@@ -2697,7 +2760,7 @@ mod tests {
 
         let ready = pending
             .check_target(SnapshotFetchOutcome::Found(target_snapshot.clone()))
-            .unwrap_or_else(|(_, error)| {
+            .unwrap_or_else(|(_, error, _)| {
                 panic!("check_target should succeed for a matching fresh snapshot, got {error:?}")
             });
 
@@ -3059,7 +3122,7 @@ mod tests {
         };
         let ready = pending
             .check_target(SnapshotFetchOutcome::Found(snapshot.clone()))
-            .unwrap_or_else(|(_, e)| panic!("check_target should succeed, got {e:?}"));
+            .unwrap_or_else(|(_, e, _)| panic!("check_target should succeed, got {e:?}"));
 
         // Write-only, no read permission -- read_at() on this handle must
         // fail with a genuine I/O error, not merely a short read.
@@ -3409,11 +3472,19 @@ mod tests {
         let result = pending.check_target(SnapshotFetchOutcome::Found(changed));
         let _ = std::fs::remove_file(&target_path);
 
-        let (_returned_image, error) = match result {
+        let (_returned_image, error, diagnostics) = match result {
             Err(rejection) => rejection,
             Ok(_) => panic!("expected identity-changed rejection"),
         };
         assert!(matches!(error, VerifyStartError::IdentityChanged));
+
+        // Verify Pre-flight Diagnostics (step 3+4): an Identity/Instance/
+        // hazard rejection must still carry the diagnostics that produced
+        // it -- only `SnapshotRefreshFailed` returns `None` (see the
+        // dedicated test for that case below).
+        let diagnostics =
+            diagnostics.expect("diagnostics should be present for an Identity rejection");
+        assert_eq!(diagnostics.identity(), IdentityComparison::Changed);
     }
 
     // V19 (Verify start: Instance recreated). A freshly re-fetched snapshot
@@ -3440,11 +3511,15 @@ mod tests {
         let result = pending.check_target(SnapshotFetchOutcome::Found(changed));
         let _ = std::fs::remove_file(&target_path);
 
-        let (_returned_image, error) = match result {
+        let (_returned_image, error, diagnostics) = match result {
             Err(rejection) => rejection,
             Ok(_) => panic!("expected instance-recreated rejection"),
         };
         assert!(matches!(error, VerifyStartError::InstanceRecreated));
+
+        let diagnostics =
+            diagnostics.expect("diagnostics should be present for an Instance rejection");
+        assert_eq!(diagnostics.instance(), InstanceComparison::Recreated);
     }
 
     // V20 (the key regression test). A freshly re-fetched snapshot whose
@@ -3475,10 +3550,57 @@ mod tests {
         let result = pending.check_target(SnapshotFetchOutcome::Found(mounted));
         let _ = std::fs::remove_file(&target_path);
 
-        assert!(
-            result.is_ok(),
-            "expected Verify to still be allowed after a benign mount-state change"
+        let ready = result.unwrap_or_else(|(_, error, _)| {
+            panic!("expected Verify to still be allowed after a benign mount-state change, got {error:?}")
+        });
+
+        // The diagnostics carried inside `VerifyReadyToOpen` preserve the
+        // observed mount-state change (for a future diagnostic log line to
+        // report) even though it did not block Verify.
+        assert_eq!(
+            ready.diagnostics.current().mount_points,
+            vec!["/media/example".to_string()]
         );
+        assert!(ready.diagnostics.baseline().mount_points.is_empty());
+        assert!(ready.diagnostics.hazards().is_empty());
+    }
+
+    // V20b. `read_only` going from `false` to `true` on the freshly
+    // re-fetched snapshot does not block Verify (Step 3's deliberate
+    // decision, see `core::verify_target_has_hard_hazard`'s doc comment),
+    // and the diagnostics carried inside `VerifyReadyToOpen` preserve the
+    // change for observability.
+    #[test]
+    fn begin_verify_check_target_allows_read_only_change_and_preserves_diagnostics() {
+        let image_size = 1000u64;
+        let data = vec![6u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-read-only-change",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let mut read_only_now = snapshot.clone();
+        read_only_now.read_only = true;
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(read_only_now));
+        let _ = std::fs::remove_file(&target_path);
+
+        let ready = result.unwrap_or_else(|(_, error, _)| {
+            panic!(
+                "expected Verify to still be allowed after read_only becoming true, got {error:?}"
+            )
+        });
+
+        assert!(!ready.diagnostics.baseline().read_only);
+        assert!(ready.diagnostics.current().read_only);
+        assert!(ready.diagnostics.hazards().is_empty());
     }
 
     // V21 (Verify start: unsafe target state). A freshly re-fetched
@@ -3505,11 +3627,204 @@ mod tests {
         let result = pending.check_target(SnapshotFetchOutcome::Found(unsafe_snapshot));
         let _ = std::fs::remove_file(&target_path);
 
-        let (_returned_image, error) = match result {
+        let (_returned_image, error, diagnostics) = match result {
             Err(rejection) => rejection,
             Ok(_) => panic!("expected unsafe-target-state rejection"),
         };
         assert!(matches!(error, VerifyStartError::UnsafeTargetState));
+
+        let diagnostics =
+            diagnostics.expect("diagnostics should be present for a hazard rejection");
+        assert_eq!(diagnostics.hazards(), &[HardHazardReason::SystemDevice]);
+    }
+
+    // V21b. Identity insufficient (no usable serial on either side) is
+    // rejected exactly like write time, and the diagnostics that produced
+    // the rejection are still returned to the caller.
+    #[test]
+    fn begin_verify_check_target_rejects_identity_insufficient() {
+        let image_size = 1000u64;
+        let data = vec![7u8; image_size as usize];
+        let (target_path, image, sync_succeeded, mut snapshot) = gate_pass_sync_succeeded(
+            "verify-start-identity-insufficient",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+        snapshot.serial = String::new();
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        // The freshly re-fetched snapshot also lacks a usable serial, so
+        // Identity cannot be proven from either side.
+        let current = snapshot.clone();
+        let result = pending.check_target(SnapshotFetchOutcome::Found(current));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error, diagnostics) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected identity-insufficient rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::IdentityInsufficient));
+
+        let diagnostics =
+            diagnostics.expect("diagnostics should be present for an Identity rejection");
+        assert_eq!(
+            diagnostics.identity(),
+            IdentityComparison::InsufficientIdentity
+        );
+    }
+
+    // V21c. Instance insufficient (diskseq missing on the freshly re-fetched
+    // snapshot) is rejected exactly like write time, and the diagnostics
+    // that produced the rejection are still returned to the caller.
+    #[test]
+    fn begin_verify_check_target_rejects_instance_insufficient() {
+        let image_size = 1000u64;
+        let data = vec![8u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-instance-insufficient",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let mut missing_diskseq = snapshot.clone();
+        missing_diskseq.diskseq = None;
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(missing_diskseq));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error, diagnostics) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected instance-insufficient rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::InstanceInsufficient));
+
+        let diagnostics =
+            diagnostics.expect("diagnostics should be present for an Instance rejection");
+        assert_eq!(
+            diagnostics.instance(),
+            InstanceComparison::InsufficientInformation
+        );
+    }
+
+    // V21d. Multiple simultaneous hazards (active_swap and complex_storage)
+    // are all reported by the diagnostics, in the same deterministic order
+    // `core::verify_target_hard_hazards` documents, regardless of the
+    // rejection still collapsing to a single `UnsafeTargetState` error.
+    #[test]
+    fn begin_verify_check_target_reports_multiple_hazards_in_deterministic_order() {
+        let image_size = 1000u64;
+        let data = vec![9u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-multiple-hazards",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let mut hazardous = snapshot.clone();
+        hazardous.complex_storage = true;
+        hazardous.active_swap = true;
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(hazardous));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error, diagnostics) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected unsafe-target-state rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::UnsafeTargetState));
+
+        let diagnostics =
+            diagnostics.expect("diagnostics should be present for a hazard rejection");
+        assert_eq!(
+            diagnostics.hazards(),
+            &[
+                HardHazardReason::ActiveSwap,
+                HardHazardReason::ComplexStorage
+            ]
+        );
+    }
+
+    // V21e. When the fresh `DeviceSnapshot` refresh itself fails
+    // (`SnapshotFetchOutcome::NotFound`/`Error`), there is no `current`
+    // snapshot to compare against, so no `VerifyTargetDiagnostics` can
+    // exist -- the third element of the error tuple must be `None`, not a
+    // diagnostics built from a stale or fabricated snapshot.
+    #[test]
+    fn begin_verify_check_target_snapshot_refresh_failed_has_no_diagnostics() {
+        let image_size = 1000u64;
+        let data = vec![11u8; image_size as usize];
+        let (target_path, image, sync_succeeded, _snapshot) = gate_pass_sync_succeeded(
+            "verify-start-snapshot-refresh-failed",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let result = pending.check_target(SnapshotFetchOutcome::NotFound);
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error, diagnostics) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected snapshot-refresh-failed rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::SnapshotRefreshFailed));
+        assert!(diagnostics.is_none());
+    }
+
+    // V21f (the success-path counterpart to V18/V19/V21 above). An
+    // identical baseline/current snapshot produces clean diagnostics
+    // (Identity Same, Instance SameInstance, no hazards) alongside the
+    // successful `VerifyReadyToOpen`.
+    #[test]
+    fn begin_verify_check_target_success_diagnostics_are_clean() {
+        let image_size = 1000u64;
+        let data = vec![12u8; image_size as usize];
+        let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+            "verify-start-clean-diagnostics",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let result = pending.check_target(SnapshotFetchOutcome::Found(snapshot.clone()));
+        let _ = std::fs::remove_file(&target_path);
+
+        let ready = result
+            .unwrap_or_else(|(_, error, _)| panic!("check_target should succeed, got {error:?}"));
+
+        assert_eq!(ready.diagnostics.identity(), IdentityComparison::Same);
+        assert_eq!(
+            ready.diagnostics.instance(),
+            InstanceComparison::SameInstance
+        );
+        assert!(ready.diagnostics.hazards().is_empty());
     }
 
     // V22 (Verify start: FD binding mismatch). A read-only handle whose
@@ -3532,7 +3847,7 @@ mod tests {
         };
         let ready = pending
             .check_target(SnapshotFetchOutcome::Found(snapshot.clone()))
-            .unwrap_or_else(|(_, e)| panic!("check_target should succeed, got {e:?}"));
+            .unwrap_or_else(|(_, e, _)| panic!("check_target should succeed, got {e:?}"));
 
         let read_file = std::fs::OpenOptions::new()
             .read(true)

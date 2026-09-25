@@ -46,8 +46,13 @@ fn main() -> zbus::Result<()> {
         }
         Some("write-test") => {
             const USAGE: &str =
-                "usage: cargo run -- write-test <image-path> <udisks2-block-object-path> [verify-mode]\n\
-                 verify-mode: none (default) | quick | full";
+                "usage: cargo run -- write-test <image-path> <udisks2-block-object-path> [verify-mode] [--test-pause-before-verify]\n\
+                 verify-mode: none (default) | quick | full\n\
+                 --test-pause-before-verify: TEST-ONLY diagnostic option (not for normal use).\n\
+                 Pauses after write+sync, before Verify fetches a fresh device snapshot, so a\n\
+                 child partition can be mounted manually in another terminal -- see this flag's\n\
+                 own doc comment on `pause_before_verify_for_test` for the full rationale.\n\
+                 Requires verify-mode quick or full.";
 
             let Some(image_path) = args.next() else {
                 eprintln!("{USAGE}");
@@ -58,25 +63,52 @@ fn main() -> zbus::Result<()> {
                 return Ok(());
             };
 
-            // Absent -> `VerifyMode::None` (see `parse_verify_mode`'s own
-            // doc comment for why that default was chosen). Present but
-            // unrecognized -> a usage error with a non-zero exit, never a
-            // silent fallback to `None` or to any other mode.
-            let verify_mode = match args.next() {
-                None => core::VerifyMode::None,
-                Some(mode_str) => match parse_verify_mode(&mode_str) {
-                    Some(mode) => mode,
-                    None => {
-                        eprintln!(
-                            "write-test: invalid verify-mode '{mode_str}' (expected: none | quick | full)"
-                        );
-                        eprintln!("{USAGE}");
-                        std::process::exit(1);
-                    }
-                },
+            let verify_mode_arg = args.next();
+            let fourth_arg = args.next();
+
+            let (verify_mode, test_pause_before_verify) = match parse_write_test_trailing_args(
+                verify_mode_arg.as_deref(),
+                fourth_arg.as_deref(),
+            ) {
+                Ok(parsed) => parsed,
+                // Present but unrecognized -> a usage error with a
+                // non-zero exit, never a silent fallback to `None` or to
+                // any other mode.
+                Err(WriteTestArgsError::InvalidVerifyMode) => {
+                    let mode_str = verify_mode_arg.as_deref().unwrap_or("");
+                    eprintln!(
+                        "write-test: invalid verify-mode '{mode_str}' (expected: none | quick | full)"
+                    );
+                    eprintln!("{USAGE}");
+                    std::process::exit(1);
+                }
+                // Same policy for the fourth token: an unrecognized value
+                // is a usage error, never silently ignored.
+                Err(WriteTestArgsError::UnrecognizedFourthArgument) => {
+                    let arg = fourth_arg.as_deref().unwrap_or("");
+                    eprintln!(
+                        "write-test: unrecognized argument '{arg}' (expected: --test-pause-before-verify)"
+                    );
+                    eprintln!("{USAGE}");
+                    std::process::exit(1);
+                }
+                // `--test-pause-before-verify` with `verify-mode none` is
+                // rejected outright rather than silently accepted-but-
+                // ineffective: `VerifyMode::None` never produces
+                // `VerifyStart::Pending`, so the flag would have no
+                // observable effect at all -- see this design's own
+                // report (reports/latest.md) for why "specified but does
+                // nothing" was deliberately ruled out.
+                Err(WriteTestArgsError::TestPauseRequiresVerification) => {
+                    eprintln!(
+                        "write-test: --test-pause-before-verify requires verify-mode quick or full (verify-mode none never runs Verify pre-flight)"
+                    );
+                    eprintln!("{USAGE}");
+                    std::process::exit(1);
+                }
             };
 
-            return run_write_test(image_path, target, verify_mode);
+            return run_write_test(image_path, target, verify_mode, test_pause_before_verify);
         }
         Some("writer-test") => return run_writer_test(),
         _ => {}
@@ -575,6 +607,49 @@ fn confirmation_matches(input: &str, expected_device: &str) -> bool {
     input.trim() == expected_device
 }
 
+// TEST-ONLY diagnostic pause, enabled only by the explicit
+// `--test-pause-before-verify` CLI flag (see the `write-test` dispatch in
+// `main()`). Exists solely to let a real-device test manually mount a child
+// partition of the target device -- in another terminal -- between write+sync
+// completing and Verify fetching its fresh `DeviceSnapshot`, so the
+// mount_points-allowance branch `core::verify_target_check_from_diagnostics`
+// implements can actually be exercised on real hardware (see
+// reports/latest.md's Mount-Allowance Real-device Test design). This is not
+// a Safety bypass of any kind: every existing check (fresh snapshot fetch,
+// `check_target()`'s Identity/Instance/hazard re-verification,
+// `OpenDevice(mode="r")`, FD binding) still runs in full afterward, unchanged
+// -- this function only delays when that sequence starts. It never touches
+// the target device itself (no `udisksctl`, `mount`, or any other command is
+// spawned here) -- mounting is entirely the user's own action in their own
+// terminal.
+//
+// Blocks on `stdin`. Returns `true` only if a line was actually read (the
+// user pressed Enter); `false` on EOF or an I/O error, mirroring the
+// existing Human Confirmation prompt's own `Ok(0) => false` / `Err(_) =>
+// false` treatment above in `run_write_test` -- the caller must never
+// proceed to Verify on `false`.
+fn pause_before_verify_for_test() -> bool {
+    println!("write-test: TEST PAUSE (--test-pause-before-verify, test-only)");
+    println!("write-test: write + sync are complete.");
+    println!("write-test: the write-mode device handle is already closed.");
+    println!("write-test: mount only a CHILD PARTITION of the target device in another terminal.");
+    println!("write-test: do NOT mount the whole-disk device.");
+    println!("write-test:   e.g. udisksctl mount -b /dev/<partition>");
+    println!("write-test: after mounting, return here and press Enter to continue.");
+    println!(
+        "write-test: Verify will then obtain a fresh device snapshot and re-check identity, instance, and hazards."
+    );
+    print!("> ");
+    let _ = std::io::stdout().flush();
+
+    let mut discard = String::new();
+    match std::io::stdin().read_line(&mut discard) {
+        Ok(0) => false, // EOF: no input was given, never treat this as an implicit "continue".
+        Ok(_) => true,
+        Err(_) => false,
+    }
+}
+
 // PoC mode: Production execution path wiring (`cargo run -- write-test
 // <image-path> <block_path>`). This is the first CLI mode that connects the
 // full, real production path in one straight line: select -> re-verify ->
@@ -619,6 +694,7 @@ fn run_write_test(
     image_path: String,
     block_path: String,
     verify_mode: core::VerifyMode,
+    test_pause_before_verify: bool,
 ) -> zbus::Result<()> {
     let mut state = attempt_select(&block_path);
 
@@ -910,6 +986,36 @@ fn run_write_test(
                                 ),
                             }
 
+                            // TEST-ONLY (implementation of the Mount-Allowance
+                            // Real-device Test design, reports/latest.md):
+                            // pauses here, strictly before the fresh
+                            // `DeviceSnapshot` below is fetched, so a child
+                            // partition can be mounted manually and actually
+                            // be reflected in that fresh snapshot's
+                            // `mount_points`. Everything below this block --
+                            // `collect_device_snapshot`, `check_target`,
+                            // Identity/Instance/hazard checks,
+                            // `OpenDevice(mode="r")`, FD binding -- is
+                            // unchanged and still runs in full; this flag
+                            // only delays when it starts. Safe to hold
+                            // `pending` here indefinitely: `begin_verify()`
+                            // already dropped the write-mode FD before
+                            // returning it (see `write_job.rs`'s own
+                            // `SyncSucceeded::begin_verify()`), so `pending`
+                            // is inert data (a cloned baseline `DeviceSnapshot`,
+                            // the `SelectedImage`, `VerifyMode`, and a
+                            // `CancelHandle`) with no open capability of any
+                            // kind while this waits on stdin.
+                            if test_pause_before_verify && !pause_before_verify_for_test() {
+                                println!(
+                                    "write-test: no input received on the test pause (EOF or I/O error) -- stopping before verification."
+                                );
+                                println!(
+                                    "write-test: write + sync already completed successfully; verification was not attempted."
+                                );
+                                return Ok(());
+                            }
+
                             println!(
                                 "write-test: requesting a fresh DeviceSnapshot for verification on {}.",
                                 pending.block_path()
@@ -1123,6 +1229,60 @@ fn parse_verify_mode(value: &str) -> Option<core::VerifyMode> {
         "full" => Some(core::VerifyMode::Full),
         _ => None,
     }
+}
+
+// Why `parse_write_test_trailing_args` (below) rejected the `write-test`
+// CLI's third/fourth arguments. Kept separate from the message text itself
+// (formatted at the call site in `main()`, which still has the original raw
+// argument strings to include in the message) so this function stays pure
+// data in, data out -- exactly like `parse_verify_mode` above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteTestArgsError {
+    InvalidVerifyMode,
+    UnrecognizedFourthArgument,
+    TestPauseRequiresVerification,
+}
+
+// Parses `write-test`'s two optional trailing arguments (verify-mode and
+// `--test-pause-before-verify`) together, since the second one's validity
+// depends on the first: pure data in, data out, no I/O, no `std::process::exit`
+// -- the caller (`main()`) owns all user-facing messages and the actual
+// process exit, exactly the same split `parse_verify_mode` already
+// established. `--test-pause-before-verify` is a TEST-ONLY diagnostic option
+// (see `pause_before_verify_for_test`'s own doc comment) for manually
+// exercising Verify pre-flight's mount_points-allowance branch on real
+// hardware -- it is deliberately rejected outright (not silently accepted
+// as a no-op) when paired with `verify-mode none`, since `VerifyMode::None`
+// never produces `VerifyStart::Pending` and the flag would then have no
+// observable effect at all.
+fn parse_write_test_trailing_args(
+    verify_mode_arg: Option<&str>,
+    fourth_arg: Option<&str>,
+) -> Result<(core::VerifyMode, bool), WriteTestArgsError> {
+    // Absent -> `VerifyMode::None` (see `parse_verify_mode`'s own doc
+    // comment for why that default was chosen). Present but unrecognized ->
+    // rejected, never a silent fallback to `None` or to any other mode.
+    let verify_mode = match verify_mode_arg {
+        None => core::VerifyMode::None,
+        Some(mode_str) => {
+            parse_verify_mode(mode_str).ok_or(WriteTestArgsError::InvalidVerifyMode)?
+        }
+    };
+
+    // Absent -> disabled (existing behavior, unchanged). Present and exactly
+    // `--test-pause-before-verify` -> enabled. Anything else -> rejected,
+    // never silently ignored.
+    let test_pause_before_verify = match fourth_arg {
+        None => false,
+        Some("--test-pause-before-verify") => true,
+        Some(_) => return Err(WriteTestArgsError::UnrecognizedFourthArgument),
+    };
+
+    if test_pause_before_verify && verify_mode == core::VerifyMode::None {
+        return Err(WriteTestArgsError::TestPauseRequiresVerification);
+    }
+
+    Ok((verify_mode, test_pause_before_verify))
 }
 
 // Formats a successful Verify outcome for the CLI. Shared by both
@@ -1433,6 +1593,7 @@ mod tests {
         format_hard_hazards, format_identity_comparison, format_instance_comparison,
         format_verify_diagnostics_summary, format_verify_diagnostics_unavailable,
         format_verify_failure_reason, format_verify_succeeded, parse_verify_mode,
+        parse_write_test_trailing_args, WriteTestArgsError,
     };
     use crate::device::DeviceSnapshot;
     use crate::execution::core::{self, HardHazardReason, VerifyMode};
@@ -1775,6 +1936,85 @@ mod tests {
         assert_eq!(
             format_verify_diagnostics_unavailable(),
             vec!["no fresh device snapshot was available for diagnostics".to_string()]
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // parse_write_test_trailing_args (--test-pause-before-verify)
+    // ---------------------------------------------------------------------
+
+    // Y1. `full` + the flag is accepted.
+    #[test]
+    fn parse_write_test_trailing_args_accepts_full_with_test_pause() {
+        assert_eq!(
+            parse_write_test_trailing_args(Some("full"), Some("--test-pause-before-verify")),
+            Ok((VerifyMode::Full, true))
+        );
+    }
+
+    // Y2. `quick` + the flag is accepted.
+    #[test]
+    fn parse_write_test_trailing_args_accepts_quick_with_test_pause() {
+        assert_eq!(
+            parse_write_test_trailing_args(Some("quick"), Some("--test-pause-before-verify")),
+            Ok((VerifyMode::Quick, true))
+        );
+    }
+
+    // Y3. `none` + the flag is rejected outright -- `VerifyMode::None` never
+    // produces `VerifyStart::Pending`, so the flag would have no effect.
+    #[test]
+    fn parse_write_test_trailing_args_rejects_none_with_test_pause() {
+        assert_eq!(
+            parse_write_test_trailing_args(Some("none"), Some("--test-pause-before-verify")),
+            Err(WriteTestArgsError::TestPauseRequiresVerification)
+        );
+    }
+
+    // Y4. An unrecognized fourth token is rejected, never silently ignored.
+    #[test]
+    fn parse_write_test_trailing_args_rejects_unknown_fourth_token() {
+        assert_eq!(
+            parse_write_test_trailing_args(Some("full"), Some("--bogus-flag")),
+            Err(WriteTestArgsError::UnrecognizedFourthArgument)
+        );
+    }
+
+    // Y5. No fourth argument at all -> existing behavior (flag disabled),
+    // for every verify-mode including the absent (default) case.
+    #[test]
+    fn parse_write_test_trailing_args_without_fourth_argument_matches_existing_behavior() {
+        assert_eq!(
+            parse_write_test_trailing_args(None, None),
+            Ok((VerifyMode::None, false))
+        );
+        assert_eq!(
+            parse_write_test_trailing_args(Some("quick"), None),
+            Ok((VerifyMode::Quick, false))
+        );
+        assert_eq!(
+            parse_write_test_trailing_args(Some("full"), None),
+            Ok((VerifyMode::Full, false))
+        );
+    }
+
+    // Y6. Existing verify-mode parsing (absent -> None, unknown -> rejected)
+    // is preserved unchanged through the new combined parser.
+    #[test]
+    fn parse_write_test_trailing_args_verify_mode_parsing_has_no_regression() {
+        assert_eq!(
+            parse_write_test_trailing_args(Some("none"), None),
+            Ok((VerifyMode::None, false))
+        );
+        assert_eq!(
+            parse_write_test_trailing_args(Some("bogus"), None),
+            Err(WriteTestArgsError::InvalidVerifyMode)
+        );
+        // An invalid verify-mode is reported even when a fourth argument is
+        // also present -- verify-mode is validated first.
+        assert_eq!(
+            parse_write_test_trailing_args(Some("bogus"), Some("--test-pause-before-verify")),
+            Err(WriteTestArgsError::InvalidVerifyMode)
         );
     }
 }

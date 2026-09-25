@@ -1092,11 +1092,9 @@ impl PendingVerify {
 // itself already verified -- there is no constructor or setter anywhere that
 // would let a caller substitute an arbitrary, unverified
 // `VerifyTargetDiagnostics` here (no "arbitrary diagnostics injection", per
-// this step's own constraint). No accessor is added this step either: this
-// module's own tests reach the field directly (ordinary same-module access),
-// and no production caller outside `write_job.rs` exists yet -- a future
-// `main.rs` wiring step (not this one) is the one that would need a public
-// accessor, and that step is the right place to decide its visibility.
+// this step's own constraint). A `pub(crate)` read-only accessor
+// (`diagnostics()`, below) was added in implementation step 5+6, once
+// `main.rs`'s CLI wiring became this field's first production caller.
 pub struct VerifyReadyToOpen {
     current: DeviceSnapshot,
     diagnostics: VerifyTargetDiagnostics,
@@ -1108,6 +1106,18 @@ pub struct VerifyReadyToOpen {
 impl VerifyReadyToOpen {
     pub fn block_path(&self) -> &str {
         &self.current.block_path
+    }
+
+    // Read-only access to the diagnostics that already decided this pass
+    // was clean -- `main.rs` (Verify Pre-flight Diagnostics implementation
+    // step 5+6) reads this to display a diagnostic summary before calling
+    // `open_device(block_path(), "r")`. Returns a borrow, not a clone: the
+    // caller only needs to read the value to format it, never to own or
+    // outlive `self`. `pub(crate)`, matching `VerifyTargetDiagnostics`'s own
+    // visibility -- no setter or alternate constructor exists anywhere, so
+    // this cannot be used to substitute an arbitrary diagnostics value.
+    pub(crate) fn diagnostics(&self) -> &VerifyTargetDiagnostics {
+        &self.diagnostics
     }
 
     // FD binding check (`core::check_fd_binding`, the exact same anti-TOCTOU

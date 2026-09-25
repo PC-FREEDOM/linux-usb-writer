@@ -9,7 +9,7 @@ mod writer;
 
 use device::SnapshotFetchOutcome;
 use execution::{core, linux_access, write_job};
-use identity::{compare_identity, compare_instance};
+use identity::{compare_identity, compare_instance, IdentityComparison, InstanceComparison};
 use linux_backend::{collect_device_snapshot, collect_device_snapshots};
 use linux_monitor::{start_monitoring, DeviceEvent};
 use safety::assess_device;
@@ -919,17 +919,37 @@ fn run_write_test(
 
                             let ready = match pending.check_target(refreshed_for_verify) {
                                 Ok(ready) => ready,
-                                // `_diagnostics` (Verify Pre-flight Diagnostics
-                                // implementation step 3+4): `check_target()` now also
-                                // returns the `VerifyTargetDiagnostics` that produced
-                                // this rejection, for a future diagnostic log line to
-                                // use. Not displayed yet -- that CLI wiring is a
-                                // separate, later step -- so it is discarded here for
-                                // now, purely to keep this call site compiling against
-                                // the new return shape.
-                                Err((image, error, _diagnostics)) => {
+                                // Verify Pre-flight Diagnostics (implementation step
+                                // 5+6): `check_target()`'s rejection carries the
+                                // `VerifyTargetDiagnostics` that produced it whenever
+                                // one could be computed -- only `SnapshotRefreshFailed`
+                                // has none, since there is no fresh snapshot to
+                                // diagnose against in that case. Write/Sync already
+                                // succeeded by this point; only Verify's own
+                                // pre-flight failed, and the wording below keeps that
+                                // distinction explicit rather than implying the write
+                                // itself failed.
+                                Err((image, error, diagnostics)) => {
                                     println!("write-test: write + sync completed successfully.");
                                     println!("write-test: verification could not start: {error:?}");
+                                    match diagnostics {
+                                        Some(diagnostics) => {
+                                            println!("write-test: verify target re-check: FAILED");
+                                            for line in
+                                                format_verify_diagnostics_summary(&diagnostics)
+                                            {
+                                                println!("write-test:   {line}");
+                                            }
+                                        }
+                                        None => {
+                                            println!(
+                                                "write-test: verify target re-check: unavailable"
+                                            );
+                                            for line in format_verify_diagnostics_unavailable() {
+                                                println!("write-test:   {line}");
+                                            }
+                                        }
+                                    }
                                     println!(
                                         "write-test: SelectedImage identity preserved (image_size={})",
                                         image.logical_size()
@@ -937,6 +957,19 @@ fn run_write_test(
                                     return Ok(());
                                 }
                             };
+
+                            // Verify Pre-flight Diagnostics (implementation step
+                            // 5+6): the same five-line summary shown on the
+                            // rejection path above, now for the passing case --
+                            // "Simple by default": always shown, never a full
+                            // `DeviceSnapshot` dump. Borrowed from `ready` before
+                            // `ready.finalize(...)` consumes it below; the borrow
+                            // ends at the end of this `for` loop, well before that
+                            // move.
+                            println!("write-test: verify target re-check: OK");
+                            for line in format_verify_diagnostics_summary(ready.diagnostics()) {
+                                println!("write-test:   {line}");
+                            }
 
                             println!(
                                 "write-test: requesting OpenDevice(mode=\"r\") on {} for verification.",
@@ -1143,6 +1176,166 @@ fn format_verify_failure_reason(reason: &write_job::VerifyFailureReason) -> Stri
     }
 }
 
+// ---------------------------------------------------------------------
+// Verify Pre-flight Diagnostics CLI display (implementation step 5+6).
+//
+// Every helper below is a pure formatter: it takes already-computed
+// `core::VerifyTargetDiagnostics` data (or one of its fields) and returns a
+// `String`/`Vec<String>`, never printing anything itself. `println!` calls
+// live only at the two `run_write_test` call sites (success path and
+// failure path), which loop over the returned lines -- this keeps the
+// comparison/wording logic testable without capturing stdout, and keeps
+// `core.rs`/`write_job.rs` themselves free of any UI/logging dependency
+// (the diagnostics data they produce is plain data; only `main.rs` decides
+// how it looks on screen).
+//
+// "Simple by default": normal display is a five-line, diff-centric summary
+// (identity/instance/mount points/read-only/hazards), never a full
+// `DeviceSnapshot` field dump -- see reports/latest.md's Verify Pre-flight
+// Diagnostics Design for the fuller rationale. `diskseq`/`size`/
+// `connection_bus`/`removable` diffs were considered but deliberately left
+// out of this step's summary to keep it exactly matching this step's
+// review scope; a future "verbose" mode remains the natural place for them.
+// ---------------------------------------------------------------------
+
+// Human-readable text for an `IdentityComparison`, matching the enum's own
+// vocabulary for the successful case (`Same`) but adding a short, fixed
+// explanation for the two rejection cases -- deterministic wording, not a
+// paraphrase that could drift between calls.
+fn format_identity_comparison(identity: IdentityComparison) -> &'static str {
+    match identity {
+        IdentityComparison::Same => "Same",
+        IdentityComparison::Changed => "Changed (different device)",
+        IdentityComparison::InsufficientIdentity => "Insufficient (no usable serial to compare)",
+    }
+}
+
+// Human-readable text for an `InstanceComparison`, mirroring
+// `format_identity_comparison`'s approach.
+fn format_instance_comparison(instance: InstanceComparison) -> &'static str {
+    match instance {
+        InstanceComparison::SameInstance => "SameInstance",
+        InstanceComparison::Recreated => "Recreated (disconnected and reconnected)",
+        InstanceComparison::InsufficientInformation => "Insufficient (no diskseq to compare)",
+    }
+}
+
+// Renders a mount-point list for display: `none` for an empty list, or a
+// comma-joined list of the paths themselves. Mount paths are shown as-is
+// (no masking) -- this step's design deliberately does not add a masking
+// mechanism (see reports/latest.md), and the mount path is exactly the
+// piece of information this diagnostic summary exists to surface.
+fn format_mount_points_list(mount_points: &[String]) -> String {
+    if mount_points.is_empty() {
+        "none".to_string()
+    } else {
+        mount_points.join(", ")
+    }
+}
+
+// Diffs two mount-point lists for display: `unchanged (none)` /
+// `unchanged (<paths>)` when the baseline and the fresh snapshot agree,
+// `<before> -> <after>` otherwise.
+fn format_mount_points_change(baseline: &[String], current: &[String]) -> String {
+    if baseline == current {
+        format!("unchanged ({})", format_mount_points_list(baseline))
+    } else {
+        format!(
+            "{} -> {}",
+            format_mount_points_list(baseline),
+            format_mount_points_list(current)
+        )
+    }
+}
+
+// Diffs a `read_only` flag for display: `unchanged (<value>)` or
+// `<before> -> <after>`, mirroring `format_mount_points_change`.
+fn format_read_only_change(baseline: bool, current: bool) -> String {
+    if baseline == current {
+        format!("unchanged ({current})")
+    } else {
+        format!("{baseline} -> {current}")
+    }
+}
+
+// Human-readable text for a single `core::HardHazardReason`. Wording kept
+// short and lowercase, matching this CLI's existing tone (see
+// `format_verify_failure_reason` above).
+fn format_hard_hazard_reason(reason: core::HardHazardReason) -> &'static str {
+    match reason {
+        core::HardHazardReason::SystemDevice => "system device",
+        core::HardHazardReason::ActiveSwap => "active swap",
+        core::HardHazardReason::ComplexStorage => "complex storage",
+        core::HardHazardReason::HintIgnore => "ignored by system policy",
+        core::HardHazardReason::MediaUnavailable => "media unavailable",
+    }
+}
+
+// Renders every hazard `core::verify_target_hard_hazards` found, in the
+// same deterministic order it already returns them in: `none` when empty,
+// otherwise a comma-joined list -- never just the first one, since more
+// than one hazard can apply at once (see `core.rs`'s own
+// `diagnostics_report_multiple_hazards_in_deterministic_order` test).
+fn format_hard_hazards(hazards: &[core::HardHazardReason]) -> String {
+    if hazards.is_empty() {
+        "none".to_string()
+    } else {
+        hazards
+            .iter()
+            .map(|reason| format_hard_hazard_reason(*reason))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+// The single, shared diagnostic summary for both the success path (Verify
+// pre-flight passed) and the failure path (Identity/Instance/hazard
+// rejection) of `PendingVerify::check_target()` -- both display exactly the
+// same five lines, from the same `core::VerifyTargetDiagnostics` value, so
+// there is no risk of the two call sites silently drifting into showing
+// different information for what is structurally the same diagnostic data.
+// Returns the *content* of each line (no `write-test:` prefix, no leading
+// indentation) -- the caller decides how to prefix/indent them, keeping
+// this function pure formatting with no CLI-framing baked in.
+fn format_verify_diagnostics_summary(diagnostics: &core::VerifyTargetDiagnostics) -> Vec<String> {
+    vec![
+        format!(
+            "identity: {}",
+            format_identity_comparison(diagnostics.identity())
+        ),
+        format!(
+            "instance: {}",
+            format_instance_comparison(diagnostics.instance())
+        ),
+        format!(
+            "mount points: {}",
+            format_mount_points_change(
+                &diagnostics.baseline().mount_points,
+                &diagnostics.current().mount_points
+            )
+        ),
+        format!(
+            "read-only: {}",
+            format_read_only_change(
+                diagnostics.baseline().read_only,
+                diagnostics.current().read_only
+            )
+        ),
+        format!("hazards: {}", format_hard_hazards(diagnostics.hazards())),
+    ]
+}
+
+// The fallback shown in place of `format_verify_diagnostics_summary`'s
+// output when `check_target()` returned `VerifyStartError::SnapshotRefreshFailed`
+// -- there is no fresh `DeviceSnapshot` in that case, so no diagnostics
+// value exists to summarize (see `PendingVerify::check_target()`'s own doc
+// comment on why this is the one rejection with no diagnostics). Returns
+// the line content only, matching `format_verify_diagnostics_summary`'s own
+// contract, so the caller prefixes/indents it the same way.
+fn format_verify_diagnostics_unavailable() -> Vec<String> {
+    vec!["no fresh device snapshot was available for diagnostics".to_string()]
+}
+
 // PoC mode: Writer self-test (`cargo run -- writer-test`). Exercises the
 // Writer Core (src/writer.rs) end to end against a throwaway *regular file*
 // only — never a block device. The target path is always chosen by this
@@ -1236,9 +1429,15 @@ fn run_writer_test_inner(temp_path: &std::path::Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::confirmation_matches;
-    use super::{format_verify_failure_reason, format_verify_succeeded, parse_verify_mode};
-    use crate::execution::core::VerifyMode;
+    use super::{
+        format_hard_hazards, format_identity_comparison, format_instance_comparison,
+        format_verify_diagnostics_summary, format_verify_diagnostics_unavailable,
+        format_verify_failure_reason, format_verify_succeeded, parse_verify_mode,
+    };
+    use crate::device::DeviceSnapshot;
+    use crate::execution::core::{self, HardHazardReason, VerifyMode};
     use crate::execution::write_job::{VerifyFailureReason, VerifySucceeded};
+    use crate::identity::{IdentityComparison, InstanceComparison};
 
     // A. Exact match -> true.
     #[test]
@@ -1387,5 +1586,195 @@ mod tests {
     fn format_verify_failure_reason_unsupported_access_mentions_random_access() {
         let formatted = format_verify_failure_reason(&VerifyFailureReason::UnsupportedAccess);
         assert!(formatted.to_lowercase().contains("random"));
+    }
+
+    // ---------------------------------------------------------------------
+    // Verify Pre-flight Diagnostics CLI display (implementation step 5+6)
+    // ---------------------------------------------------------------------
+
+    fn base_snapshot() -> DeviceSnapshot {
+        DeviceSnapshot {
+            device: "/dev/sdx".to_string(),
+            block_path: "/org/freedesktop/UDisks2/block_devices/sdx".to_string(),
+            drive_path: "/org/freedesktop/UDisks2/drives/Test_Model_TEST-SERIAL-0001".to_string(),
+            major: 8,
+            minor: 0,
+            diskseq: Some(12),
+            size: 8_000_000_000,
+            read_only: false,
+            media_available: true,
+            model: "Test Model".to_string(),
+            vendor: "Test Vendor".to_string(),
+            serial: "TEST-SERIAL-0001".to_string(),
+            connection_bus: "usb".to_string(),
+            removable: true,
+            hint_system: false,
+            hint_ignore: false,
+            hint_partitionable: true,
+            mount_points: Vec::new(),
+            active_swap: false,
+            swap_devices: Vec::new(),
+            complex_storage: false,
+            complex_storage_details: Vec::new(),
+        }
+    }
+
+    // O. An unchanged snapshot (Identity Same, Instance SameInstance, no
+    // mount/read-only change, no hazards) produces the exact five-line
+    // "everything is fine" summary.
+    #[test]
+    fn format_verify_diagnostics_summary_for_unchanged_snapshot() {
+        let baseline = base_snapshot();
+        let current = base_snapshot();
+        let diagnostics = core::diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(
+            format_verify_diagnostics_summary(&diagnostics),
+            vec![
+                "identity: Same".to_string(),
+                "instance: SameInstance".to_string(),
+                "mount points: unchanged (none)".to_string(),
+                "read-only: unchanged (false)".to_string(),
+                "hazards: none".to_string(),
+            ]
+        );
+    }
+
+    // P. mount_points growing from empty to a single path -- the real
+    // post-write auto-mount scenario -- is shown as a `before -> after`
+    // diff, and does not appear as a hazard.
+    #[test]
+    fn format_verify_diagnostics_summary_reports_a_newly_mounted_filesystem() {
+        let baseline = base_snapshot();
+        let mut current = base_snapshot();
+        current.mount_points = vec!["/media/test/MYPOCKETOS".to_string()];
+        let diagnostics = core::diagnose_identity_instance_for_verify(&baseline, &current);
+
+        let lines = format_verify_diagnostics_summary(&diagnostics);
+        assert!(lines.contains(&"mount points: none -> /media/test/MYPOCKETOS".to_string()));
+        assert!(lines.contains(&"hazards: none".to_string()));
+    }
+
+    // Q. Multiple mount points are listed in a deterministic,
+    // comma-separated order (the same order `DeviceSnapshot.mount_points`
+    // itself carries them in -- this formatter never sorts or reorders).
+    #[test]
+    fn format_verify_diagnostics_summary_lists_multiple_mount_points_in_order() {
+        let baseline = base_snapshot();
+        let mut current = base_snapshot();
+        current.mount_points = vec![
+            "/media/test/MYPOCKETOS".to_string(),
+            "/media/test/MYPOCKETOS-EFI".to_string(),
+        ];
+        let diagnostics = core::diagnose_identity_instance_for_verify(&baseline, &current);
+
+        let lines = format_verify_diagnostics_summary(&diagnostics);
+        assert!(lines.contains(
+            &"mount points: none -> /media/test/MYPOCKETOS, /media/test/MYPOCKETOS-EFI".to_string()
+        ));
+    }
+
+    // R. `read_only` going from `false` to `true` is shown as a
+    // `before -> after` diff, and (per Step 3's deliberate design) is never
+    // itself a hazard.
+    #[test]
+    fn format_verify_diagnostics_summary_reports_read_only_becoming_true() {
+        let baseline = base_snapshot();
+        let mut current = base_snapshot();
+        current.read_only = true;
+        let diagnostics = core::diagnose_identity_instance_for_verify(&baseline, &current);
+
+        let lines = format_verify_diagnostics_summary(&diagnostics);
+        assert!(lines.contains(&"read-only: false -> true".to_string()));
+        assert!(lines.contains(&"hazards: none".to_string()));
+    }
+
+    // S. A single hazard is rendered as its human-readable text, not the
+    // raw Rust enum name.
+    #[test]
+    fn format_verify_diagnostics_summary_reports_a_single_hazard() {
+        let baseline = base_snapshot();
+        let mut current = base_snapshot();
+        current.hint_system = true;
+        let diagnostics = core::diagnose_identity_instance_for_verify(&baseline, &current);
+
+        let lines = format_verify_diagnostics_summary(&diagnostics);
+        assert!(lines.contains(&"hazards: system device".to_string()));
+    }
+
+    // T. Multiple simultaneous hazards are listed in the same deterministic
+    // order `core::verify_target_hard_hazards` produces them in.
+    #[test]
+    fn format_verify_diagnostics_summary_lists_multiple_hazards_in_deterministic_order() {
+        let baseline = base_snapshot();
+        let mut current = base_snapshot();
+        current.complex_storage = true;
+        current.active_swap = true;
+        let diagnostics = core::diagnose_identity_instance_for_verify(&baseline, &current);
+
+        let lines = format_verify_diagnostics_summary(&diagnostics);
+        assert!(lines.contains(&"hazards: active swap, complex storage".to_string()));
+    }
+
+    // U. Every `IdentityComparison` variant has a distinct, deterministic
+    // rendering -- including both rejection cases, not just `Same`.
+    #[test]
+    fn format_identity_comparison_covers_every_variant() {
+        assert_eq!(format_identity_comparison(IdentityComparison::Same), "Same");
+        assert_eq!(
+            format_identity_comparison(IdentityComparison::Changed),
+            "Changed (different device)"
+        );
+        assert_eq!(
+            format_identity_comparison(IdentityComparison::InsufficientIdentity),
+            "Insufficient (no usable serial to compare)"
+        );
+    }
+
+    // V. Every `InstanceComparison` variant has a distinct, deterministic
+    // rendering -- including both rejection cases, not just `SameInstance`.
+    #[test]
+    fn format_instance_comparison_covers_every_variant() {
+        assert_eq!(
+            format_instance_comparison(InstanceComparison::SameInstance),
+            "SameInstance"
+        );
+        assert_eq!(
+            format_instance_comparison(InstanceComparison::Recreated),
+            "Recreated (disconnected and reconnected)"
+        );
+        assert_eq!(
+            format_instance_comparison(InstanceComparison::InsufficientInformation),
+            "Insufficient (no diskseq to compare)"
+        );
+    }
+
+    // W. `format_hard_hazards` itself: empty, single, and multiple-reason
+    // cases, independent of the full summary wiring above.
+    #[test]
+    fn format_hard_hazards_lists_every_reason_in_order() {
+        assert_eq!(format_hard_hazards(&[]), "none");
+        assert_eq!(
+            format_hard_hazards(&[HardHazardReason::SystemDevice]),
+            "system device"
+        );
+        assert_eq!(
+            format_hard_hazards(&[
+                HardHazardReason::ActiveSwap,
+                HardHazardReason::ComplexStorage
+            ]),
+            "active swap, complex storage"
+        );
+    }
+
+    // X. When `check_target()` rejected with `SnapshotRefreshFailed`, no
+    // `VerifyTargetDiagnostics` exists -- the fallback text says so plainly,
+    // rather than guessing at values that were never fetched.
+    #[test]
+    fn format_verify_diagnostics_unavailable_reports_no_snapshot() {
+        assert_eq!(
+            format_verify_diagnostics_unavailable(),
+            vec!["no fresh device snapshot was available for diagnostics".to_string()]
+        );
     }
 }

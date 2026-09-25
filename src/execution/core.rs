@@ -278,12 +278,14 @@ pub(in crate::execution) enum VerifyTargetCheckError {
 // left unchanged (see its own doc comment above): this enum supplements it
 // with detail, rather than replacing or subdividing it.
 //
-// `pub(in crate::execution)`, matching `VerifyTargetCheckError`: nothing
-// outside `execution` can observe a hazard reason yet (no production caller
-// wires this to `main.rs` this step), so there is no reason to expose it any
-// more broadly than its sibling type already is.
+// `pub(crate)` (Verify Pre-flight Diagnostics implementation step 5+6):
+// `main.rs` now reads `VerifyTargetDiagnostics::hazards()` (a
+// `&[HardHazardReason]`) to build its human-readable hazard summary, so this
+// must be at least as visible as that accessor. Still not plain `pub` --
+// this is CLI-facing display data for this crate's own binary, not a public
+// library API.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(in crate::execution) enum HardHazardReason {
+pub(crate) enum HardHazardReason {
     SystemDevice,
     ActiveSwap,
     ComplexStorage,
@@ -368,29 +370,33 @@ pub(crate) struct VerifyTargetDiagnostics {
 // calls these yet -- they exist for a future `write_job.rs` consumer that,
 // unlike this module's tests, is a different module and therefore cannot
 // reach the private fields directly.
+// `pub(crate)`, matching `VerifyTargetDiagnostics` itself (Verify
+// Pre-flight Diagnostics implementation step 5+6): `main.rs` (outside
+// `crate::execution`) reads these to build its diagnostic CLI summary,
+// exactly the caller `VerifyTargetDiagnostics`'s own visibility widening
+// (step 3+4) already anticipated. Still not plain `pub` -- nothing outside
+// this crate has, or needs, a reason to read Verify's internal diagnostic
+// model. Every getter returns a borrow or a `Copy` value, never a clone of
+// owned data -- `main.rs`'s formatting helpers only ever need to read these
+// fields, never to own or outlive `self`.
 impl VerifyTargetDiagnostics {
-    #[allow(dead_code)]
-    pub(in crate::execution) fn baseline(&self) -> &DeviceSnapshot {
+    pub(crate) fn baseline(&self) -> &DeviceSnapshot {
         &self.baseline
     }
 
-    #[allow(dead_code)]
-    pub(in crate::execution) fn current(&self) -> &DeviceSnapshot {
+    pub(crate) fn current(&self) -> &DeviceSnapshot {
         &self.current
     }
 
-    #[allow(dead_code)]
-    pub(in crate::execution) fn identity(&self) -> IdentityComparison {
+    pub(crate) fn identity(&self) -> IdentityComparison {
         self.identity
     }
 
-    #[allow(dead_code)]
-    pub(in crate::execution) fn instance(&self) -> InstanceComparison {
+    pub(crate) fn instance(&self) -> InstanceComparison {
         self.instance
     }
 
-    #[allow(dead_code)]
-    pub(in crate::execution) fn hazards(&self) -> &[HardHazardReason] {
+    pub(crate) fn hazards(&self) -> &[HardHazardReason] {
         &self.hazards
     }
 }
@@ -403,9 +409,19 @@ impl VerifyTargetDiagnostics {
 // recomputing `compare_identity`/`compare_instance`/`verify_target_hard_hazards`
 // a second time, so the value a future diagnostic log line would report and
 // the value the allow/reject decision is actually based on can never
-// diverge.
-#[allow(dead_code)] // no production caller yet; exercised by this module's own tests below.
-pub(in crate::execution) fn diagnose_identity_instance_for_verify(
+// diverge. `write_job::PendingVerify::check_target()` is its production
+// caller today.
+//
+// `pub(crate)`, not the narrower `pub(in crate::execution)` this function
+// started with: `main.rs`'s own unit tests for its Verify Pre-flight
+// Diagnostics CLI formatters (implementation step 5+6) need a realistic way
+// to build a `VerifyTargetDiagnostics` value -- there is no other
+// constructor, by design (see that type's own doc comment on why an
+// arbitrary struct literal is deliberately not available outside this
+// module) -- so this is the minimum widening that lets those tests build
+// one from ordinary `DeviceSnapshot` fixtures instead of adding a second,
+// test-only construction path.
+pub(crate) fn diagnose_identity_instance_for_verify(
     baseline: &DeviceSnapshot,
     current: &DeviceSnapshot,
 ) -> VerifyTargetDiagnostics {

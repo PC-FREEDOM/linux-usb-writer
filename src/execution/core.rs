@@ -269,6 +269,143 @@ pub(in crate::execution) enum VerifyTargetCheckError {
     UnsafeTargetState,
 }
 
+// The specific reason(s) `verify_target_hard_hazards` (below) found a fresh
+// `DeviceSnapshot` unsafe to read from during Verify. Introduced as part of
+// the Verify Pre-flight Diagnostics design so a future caller (a
+// `write_job.rs` Verify state machine, or a diagnostic log line) can report
+// *which* condition(s) triggered `VerifyTargetCheckError::UnsafeTargetState`
+// instead of only that one did -- `UnsafeTargetState` itself is deliberately
+// left unchanged (see its own doc comment above): this enum supplements it
+// with detail, rather than replacing or subdividing it.
+//
+// `pub(in crate::execution)`, matching `VerifyTargetCheckError`: nothing
+// outside `execution` can observe a hazard reason yet (no production caller
+// wires this to `main.rs` this step), so there is no reason to expose it any
+// more broadly than its sibling type already is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::execution) enum HardHazardReason {
+    SystemDevice,
+    ActiveSwap,
+    ComplexStorage,
+    HintIgnore,
+    MediaUnavailable,
+}
+
+// Pure function: every hard hazard a fresh `DeviceSnapshot` currently
+// exhibits, in a fixed, deterministic order (checked in the same order
+// `verify_target_has_hard_hazard`'s boolean chain always has: SystemDevice,
+// ActiveSwap, ComplexStorage, HintIgnore, MediaUnavailable). Returns every
+// applicable reason, not just the first -- a snapshot can fail more than one
+// of these independently (e.g. `active_swap` and `complex_storage` both
+// `true` at once), and a diagnostic log line should be able to say so.
+// `verify_target_has_hard_hazard` below is now a thin wrapper over this.
+fn verify_target_hard_hazards(current: &DeviceSnapshot) -> Vec<HardHazardReason> {
+    let mut hazards = Vec::new();
+
+    if current.hint_system {
+        hazards.push(HardHazardReason::SystemDevice);
+    }
+    if current.active_swap {
+        hazards.push(HardHazardReason::ActiveSwap);
+    }
+    if current.complex_storage {
+        hazards.push(HardHazardReason::ComplexStorage);
+    }
+    if current.hint_ignore {
+        hazards.push(HardHazardReason::HintIgnore);
+    }
+    if !current.media_available {
+        hazards.push(HardHazardReason::MediaUnavailable);
+    }
+
+    hazards
+}
+
+// A single, pure snapshot of everything `check_identity_instance_for_verify`
+// needs to decide whether Verify may proceed -- Identity comparison,
+// Instance comparison, and every hard hazard found -- plus the two
+// `DeviceSnapshot`s that comparison was made from. Exists so that decision
+// and diagnostic detail are computed exactly once, from exactly one call
+// (`diagnose_identity_instance_for_verify` below), instead of the check path
+// and a future logging path re-running `compare_identity`/`compare_instance`/
+// `verify_target_hard_hazards` independently and risking the two silently
+// drifting apart (single source of truth).
+//
+// Fields are private, not `pub`: nothing outside this module should be able
+// to construct one from independently-sourced parts (the same rationale as
+// `ImageSelection`/`WriteIntent` above) -- `diagnose_identity_instance_for_verify`
+// is the only constructor. `pub(in crate::execution)`, matching
+// `HardHazardReason`/`VerifyTargetCheckError`: no production caller outside
+// this module exists yet (a future `write_job.rs` Verify state machine is
+// the intended one), so this stays no more exposed than it needs to be
+// today. `Debug, Clone` only -- `DeviceSnapshot` itself does not derive
+// `Copy`/`PartialEq`/`Eq`, so neither can this type without first changing
+// `device.rs`, which is out of scope for this step.
+#[derive(Debug, Clone)]
+pub(in crate::execution) struct VerifyTargetDiagnostics {
+    baseline: DeviceSnapshot,
+    current: DeviceSnapshot,
+    identity: IdentityComparison,
+    instance: InstanceComparison,
+    hazards: Vec<HardHazardReason>,
+}
+
+// `#[allow(dead_code)]` on every accessor below: this module's own tests
+// reach the private fields directly (ordinary same-module field access,
+// since privacy in Rust is module-scoped, not `impl`-scoped), so nothing
+// calls these yet -- they exist for a future `write_job.rs` consumer that,
+// unlike this module's tests, is a different module and therefore cannot
+// reach the private fields directly.
+impl VerifyTargetDiagnostics {
+    #[allow(dead_code)]
+    pub(in crate::execution) fn baseline(&self) -> &DeviceSnapshot {
+        &self.baseline
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::execution) fn current(&self) -> &DeviceSnapshot {
+        &self.current
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::execution) fn identity(&self) -> IdentityComparison {
+        self.identity
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::execution) fn instance(&self) -> InstanceComparison {
+        self.instance
+    }
+
+    #[allow(dead_code)]
+    pub(in crate::execution) fn hazards(&self) -> &[HardHazardReason] {
+        &self.hazards
+    }
+}
+
+// The only constructor for `VerifyTargetDiagnostics`. Pure: no D-Bus, no
+// file I/O, no global state, no logging/formatting -- takes only the two
+// snapshots already in the caller's hand and returns plain data, exactly
+// like `check_identity_instance_for_verify` itself. `check_identity_instance_for_verify`
+// (below) is now implemented in terms of this function's result rather than
+// recomputing `compare_identity`/`compare_instance`/`verify_target_hard_hazards`
+// a second time, so the value a future diagnostic log line would report and
+// the value the allow/reject decision is actually based on can never
+// diverge.
+#[allow(dead_code)] // no production caller yet; exercised by this module's own tests below.
+pub(in crate::execution) fn diagnose_identity_instance_for_verify(
+    baseline: &DeviceSnapshot,
+    current: &DeviceSnapshot,
+) -> VerifyTargetDiagnostics {
+    VerifyTargetDiagnostics {
+        baseline: baseline.clone(),
+        current: current.clone(),
+        identity: compare_identity(baseline, current),
+        instance: compare_instance(baseline, current),
+        hazards: verify_target_hard_hazards(current),
+    }
+}
+
 // Verify-specific counterpart to `check_identity_instance_safety` above,
 // intended as the pre-flight check a future Verify orchestration
 // (`write_job.rs`, a later step) runs immediately before opening a
@@ -302,7 +439,18 @@ pub(in crate::execution) fn check_identity_instance_for_verify(
     baseline: &DeviceSnapshot,
     current: &DeviceSnapshot,
 ) -> Result<(), VerifyTargetCheckError> {
-    match compare_identity(baseline, current) {
+    // Single source of truth: the diagnostics below are the one and only
+    // place Identity/Instance/hazards are computed for this check. A future
+    // diagnostic log line reads the exact same `VerifyTargetDiagnostics`
+    // value (via `diagnose_identity_instance_for_verify`) that this decision
+    // is based on -- never a second, independently recomputed copy.
+    let diagnostics = diagnose_identity_instance_for_verify(baseline, current);
+
+    // Priority order preserved unchanged from the pre-diagnostics
+    // implementation: Identity, then Instance, then hazards. This is a
+    // regression-sensitive ordering (see this module's own
+    // `verify_target_check_*` tests below), not an incidental one.
+    match diagnostics.identity {
         IdentityComparison::Changed => return Err(VerifyTargetCheckError::IdentityChanged),
         IdentityComparison::InsufficientIdentity => {
             return Err(VerifyTargetCheckError::IdentityInsufficient);
@@ -310,7 +458,7 @@ pub(in crate::execution) fn check_identity_instance_for_verify(
         IdentityComparison::Same => {}
     }
 
-    match compare_instance(baseline, current) {
+    match diagnostics.instance {
         InstanceComparison::Recreated => return Err(VerifyTargetCheckError::InstanceRecreated),
         InstanceComparison::InsufficientInformation => {
             return Err(VerifyTargetCheckError::InstanceInsufficient);
@@ -318,7 +466,7 @@ pub(in crate::execution) fn check_identity_instance_for_verify(
         InstanceComparison::SameInstance => {}
     }
 
-    if verify_target_has_hard_hazard(current) {
+    if !diagnostics.hazards.is_empty() {
         return Err(VerifyTargetCheckError::UnsafeTargetState);
     }
 
@@ -369,12 +517,15 @@ pub(in crate::execution) fn check_identity_instance_for_verify(
 //     either way, not a state Verify should silently read through.
 //   - `hint_ignore` -- the system now says to leave this device alone.
 //   - `!media_available` -- there is no media to read from at all.
+// Thin wrapper over `verify_target_hard_hazards`: kept for the boolean-only
+// question this module's doc comments above already reference by name.
+// `check_identity_instance_for_verify` itself no longer calls this -- it
+// reads `diagnostics.hazards` directly (see the single-source-of-truth note
+// on that function) -- so this exists purely as a small, still-useful
+// predicate for any future caller that only needs a yes/no answer.
+#[allow(dead_code)] // no caller left after the diagnostics refactor; kept as a thin, documented predicate per the Verify Pre-flight Diagnostics design.
 fn verify_target_has_hard_hazard(current: &DeviceSnapshot) -> bool {
-    current.hint_system
-        || current.active_swap
-        || current.complex_storage
-        || current.hint_ignore
-        || !current.media_available
+    !verify_target_hard_hazards(current).is_empty()
 }
 
 // Re-verifies the current Selection against a freshly re-fetched
@@ -3326,6 +3477,231 @@ mod tests {
         assert_eq!(
             check_identity_instance_for_verify(&baseline, &current),
             Ok(())
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // diagnose_identity_instance_for_verify / VerifyTargetDiagnostics /
+    // HardHazardReason (Verify Pre-flight Diagnostics Design, implementation
+    // step 1+2)
+    //
+    // Every test below checks both the diagnostics value itself and the
+    // `check_identity_instance_for_verify` result together, so a future
+    // change that made the two diverge (diagnostics saying one thing, the
+    // check deciding another) would fail here immediately.
+    // ---------------------------------------------------------------------
+
+    // D1. Identical baseline/current: Identity Same, Instance SameInstance,
+    // no hazards, and the check still allows Verify.
+    #[test]
+    fn diagnostics_for_identical_snapshot_are_clean_and_check_allows() {
+        let baseline = base_device();
+        let current = base_device();
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(diagnostics.identity, IdentityComparison::Same);
+        assert_eq!(diagnostics.instance, InstanceComparison::SameInstance);
+        assert!(diagnostics.hazards.is_empty());
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
+    }
+
+    // D2. mount_points going from empty to non-empty: the diagnostics'
+    // `current` snapshot preserves the new value (observable for a future
+    // log line), no hazard is raised, and the check still allows Verify --
+    // this is the same real-hardware scenario `verify_target_check_allows_newly_mounted_filesystem`
+    // above pins, now also checked at the diagnostics level.
+    #[test]
+    fn diagnostics_preserve_newly_mounted_filesystem_without_hazard() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.mount_points = vec!["/media/example".to_string()];
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(diagnostics.current.mount_points, vec!["/media/example"]);
+        assert!(diagnostics.baseline.mount_points.is_empty());
+        assert!(diagnostics.hazards.is_empty());
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
+    }
+
+    // D3. read_only going from false to true: the diagnostics' `current`
+    // snapshot preserves the change, no hazard is raised, and the check
+    // still allows Verify (mirrors `verify_target_check_allows_read_only_becoming_true`
+    // above at the diagnostics level).
+    #[test]
+    fn diagnostics_preserve_read_only_change_without_hazard() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.read_only = true;
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert!(!diagnostics.baseline.read_only);
+        assert!(diagnostics.current.read_only);
+        assert!(diagnostics.hazards.is_empty());
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Ok(())
+        );
+    }
+
+    // D4. hint_system alone: hazards contains exactly SystemDevice, and the
+    // check rejects with UnsafeTargetState.
+    #[test]
+    fn diagnostics_report_system_device_hazard() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.hint_system = true;
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(diagnostics.hazards, vec![HardHazardReason::SystemDevice]);
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // D5. active_swap and complex_storage both true: both reasons are
+    // reported, in the fixed, documented order (ActiveSwap before
+    // ComplexStorage), regardless of which field was set first in the test.
+    #[test]
+    fn diagnostics_report_multiple_hazards_in_deterministic_order() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.complex_storage = true;
+        current.active_swap = true;
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(
+            diagnostics.hazards,
+            vec![
+                HardHazardReason::ActiveSwap,
+                HardHazardReason::ComplexStorage
+            ]
+        );
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // D6. hint_ignore alone: hazards contains exactly HintIgnore.
+    #[test]
+    fn diagnostics_report_hint_ignore_hazard() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.hint_ignore = true;
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(diagnostics.hazards, vec![HardHazardReason::HintIgnore]);
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // D7. media_available false: hazards contains exactly MediaUnavailable.
+    #[test]
+    fn diagnostics_report_media_unavailable_hazard() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.media_available = false;
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(
+            diagnostics.hazards,
+            vec![HardHazardReason::MediaUnavailable]
+        );
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::UnsafeTargetState)
+        );
+    }
+
+    // D8. Identity changed: diagnostics.identity reports Changed, and the
+    // check still rejects with the same IdentityChanged error as before this
+    // refactor (Instance/hazards are not even reached).
+    #[test]
+    fn diagnostics_report_identity_changed_and_check_still_rejects() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.serial = "DIFFERENT-SERIAL".to_string();
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(diagnostics.identity, IdentityComparison::Changed);
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::IdentityChanged)
+        );
+    }
+
+    // D9. Identity insufficient (no usable serial on either side): diagnostics
+    // and check behavior both preserved from before this refactor.
+    #[test]
+    fn diagnostics_report_identity_insufficient_and_check_still_rejects() {
+        let mut baseline = base_device();
+        baseline.serial = String::new();
+        let mut current = base_device();
+        current.serial = String::new();
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(
+            diagnostics.identity,
+            IdentityComparison::InsufficientIdentity
+        );
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::IdentityInsufficient)
+        );
+    }
+
+    // D10. Instance recreated (diskseq changed): diagnostics.instance reports
+    // Recreated, and the check still rejects with InstanceRecreated.
+    #[test]
+    fn diagnostics_report_instance_recreated_and_check_still_rejects() {
+        let baseline = base_device();
+        let mut current = base_device();
+        current.diskseq = Some(999);
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(diagnostics.instance, InstanceComparison::Recreated);
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::InstanceRecreated)
+        );
+    }
+
+    // D11. Instance insufficient (diskseq missing on one side): diagnostics
+    // and check behavior both preserved from before this refactor.
+    #[test]
+    fn diagnostics_report_instance_insufficient_and_check_still_rejects() {
+        let mut baseline = base_device();
+        baseline.diskseq = None;
+        let current = base_device();
+
+        let diagnostics = diagnose_identity_instance_for_verify(&baseline, &current);
+
+        assert_eq!(
+            diagnostics.instance,
+            InstanceComparison::InsufficientInformation
+        );
+        assert_eq!(
+            check_identity_instance_for_verify(&baseline, &current),
+            Err(VerifyTargetCheckError::InstanceInsufficient)
         );
     }
 }

@@ -141,6 +141,7 @@ use super::core::{
 };
 use super::linux_access::{FdMetadata, OpenedDeviceHandle, ReadTarget};
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
+use crate::image_source::source_identity::SourceChanged;
 use crate::image_source::{ImageSourceAccess, SelectedImage};
 use crate::writer::{self, WriteError, WritePlan, WriteProgress};
 
@@ -253,6 +254,12 @@ pub enum WriteStage {
 pub enum WriteJobFailureCause {
     Write(WriteError),
     Sync(io::Error),
+    // The source image was no longer in the state it was selected in when
+    // the write was about to start (see `WritingExecution::write`). Nothing
+    // was written. Carries the metadata comparison; it deliberately does
+    // not guess *why* the source changed (content rewrite, rename, deletion
+    // and replacement all look alike in metadata).
+    SourceChanged(SourceChanged),
 }
 
 // Whether a terminal outcome leaves the target possibly modified, computed
@@ -656,11 +663,40 @@ impl WritingExecution {
     // keeps it private with no accessor). The Raw Write Capability Boundary
     // (`pub(in crate::execution)` on `ActiveWrite::writer_target()` etc.) is
     // therefore unaffected by adding this method.
+    //
+    // Source gate: immediately before the first byte is written, the source
+    // image is revalidated (`SelectedImage::revalidate_identity`: one
+    // metadata read of the already-open file, compared with the snapshot
+    // taken when it was opened). Everything about the target -- fresh
+    // snapshot, Identity/Instance/Safety re-check, FD binding -- was already
+    // verified before `AuthorizedExecution::bind()`, so the order is target
+    // revalidation, then source revalidation, then the first write. This is
+    // the latest point every write passes through (`Writing` has no public
+    // constructor), so no caller can reach the target without it.
+    //
+    // If the source changed, the result is `Failed` with
+    // `WriteJobFailureCause::SourceChanged`, 0 bytes written and the target
+    // untouched; being `Failed`, it cannot lead to sync or Verify, and a
+    // retry needs a fresh selection and a fresh Gate pass.
     pub fn write(
         self,
         on_progress: impl FnMut(WriteProgress),
     ) -> (SelectedImage, WriteAttemptOutcome) {
         let WritingExecution { writing, image } = self;
+
+        if let Err(changed) = image.revalidate_identity() {
+            let failed = Failed {
+                image_size: writing.plan.image_size,
+                bytes_written: 0,
+                stage: WriteStage::Writing,
+                target_may_be_modified: false,
+                retry_requires_fresh_gate: true,
+                cause: WriteJobFailureCause::SourceChanged(changed),
+            };
+            // `writing` (and the target FD inside it) is dropped here,
+            // unused: no write call was ever made.
+            return (image, WriteAttemptOutcome::Failed(failed));
+        }
 
         (image, writing.write(on_progress))
     }
@@ -2266,6 +2302,11 @@ mod tests {
             self.logical_size
         }
 
+        // Not file-backed: there is no file whose state could change.
+        fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+            Ok(())
+        }
+
         fn access(&self) -> ImageSourceAccess {
             ImageSourceAccess::SequentialReplay
         }
@@ -2837,6 +2878,11 @@ mod tests {
     impl ImageSource for FailingAfterNBytesSource {
         fn logical_size(&self) -> u64 {
             self.logical_size
+        }
+
+        // Not file-backed: there is no file whose state could change.
+        fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+            Ok(())
         }
 
         fn access(&self) -> ImageSourceAccess {
@@ -3921,5 +3967,108 @@ mod tests {
     // reach it without exposing the field itself any more broadly.
     fn sync_succeeded_raw_fd_for_test(succeeded: &SyncSucceeded) -> std::os::fd::RawFd {
         succeeded.active.raw_fd_for_test()
+    }
+
+    // ---------------------------------------------------------------------
+    // Pre-write source gate (`WritingExecution::write`).
+    // ---------------------------------------------------------------------
+
+    fn let_the_clock_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    // An unchanged source passes the gate and is written normally through
+    // the production entry point.
+    #[test]
+    fn unchanged_source_passes_the_pre_write_gate() {
+        let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let path = write_temp_image_file("gate-unchanged", &data);
+        let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+        let (target_path, authorized) = gate_pass_active_write_for_image(
+            "gate-unchanged-target",
+            selected.selection(),
+            data.len() as u64,
+            true,
+        );
+        let target_path = target_path.expect("persistent temp target path");
+
+        let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+        let writing_execution = execution.begin_write(CancelHandle::new()).unwrap();
+        let (_image, outcome) = writing_execution.write(|_| {});
+
+        assert!(matches!(outcome, WriteAttemptOutcome::Succeeded(_)));
+        assert_eq!(std::fs::read(&target_path).unwrap(), data);
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // A source changed after the Gate (after bind and after the write-time
+    // reader was opened) is caught at the last moment: the outcome is a
+    // typed `SourceChanged` failure, nothing reaches the target, and being
+    // `Failed` it cannot proceed to sync or Verify.
+    #[test]
+    fn changed_source_is_refused_before_any_byte_is_written() {
+        type Mutation = fn(&std::path::Path);
+        let mutations: [(&str, Mutation); 3] = [
+            ("append", |path| {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(b"appended").unwrap();
+            }),
+            ("overwrite", |path| {
+                use std::os::unix::fs::FileExt as _;
+                let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+                file.write_all_at(b"XXXX", 0).unwrap();
+            }),
+            ("rename", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+            }),
+        ];
+
+        for (name, mutate) in mutations {
+            let data: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+            let path = write_temp_image_file(&format!("gate-{name}"), &data);
+            let selected = SelectedImage::new(Box::new(FileImageSource::new(&path).unwrap()));
+            let (target_path, authorized) = gate_pass_active_write_for_image(
+                &format!("gate-{name}-target"),
+                selected.selection(),
+                data.len() as u64,
+                true,
+            );
+            let target_path = target_path.expect("persistent temp target path");
+
+            let execution = AuthorizedExecution::bind(authorized, selected).unwrap();
+            let writing_execution = execution.begin_write(CancelHandle::new()).unwrap();
+
+            let_the_clock_tick();
+            mutate(&path);
+
+            let (_image, outcome) = writing_execution
+                .write(|_| panic!("{name}: no progress may be reported: nothing may be written"));
+
+            let failed = match outcome {
+                WriteAttemptOutcome::Failed(failed) => failed,
+                other => panic!("{name}: expected Failed, got {other:?}"),
+            };
+            assert!(
+                matches!(failed.cause, WriteJobFailureCause::SourceChanged(_)),
+                "{name}: {:?}",
+                failed.cause
+            );
+            assert_eq!(failed.bytes_written, 0, "{name}");
+            assert!(!failed.target_may_be_modified, "{name}");
+            assert!(failed.retry_requires_fresh_gate, "{name}");
+            assert_eq!(failed.stage, WriteStage::Writing, "{name}");
+
+            let target_contents = std::fs::read(&target_path).unwrap();
+            assert!(
+                target_contents.is_empty(),
+                "{name}: target must be untouched"
+            );
+
+            let _ = std::fs::remove_file(&target_path);
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("moved"));
+        }
     }
 }

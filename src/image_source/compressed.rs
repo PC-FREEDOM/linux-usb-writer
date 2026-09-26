@@ -68,6 +68,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::bufread::MultiGzDecoder;
 
+use super::source_identity::{SourceChanged, SourceIdentity};
 use super::{CompressedImageFile, CompressionFormat, FileImageReader};
 
 // Capacity of the `BufReader` above the source cursor: how much compressed
@@ -163,6 +164,10 @@ pub struct PreflightedCompressedImage {
     format: CompressionFormat,
     compressed_size: u64,
     logical_size: u64,
+    // The snapshot taken when `open_image` opened the file -- deliberately
+    // not refreshed by Preflight, so a change at any point after selection
+    // (including during Preflight) is still detected.
+    identity: SourceIdentity,
 }
 
 impl PreflightedCompressedImage {
@@ -182,6 +187,13 @@ impl PreflightedCompressedImage {
     // The exact number of bytes the validated stream decodes to.
     pub fn logical_size(&self) -> u64 {
         self.logical_size
+    }
+
+    // Confirms the file is still in the state it was selected in (see
+    // `source_identity`): the reference is the snapshot from `open_image`,
+    // not from the end of Preflight.
+    pub fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+        self.identity.revalidate(&self.file)
     }
 
     // Starts a fresh decode of the validated stream: a new reader over the
@@ -238,6 +250,7 @@ impl CompressedImageFile {
             format: self.format,
             compressed_size: self.compressed_size,
             logical_size,
+            identity: self.identity,
         })
     }
 }
@@ -2435,5 +2448,110 @@ mod tests {
         }
         assert_eq!(delivered as u64, image.logical_size());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // Source identity (gzip): same contracts as raw, with the snapshot taken
+    // when `open_image` opened the file and never refreshed by Preflight.
+    // ---------------------------------------------------------------------
+
+    fn source_changed(result: Result<(), SourceChanged>) -> bool {
+        matches!(result, Err(SourceChanged::Metadata { .. }))
+    }
+
+    fn let_the_clock_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn preflighted_image_unchanged_revalidates() {
+        let (image, path) = preflighted("identity-gz-unchanged", &gzip_member(&payload_a()));
+        for _ in 0..3 {
+            image.revalidate_identity().unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn preflighted_image_detects_append_and_overwrite() {
+        let member = gzip_member(&payload_a());
+
+        let (image, path) = preflighted("identity-gz-append", &member);
+        let_the_clock_tick();
+        let mut appender = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        appender.write_all(&[0u8; 16]).unwrap();
+        assert!(source_changed(image.revalidate_identity()));
+        let _ = std::fs::remove_file(&path);
+
+        let (image, path) = preflighted("identity-gz-overwrite", &member);
+        let_the_clock_tick();
+        rewrite_in_place(&path, &member); // same bytes, same size: still a write
+        assert!(source_changed(image.revalidate_identity()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The reference point is selection (`open_image`), not the end of
+    // Preflight: a change between opening and Preflight -- here rewriting
+    // the very same valid bytes, so Preflight itself succeeds -- is still
+    // reported afterwards.
+    #[test]
+    fn preflight_keeps_the_open_time_snapshot() {
+        let member = gzip_member(&payload_a());
+        let path = write_gz_file("identity-gz-before-preflight", &member);
+        let file = open_compressed(&path);
+
+        let_the_clock_tick();
+        rewrite_in_place(&path, &member);
+
+        let image = file.preflight(NO_LIMIT, || false, |_| {}).unwrap();
+        assert_eq!(image.logical_size(), payload_a().len() as u64);
+        assert!(source_changed(image.revalidate_identity()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // Path operations after Preflight: replays keep decoding the opened
+    // file, while revalidation reports the change.
+    #[test]
+    fn preflighted_image_path_operations_keep_the_open_file_but_are_reported() {
+        let a = payload_a();
+        type PathOperation = fn(&PathBuf);
+        let operations: [(&str, PathOperation); 4] = [
+            ("rename", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+            }),
+            ("unlink", |path| {
+                std::fs::remove_file(path).unwrap();
+            }),
+            ("replace", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+                std::fs::write(path, gzip_member(b"a different image")).unwrap();
+            }),
+            ("hard-link", |path| {
+                std::fs::hard_link(path, path.with_extension("link")).unwrap();
+            }),
+        ];
+
+        for (name, operate) in operations {
+            let (image, path) = preflighted(&format!("identity-gz-{name}"), &gzip_member(&a));
+
+            let_the_clock_tick();
+            operate(&path);
+
+            let run = replay_all(&mut image.replay(), 64 * 1024);
+            assert_eq!(run.end, Ok(()), "{name}");
+            assert_eq!(run.delivered, a, "{name}: still the opened file");
+            assert!(source_changed(image.revalidate_identity()), "{name}");
+
+            for leftover in [
+                path.clone(),
+                path.with_extension("moved"),
+                path.with_extension("link"),
+            ] {
+                let _ = std::fs::remove_file(leftover);
+            }
+        }
     }
 }

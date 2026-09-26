@@ -67,13 +67,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::execution::core::ImageSelection;
+use source_identity::{SourceChanged, SourceIdentity};
 
 // Compressed image validation (`CompressedImageFile::preflight` and its
 // types), reached as `image_source::compressed::*`.
 pub mod compressed;
 mod detect;
+// Detecting that a selected image file changed after it was opened
+// (`SourceIdentity` / `SourceChanged`), reached as
+// `image_source::source_identity::*`.
 #[cfg(test)]
 mod gzip_behavior;
+pub mod source_identity;
 
 // Why `FileImageSource::new` refused to construct a source. Deliberately
 // small and specific to construction-time failures -- `open_reader()`
@@ -171,6 +176,10 @@ pub struct CompressedImageFile {
     path: PathBuf,
     format: CompressionFormat,
     compressed_size: u64,
+    // Metadata snapshot taken at open time, from the same `fstat` as
+    // `compressed_size`. Carried unchanged through Preflight: the reference
+    // point for later revalidation is always the moment of selection.
+    identity: SourceIdentity,
 }
 
 impl CompressedImageFile {
@@ -235,6 +244,7 @@ pub fn open_image(path: impl Into<PathBuf>) -> Result<OpenedImage, ImageSourceEr
                 path,
                 format,
                 compressed_size: metadata.len(),
+                identity: SourceIdentity::from_metadata(&metadata),
             }))
         }
         detect::DetectedFormat::Unsupported(kind) => Err(ImageSourceError::UnsupportedFormat(kind)),
@@ -385,6 +395,16 @@ pub trait ImageSource {
             "this ImageSource does not support offset-based reads",
         ))
     }
+
+    // Confirms the source is still in the state it was selected in: the
+    // metadata of the already-open file must match the snapshot taken when
+    // it was opened (see `source_identity`). Metadata only -- no path, no
+    // data read. Called at checkpoints (in particular immediately before the
+    // first byte is written to the target), never per read.
+    //
+    // Required, with no default: a default of "unchanged" would let a new
+    // source type silently skip the check.
+    fn revalidate_identity(&self) -> Result<(), SourceChanged>;
 }
 
 // The only `ImageSource` implementation in this revision: a plain regular
@@ -438,6 +458,9 @@ pub struct FileImageSource {
     file: Arc<File>,
     path: PathBuf,
     logical_size: u64,
+    // Metadata snapshot taken at open time, from the same `fstat` as
+    // `logical_size` (see `source_identity`).
+    identity: SourceIdentity,
 }
 
 impl FileImageSource {
@@ -481,6 +504,7 @@ impl FileImageSource {
             file: Arc::new(file),
             path,
             logical_size: metadata.len(),
+            identity: SourceIdentity::from_metadata(&metadata),
         })
     }
 
@@ -497,6 +521,10 @@ impl FileImageSource {
 impl ImageSource for FileImageSource {
     fn logical_size(&self) -> u64 {
         self.logical_size
+    }
+
+    fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+        self.identity.revalidate(&self.file)
     }
 
     // `RandomAccess`: `read_at` (below) genuinely reads at an arbitrary
@@ -685,6 +713,12 @@ impl SelectedImage {
     // `&dyn ImageSource` must never be handed out.
     pub(crate) fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
         self.source.read_at(offset, buf)
+    }
+
+    // Delegates to `self.source.revalidate_identity()`: used by the write
+    // path (`write_job`) immediately before the first target write.
+    pub(crate) fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+        self.source.revalidate_identity()
     }
 }
 
@@ -986,6 +1020,11 @@ mod tests {
     impl ImageSource for SequentialOnlySource {
         fn logical_size(&self) -> u64 {
             self.logical_size
+        }
+
+        // Not file-backed: there is no file whose state could change.
+        fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+            Ok(())
         }
 
         fn access(&self) -> ImageSourceAccess {
@@ -1676,6 +1715,134 @@ mod tests {
         assert_eq!(selected.access(), ImageSourceAccess::RandomAccess);
         assert_eq!(read_all(selected.open_reader().unwrap()), data);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // Source identity (raw): two separate contracts, tested separately.
+    //   - same open file: reads keep coming from the file that was opened;
+    //   - unchanged since selection: `revalidate_identity()` reports any
+    //     change to that file's metadata, including path operations.
+    // ---------------------------------------------------------------------
+
+    fn changed(result: Result<(), SourceChanged>) -> bool {
+        matches!(result, Err(SourceChanged::Metadata { .. }))
+    }
+
+    // Filesystems without fine-grained timestamps only advance them once per
+    // clock tick; waiting briefly before a change avoids depending on that.
+    fn let_the_clock_tick() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn raw_source_unchanged_revalidates_repeatedly() {
+        let data = b"raw image contents".to_vec();
+        let path = write_named_temp_file("identity-unchanged", ".img", &data);
+        let source = open_raw(&path);
+
+        for _ in 0..3 {
+            source.revalidate_identity().unwrap();
+        }
+        assert_eq!(read_all(source.open_reader().unwrap()), data);
+        source.revalidate_identity().unwrap();
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn raw_source_content_changes_are_detected() {
+        type Mutation = fn(&Path);
+        let mutations: [(&str, Mutation); 3] = [
+            ("append", |path| {
+                let mut file = OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(b"appended").unwrap();
+            }),
+            ("truncate", |path| {
+                OpenOptions::new()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(4)
+                    .unwrap();
+            }),
+            ("overwrite", |path| {
+                let file = OpenOptions::new().write(true).open(path).unwrap();
+                file.write_all_at(b"RAW", 0).unwrap();
+            }),
+        ];
+
+        for (name, mutate) in mutations {
+            let path = write_named_temp_file(name, ".img", b"raw image contents");
+            let source = open_raw(&path);
+
+            let_the_clock_tick();
+            mutate(&path);
+
+            assert!(changed(source.revalidate_identity()), "{name}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // Rename / unlink / rename + replacement / hard link: the open file keeps
+    // being read (no swap to whatever the path now names), and at the same
+    // time revalidation reports that the selected file was touched.
+    #[test]
+    fn raw_source_path_operations_keep_the_open_file_but_are_reported() {
+        let original = b"the selected raw image".to_vec();
+        type PathOperation = fn(&Path);
+        let operations: [(&str, PathOperation); 4] = [
+            ("rename", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+            }),
+            ("unlink", |path| {
+                std::fs::remove_file(path).unwrap();
+            }),
+            ("replace", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+                std::fs::write(path, b"a replacement file at the old path").unwrap();
+            }),
+            ("hard-link", |path| {
+                std::fs::hard_link(path, path.with_extension("link")).unwrap();
+            }),
+        ];
+
+        for (name, operate) in operations {
+            let path = write_named_temp_file(name, ".img", &original);
+            let source = open_raw(&path);
+
+            let_the_clock_tick();
+            operate(&path);
+
+            // Same-FD contract: still the originally opened content.
+            assert_eq!(read_all(source.open_reader().unwrap()), original, "{name}");
+            // Source-identity contract: reported as changed.
+            assert!(changed(source.revalidate_identity()), "{name}");
+
+            for leftover in [
+                path.clone(),
+                path.with_extension("moved"),
+                path.with_extension("link"),
+            ] {
+                let _ = std::fs::remove_file(leftover);
+            }
+        }
+    }
+
+    // SelectedImage delegates to its source.
+    #[test]
+    fn selected_image_revalidates_its_source() {
+        let path = write_named_temp_file("identity-selected", ".img", b"raw image");
+        let selected = SelectedImage::new(Box::new(open_raw(&path)));
+        selected.revalidate_identity().unwrap();
+
+        let_the_clock_tick();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1)
+            .unwrap();
+        assert!(changed(selected.revalidate_identity()));
         let _ = std::fs::remove_file(&path);
     }
 }

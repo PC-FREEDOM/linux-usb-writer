@@ -12,17 +12,51 @@
 //                    `open_image` opened, starting at byte 0, clamped to the
 //                    compressed size recorded at open time
 //   BufReader        buffering for the syscalls
-//   CountingBufRead  counts what the decoder actually `consume()`s, polls
-//                    for cancellation before every `fill_buf()`, and tags any
-//                    error from below as a source I/O error
+//   CountingBufRead  counts what the decoder actually `consume()`s, runs a
+//                    check before every `fill_buf()` (cancellation, then the
+//                    Compressed Input Budget below), and tags any error from
+//                    below as a source I/O error
 //   MultiGzDecoder   every member, CRC32 + ISIZE per member, and any trailing
 //                    bytes rejected (behavior pinned by `gzip_behavior` tests)
 //
-// Errors are classified by type, never by message text: cancellation and
-// source I/O failures travel through the decoder as typed payloads
-// (`PreflightCancelled` / `SourceReadError`), which `flate2` passes through
-// unchanged (see `gzip_behavior::errors_from_below_the_decoder_propagate_
-// unchanged`); anything else came from the decoder itself.
+// Errors are classified by type, never by message text: cancellation, budget
+// exhaustion and source I/O failures travel through the decoder as typed
+// payloads (`PreflightCancelled` / `InputBudgetExceeded` /
+// `SourceReadError`), which `flate2` passes through unchanged (see
+// `gzip_behavior::errors_from_below_the_decoder_propagate_unchanged`);
+// anything else came from the decoder itself.
+//
+// Compressed Input Budget (a resource / responsiveness policy -- not a
+// corruption check and not a decompression-bomb check): a valid gzip stream
+// can make the decoder process a great deal of compressed input while
+// producing almost no output (thousands of empty members, empty stored
+// blocks, large header fields). A single `read()` would then stay inside the
+// decoder for a long time, and nothing above it could react (e.g. to a
+// cancellation) until it returned. The budget bounds that work locally:
+//
+//   - every decoded output byte earns 65/64 bytes of compressed-input
+//     budget (integer arithmetic; the fractional remainder is carried, so
+//     the total earned never depends on how output was split into reads);
+//   - the balance starts at, and can never exceed, 1 MiB -- output earned in
+//     the past cannot be banked for later;
+//   - compressed bytes the decoder consumes are charged against the
+//     balance, and consuming more than the balance is refused.
+//
+// The balance is checked in `fill_buf()`, before the decoder can consume the
+// next buffer, so the decoder may consume up to one buffer (the 256 KiB
+// `BufReader` capacity) beyond it before the next check. Output is credited
+// every `DECODE_QUANTUM` (64 KiB) of decoding. Together, for any stretch of
+// decoding that produces `dL` bytes of output, the compressed input
+// processed is at most `1 MiB + dL * 65/64 + 256 KiB` -- about 2.27 MiB per
+// 1 MiB of output. That bound is what keeps every read short enough for the
+// caller to stay responsive.
+//
+// This policy can refuse gzip files that are well-formed: very long runs of
+// tiny members (each with ~20 bytes of member overhead for a byte or so of
+// output -- about 50,000+ consecutive 1-byte members), runs of members with
+// very large header fields, or runs of empty members / empty stored blocks.
+// Ordinary disk-image gzip files (single member, pigz, a few concatenated
+// files, `--rsyncable`) stay far below the limit.
 
 use std::cell::Cell;
 use std::fmt;
@@ -38,8 +72,16 @@ use super::{CompressedImageFile, CompressionFormat, FileImageReader};
 // Capacity of the `BufReader` above the source cursor: how much compressed
 // data one positional read fetches.
 const INPUT_BUFFER_LEN: usize = 256 * 1024;
-// Size of the scratch buffer decoded output is read into and discarded.
-const OUTPUT_BUFFER_LEN: usize = 1024 * 1024;
+// How much decoded output one decoder read may produce before it is counted
+// and credited to the Compressed Input Budget. Part of the budget's
+// responsiveness contract, not just a buffer size: a smaller quantum keeps
+// the credit current; a larger one could let honest, incompressible input
+// run ahead of its credit.
+const DECODE_QUANTUM: usize = 64 * 1024;
+// Compressed Input Budget: the balance's starting value and ceiling.
+const INPUT_BUDGET_CAP: u64 = 1024 * 1024;
+// Compressed Input Budget: each output byte earns `1 + 1/64` input bytes.
+const INPUT_BUDGET_RATE_DENOMINATOR: u64 = 64;
 // Progress is reported whenever compressed input or decoded output has
 // advanced by at least this much since the last report (and once more on
 // success), so a huge image produces a bounded, steady stream of reports.
@@ -83,11 +125,25 @@ pub enum PreflightError {
     // The decoded size does not fit in a `u64`.
     LogicalSizeOverflow,
     // The decoded size exceeds `PreflightOptions::max_logical_size`.
-    LogicalSizeLimitExceeded { limit: u64 },
+    LogicalSizeLimitExceeded {
+        limit: u64,
+    },
     // The decoder reported a clean end of stream without having consumed
     // exactly the compressed file's size. Not expected from a correct
     // decoder; checked so a clean end is never trusted on its own.
-    InputConsumptionMismatch { consumed: u64, compressed_size: u64 },
+    InputConsumptionMismatch {
+        consumed: u64,
+        compressed_size: u64,
+    },
+    // The decoder needed more compressed input than the Compressed Input
+    // Budget allows for the output produced so far (see the module
+    // comment). The stream is not necessarily damaged -- it may be valid
+    // gzip -- but processing it would take unreasonably long per byte of
+    // image, so it is refused as a resource policy.
+    CompressedInputBudgetExceeded {
+        compressed_consumed: u64,
+        logical_produced: u64,
+    },
     // Reading the compressed file itself failed.
     Io(io::Error),
     // Validation for this compression format is not implemented yet.
@@ -207,9 +263,12 @@ fn preflight_gzip(
 
     let (decoded, consumed) = {
         let mut reporter = ProgressReporter::new(compressed_size);
+        let mut budget = InputBudgetMeter::new();
         let hook = |consumed: u64| {
-            reporter.maybe_report(consumed, logical_produced.get(), &mut *on_progress);
-            is_cancelled()
+            let logical = logical_produced.get();
+            preflight_check(is_cancelled(), &mut budget, consumed, logical)?;
+            reporter.maybe_report(consumed, logical, &mut *on_progress);
+            Ok(())
         };
 
         let mut decoder = MultiGzDecoder::new(CountingBufRead::new(input, hook));
@@ -242,7 +301,7 @@ fn decode_to_end(
     options: PreflightOptions,
     logical_produced: &Cell<u64>,
 ) -> Result<u64, PreflightError> {
-    let mut buf = vec![0u8; OUTPUT_BUFFER_LEN];
+    let mut buf = vec![0u8; DECODE_QUANTUM];
 
     loop {
         let n = match decoder.read(&mut buf) {
@@ -254,6 +313,108 @@ fn decode_to_end(
 
         let total = add_logical_bytes(logical_produced.get(), n, options.max_logical_size)?;
         logical_produced.set(total);
+    }
+}
+
+// The check run before every `fill_buf()` during Preflight. Cancellation is
+// checked first and wins: if the caller has asked to stop, the result is
+// `Cancelled` even when the budget is also exhausted at that moment.
+fn preflight_check(
+    cancelled: bool,
+    budget: &mut InputBudgetMeter,
+    consumed: u64,
+    logical: u64,
+) -> io::Result<()> {
+    if cancelled {
+        return Err(io::Error::other(PreflightCancelled));
+    }
+    budget.update(consumed, logical)
+}
+
+// The Compressed Input Budget's balance (see the module comment). Pure
+// integer arithmetic, no I/O.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompressedInputBudget {
+    // Compressed bytes that may still be consumed. Never above
+    // `INPUT_BUDGET_CAP`.
+    tokens: u64,
+    // Output bytes not yet worth a whole extra token: the running total of
+    // credited output modulo `INPUT_BUDGET_RATE_DENOMINATOR`. Carrying it
+    // makes the credit for N output bytes exactly `N + floor(N / 64)` no
+    // matter how N was split across calls.
+    credit_remainder: u64,
+}
+
+impl CompressedInputBudget {
+    fn new() -> Self {
+        CompressedInputBudget {
+            tokens: INPUT_BUDGET_CAP,
+            credit_remainder: 0,
+        }
+    }
+
+    // Credits `produced` output bytes at 65/64, never raising the balance
+    // above the cap (so past output cannot be banked).
+    fn credit_output(&mut self, produced: u64) {
+        let denominator = INPUT_BUDGET_RATE_DENOMINATOR;
+        // Both terms are below `denominator`, so this cannot overflow.
+        let carried = self.credit_remainder + produced % denominator;
+        let extra = produced / denominator + carried / denominator;
+        self.credit_remainder = carried % denominator;
+
+        let credit = produced.saturating_add(extra);
+        self.tokens = self.tokens.saturating_add(credit).min(INPUT_BUDGET_CAP);
+    }
+
+    // Charges `consumed` input bytes. Returns `false` -- leaving the balance
+    // unchanged -- when the balance does not cover them.
+    fn try_charge_input(&mut self, consumed: u64) -> bool {
+        if consumed > self.tokens {
+            return false;
+        }
+        self.tokens -= consumed;
+        true
+    }
+}
+
+// Applies the budget to a running decode: credits output and charges input
+// as the totals advance between checks.
+struct InputBudgetMeter {
+    budget: CompressedInputBudget,
+    credited_logical: u64,
+    charged_consumed: u64,
+}
+
+impl InputBudgetMeter {
+    fn new() -> Self {
+        InputBudgetMeter {
+            budget: CompressedInputBudget::new(),
+            credited_logical: 0,
+            charged_consumed: 0,
+        }
+    }
+
+    // `consumed` / `logical` are the running totals (both only ever grow).
+    // Output is credited before input is charged, so the output produced up
+    // to this point always counts.
+    fn update(&mut self, consumed: u64, logical: u64) -> io::Result<()> {
+        self.budget
+            .credit_output(logical.saturating_sub(self.credited_logical));
+        self.credited_logical = logical;
+
+        let delta = consumed.saturating_sub(self.charged_consumed);
+        if !self.budget.try_charge_input(delta) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                InputBudgetExceeded {
+                    compressed_consumed: consumed,
+                    logical_produced: logical,
+                },
+            ));
+        }
+        self.charged_consumed = consumed;
+
+        Ok(())
     }
 }
 
@@ -281,6 +442,16 @@ fn classify_error(error: io::Error) -> PreflightError {
         .is_some_and(|inner| inner.is::<PreflightCancelled>())
     {
         return PreflightError::Cancelled;
+    }
+
+    if let Some(exceeded) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<InputBudgetExceeded>())
+    {
+        return PreflightError::CompressedInputBudgetExceeded {
+            compressed_consumed: exceeded.compressed_consumed,
+            logical_produced: exceeded.logical_produced,
+        };
     }
 
     if error
@@ -353,6 +524,26 @@ impl fmt::Display for PreflightCancelled {
 
 impl std::error::Error for PreflightCancelled {}
 
+// Payload of the error raised when the Compressed Input Budget is exhausted.
+// Recognized by type after it has passed through the decoder.
+#[derive(Debug)]
+struct InputBudgetExceeded {
+    compressed_consumed: u64,
+    logical_produced: u64,
+}
+
+impl fmt::Display for InputBudgetExceeded {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "compressed input budget exceeded after {} compressed bytes for {} decoded bytes",
+            self.compressed_consumed, self.logical_produced
+        )
+    }
+}
+
+impl std::error::Error for InputBudgetExceeded {}
+
 // Payload wrapping any error from the source below `CountingBufRead`, so it
 // can never be mistaken for a decoder (format) error, whatever its kind.
 #[derive(Debug)]
@@ -373,8 +564,9 @@ impl std::error::Error for SourceReadError {
 // The `BufRead` placed directly below the decoder. Counts the compressed
 // bytes the decoder actually consumes (via `consume()`, never what a buffer
 // below has read ahead), calls `before_fill` with that count before every
-// `fill_buf()` -- a `true` return cancels -- and tags every error from below
-// as `SourceReadError`. Retries `Interrupted` from below itself, so that kind
+// `fill_buf()` -- an `Err` from it is returned as-is (the caller's typed
+// payload, e.g. cancellation or budget exhaustion) -- and tags every error
+// from below as `SourceReadError`. Retries `Interrupted` from below itself, so that kind
 // never reaches the decoder (which treats it specially in places).
 pub(super) struct CountingBufRead<R, F> {
     inner: R,
@@ -382,7 +574,7 @@ pub(super) struct CountingBufRead<R, F> {
     before_fill: F,
 }
 
-impl<R: BufRead, F: FnMut(u64) -> bool> CountingBufRead<R, F> {
+impl<R: BufRead, F: FnMut(u64) -> io::Result<()>> CountingBufRead<R, F> {
     pub(super) fn new(inner: R, before_fill: F) -> Self {
         CountingBufRead {
             inner,
@@ -397,11 +589,9 @@ impl<R: BufRead, F: FnMut(u64) -> bool> CountingBufRead<R, F> {
     }
 }
 
-impl<R: BufRead, F: FnMut(u64) -> bool> BufRead for CountingBufRead<R, F> {
+impl<R: BufRead, F: FnMut(u64) -> io::Result<()>> BufRead for CountingBufRead<R, F> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if (self.before_fill)(self.consumed) {
-            return Err(io::Error::other(PreflightCancelled));
-        }
+        (self.before_fill)(self.consumed)?;
 
         // Retry `Interrupted` from below; a plain loop around `fill_buf`
         // cannot return the borrowed slice from inside it, so probe first.
@@ -427,7 +617,7 @@ impl<R: BufRead, F: FnMut(u64) -> bool> BufRead for CountingBufRead<R, F> {
     }
 }
 
-impl<R: BufRead, F: FnMut(u64) -> bool> Read for CountingBufRead<R, F> {
+impl<R: BufRead, F: FnMut(u64) -> io::Result<()>> Read for CountingBufRead<R, F> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         let available = self.fill_buf()?;
         let n = available.len().min(buf.len());
@@ -970,7 +1160,7 @@ mod tests {
     #[test]
     fn counting_follows_consume_not_read_ahead() {
         let data = [7u8; 100];
-        let mut reader = CountingBufRead::new(&data[..], |_| false);
+        let mut reader = CountingBufRead::new(&data[..], |_| Ok(()));
 
         assert_eq!(reader.fill_buf().unwrap().len(), 100);
         assert_eq!(reader.consumed(), 0);
@@ -1002,6 +1192,409 @@ mod tests {
         assert!(matches!(
             result,
             Err(PreflightError::UnsupportedFormat(CompressionFormat::Xz))
+        ));
+    }
+
+    // ---------------------------------------------------------------------
+    // Compressed Input Budget: arithmetic.
+    // ---------------------------------------------------------------------
+
+    fn drained_budget() -> CompressedInputBudget {
+        let mut budget = CompressedInputBudget::new();
+        assert!(budget.try_charge_input(INPUT_BUDGET_CAP));
+        assert_eq!(budget.tokens, 0);
+        budget
+    }
+
+    #[test]
+    fn budget_starts_full_at_the_cap() {
+        let budget = CompressedInputBudget::new();
+        assert_eq!(budget.tokens, INPUT_BUDGET_CAP);
+        assert_eq!(budget.credit_remainder, 0);
+    }
+
+    // 64 one-byte credits earn exactly 65, like one 64-byte credit; the
+    // fraction is carried, not rounded away per call.
+    #[test]
+    fn budget_credit_carries_the_fraction() {
+        let mut budget = drained_budget();
+        for _ in 0..63 {
+            budget.credit_output(1);
+        }
+        assert_eq!(budget.tokens, 63);
+        budget.credit_output(1);
+        assert_eq!(budget.tokens, 65);
+
+        let mut whole = drained_budget();
+        whole.credit_output(64);
+        assert_eq!(whole.tokens, 65);
+    }
+
+    // The total credit for N output bytes is `N + floor(N / 64)` however the
+    // N bytes are split into calls.
+    #[test]
+    fn budget_credit_does_not_depend_on_read_splitting() {
+        for total in [1u64, 63, 64, 65, 1000, 12_345, 64 * 1024 + 17] {
+            let expected = total + total / 64;
+            for chunk in [1u64, 7, 64, 4096, 64 * 1024, total] {
+                let mut budget = drained_budget();
+                let mut left = total;
+                while left > 0 {
+                    let step = chunk.min(left);
+                    budget.credit_output(step);
+                    left -= step;
+                }
+                assert_eq!(budget.tokens, expected, "total={total} chunk={chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn budget_credit_never_exceeds_the_cap() {
+        let mut budget = CompressedInputBudget::new();
+        budget.credit_output(1);
+        assert_eq!(budget.tokens, INPUT_BUDGET_CAP);
+
+        let mut budget = drained_budget();
+        budget.credit_output(INPUT_BUDGET_CAP);
+        assert_eq!(budget.tokens, INPUT_BUDGET_CAP);
+
+        // Huge output, repeatedly: still exactly the cap (no banking).
+        for _ in 0..3 {
+            budget.credit_output(1 << 40);
+            assert_eq!(budget.tokens, INPUT_BUDGET_CAP);
+        }
+    }
+
+    #[test]
+    fn budget_credit_is_overflow_safe() {
+        let mut budget = drained_budget();
+        budget.credit_output(u64::MAX);
+        assert_eq!(budget.tokens, INPUT_BUDGET_CAP);
+        assert_eq!(budget.credit_remainder, u64::MAX % 64);
+
+        budget.credit_output(u64::MAX);
+        assert_eq!(budget.tokens, INPUT_BUDGET_CAP);
+        assert!(budget.credit_remainder < 64);
+
+        let mut zero = drained_budget();
+        zero.credit_output(0);
+        assert_eq!(zero, drained_budget());
+    }
+
+    #[test]
+    fn budget_charge_is_exact_and_never_wraps() {
+        let mut exact = CompressedInputBudget::new();
+        assert!(exact.try_charge_input(INPUT_BUDGET_CAP));
+        assert_eq!(exact.tokens, 0);
+        assert!(exact.try_charge_input(0));
+
+        let mut over = CompressedInputBudget::new();
+        assert!(!over.try_charge_input(INPUT_BUDGET_CAP + 1));
+        assert_eq!(
+            over.tokens, INPUT_BUDGET_CAP,
+            "a refused charge changes nothing"
+        );
+
+        let mut huge = CompressedInputBudget::new();
+        assert!(!huge.try_charge_input(u64::MAX));
+        assert_eq!(huge.tokens, INPUT_BUDGET_CAP);
+    }
+
+    fn budget_error(result: io::Result<()>) -> PreflightError {
+        classify_error(result.unwrap_err())
+    }
+
+    // Exactly the balance is allowed; one byte more is refused, and reported
+    // as the typed budget error with the totals at that point.
+    #[test]
+    fn meter_allows_exactly_the_balance_and_refuses_one_more_byte() {
+        let mut meter = InputBudgetMeter::new();
+        meter.update(INPUT_BUDGET_CAP, 0).unwrap();
+
+        let mut meter = InputBudgetMeter::new();
+        let error = budget_error(meter.update(INPUT_BUDGET_CAP + 1, 0));
+        assert!(matches!(
+            error,
+            PreflightError::CompressedInputBudgetExceeded {
+                compressed_consumed,
+                logical_produced: 0,
+            } if compressed_consumed == INPUT_BUDGET_CAP + 1
+        ));
+
+        // With output: 64 KiB of output earns 65 KiB on top of the cap.
+        let mut meter = InputBudgetMeter::new();
+        let allowed = INPUT_BUDGET_CAP + 65 * 1024;
+        meter.update(INPUT_BUDGET_CAP, 0).unwrap();
+        meter.update(allowed, 64 * 1024).unwrap();
+        assert!(meter.update(allowed + 1, 64 * 1024).is_err());
+    }
+
+    // The core of the policy: a gigabyte of earlier output does not buy more
+    // than the cap of later input.
+    #[test]
+    fn meter_does_not_bank_past_output() {
+        // The 1 GiB of output is credited, but the balance stays capped, so
+        // the total input allowed is still exactly the cap.
+        let mut meter = InputBudgetMeter::new();
+        meter.update(1_000, 1 << 30).unwrap();
+        meter.update(INPUT_BUDGET_CAP, 1 << 30).unwrap();
+        assert!(meter.update(INPUT_BUDGET_CAP + 1, 1 << 30).is_err());
+    }
+
+    // When cancellation and budget exhaustion coincide, cancellation wins.
+    #[test]
+    fn cancellation_takes_priority_over_budget_exhaustion() {
+        let mut meter = InputBudgetMeter::new();
+        let cancelled = preflight_check(true, &mut meter, INPUT_BUDGET_CAP + 1, 0);
+        assert!(matches!(budget_error(cancelled), PreflightError::Cancelled));
+
+        let mut meter = InputBudgetMeter::new();
+        let exceeded = preflight_check(false, &mut meter, INPUT_BUDGET_CAP + 1, 0);
+        assert!(matches!(
+            budget_error(exceeded),
+            PreflightError::CompressedInputBudgetExceeded { .. }
+        ));
+    }
+
+    // ---------------------------------------------------------------------
+    // Compressed Input Budget: real gzip streams through the production path.
+    // ---------------------------------------------------------------------
+
+    fn gzip_at(payload: &[u8], level: u32) -> Vec<u8> {
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::new(level));
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn pseudo_random(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    fn assert_budget_exceeded(tag: &str, contents: &[u8]) -> (u64, u64) {
+        let (result, reports) = preflight_contents(tag, contents, NO_LIMIT);
+        let (consumed, logical) = match result {
+            Err(PreflightError::CompressedInputBudgetExceeded {
+                compressed_consumed,
+                logical_produced,
+            }) => (compressed_consumed, logical_produced),
+            other => panic!("{tag}: expected CompressedInputBudgetExceeded, got {other:?}"),
+        };
+        // A refused image never gets the final "complete" progress report.
+        assert!(
+            reports
+                .iter()
+                .all(|report| report.compressed_consumed < contents.len() as u64),
+            "{tag}: a success-looking final report was emitted"
+        );
+        (consumed, logical)
+    }
+
+    #[test]
+    fn budget_accepts_ordinary_gzip_at_every_level() {
+        let random = pseudo_random(1 << 20, 11);
+        let zeros = vec![0u8; 4 << 20];
+        let text = payload_b().repeat(100);
+
+        for level in [0, 1, 6, 9] {
+            for (name, payload) in [("random", &random), ("zeros", &zeros), ("text", &text)] {
+                let (result, _) = preflight_contents(
+                    &format!("budget-{name}-{level}"),
+                    &gzip_at(payload, level),
+                    NO_LIMIT,
+                );
+                assert_eq!(
+                    result.unwrap().logical_size(),
+                    payload.len() as u64,
+                    "{name} level {level}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn budget_accepts_small_gzip_files() {
+        for size in [0usize, 1, 100, 1024, 64 * 1024] {
+            let payload = pseudo_random(size, 3);
+            let (result, _) = preflight_contents(
+                &format!("budget-small-{size}"),
+                &gzip_at(&payload, 6),
+                NO_LIMIT,
+            );
+            assert_eq!(result.unwrap().logical_size(), size as u64);
+        }
+    }
+
+    #[test]
+    fn budget_accepts_realistic_multi_member_files() {
+        let text_member = gzip_at(&payload_b()[..4096], 6);
+        let random_member = gzip_at(&pseudo_random(4096, 9), 6);
+        let empty = gzip_at(&[], 6);
+
+        let mut mixed = Vec::new();
+        for _ in 0..1000 {
+            mixed.extend_from_slice(&text_member);
+            mixed.extend_from_slice(&empty);
+            mixed.extend_from_slice(&random_member);
+        }
+        let (result, _) = preflight_contents("budget-multi", &mixed, NO_LIMIT);
+        assert_eq!(result.unwrap().logical_size(), 1000 * 2 * 4096);
+    }
+
+    // Consecutive 1-byte members: each costs ~21 compressed bytes for one
+    // output byte, so a long enough run exhausts the budget (a documented
+    // false rejection of valid gzip). 10,000 and 50,000 pass; 100,000 is
+    // refused after roughly 50,000 members.
+    #[test]
+    fn budget_tiny_member_runs_pass_up_to_the_documented_boundary() {
+        let one = gzip_at(b"x", 6);
+
+        for count in [10_000usize, 50_000] {
+            let (result, _) = preflight_contents(
+                &format!("budget-tiny-{count}"),
+                &one.repeat(count),
+                NO_LIMIT,
+            );
+            assert_eq!(result.unwrap().logical_size(), count as u64);
+        }
+
+        let (consumed, logical) = assert_budget_exceeded("budget-tiny-100k", &one.repeat(100_000));
+        assert!(
+            (50_000..60_000).contains(&logical),
+            "refused after {logical} members"
+        );
+        assert!(consumed <= INPUT_BUDGET_CAP + logical + logical / 64 + INPUT_BUFFER_LEN as u64);
+    }
+
+    // P1: a long run of empty members is refused within the cap plus one
+    // input buffer, before any output.
+    #[test]
+    fn budget_refuses_a_run_of_empty_members() {
+        let mut contents = gzip_at(&[], 6).repeat(80_000);
+        contents.extend_from_slice(&gzip_at(b"x", 6));
+
+        let (consumed, logical) = assert_budget_exceeded("budget-p1", &contents);
+        assert_eq!(logical, 0);
+        assert!(consumed > INPUT_BUDGET_CAP);
+        assert!(consumed <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64);
+    }
+
+    // P2: one member made of empty stored blocks is refused the same way.
+    #[test]
+    fn budget_refuses_a_run_of_empty_stored_blocks() {
+        let mut member = vec![0x1F, 0x8B, 8, 0, 0, 0, 0, 0, 0, 0xFF];
+        for _ in 0..400_000 {
+            member.extend_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0xFF]);
+        }
+        member.extend_from_slice(&[0x01, 0x01, 0x00, 0xFE, 0xFF, b'x']);
+        let mut crc = flate2::Crc::new();
+        crc.update(b"x");
+        member.extend_from_slice(&crc.sum().to_le_bytes());
+        member.extend_from_slice(&1u32.to_le_bytes());
+
+        let (consumed, logical) = assert_budget_exceeded("budget-p2", &member);
+        assert_eq!(logical, 0);
+        assert!(consumed <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64);
+    }
+
+    // P3: sprinkling single output bytes between runs of empty members earns
+    // almost nothing and does not keep the stream alive.
+    #[test]
+    fn budget_refuses_empty_member_runs_interleaved_with_output() {
+        let one = gzip_at(b"x", 6);
+        let empty_run = gzip_at(&[], 6).repeat(3_000);
+        let mut contents = Vec::new();
+        for _ in 0..100 {
+            contents.extend_from_slice(&one);
+            contents.extend_from_slice(&empty_run);
+        }
+
+        let (consumed, logical) = assert_budget_exceeded("budget-p3", &contents);
+        assert!(logical < 100);
+        assert!(consumed <= INPUT_BUDGET_CAP + logical * 2 + INPUT_BUFFER_LEN as u64);
+    }
+
+    // BANK: many megabytes of highly compressible output first (earning far
+    // more than the cap), then a long run of empty members. Because the
+    // balance is capped, the run is refused within the cap -- the earlier
+    // output was not banked.
+    #[test]
+    fn budget_refuses_empty_members_after_banking_attempt() {
+        let zeros = vec![0u8; 16 << 20];
+        let bank = gzip_at(&zeros, 9);
+        let mut contents = bank.clone();
+        contents.extend_from_slice(&gzip_at(&[], 6).repeat(80_000));
+        contents.extend_from_slice(&gzip_at(b"x", 6));
+
+        let (consumed, logical) = assert_budget_exceeded("budget-bank", &contents);
+        assert_eq!(
+            logical,
+            zeros.len() as u64,
+            "all banked output was produced first"
+        );
+        let spent_after_bank = consumed - bank.len() as u64;
+        assert!(
+            spent_after_bank <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64,
+            "spent {spent_after_bank} after the bank: earlier output was banked"
+        );
+    }
+
+    // Cancellation still works with the budget in place, and wins when it
+    // lands on the very check where the budget would have been exceeded.
+    #[test]
+    fn cancellation_wins_at_the_poll_where_the_budget_runs_out() {
+        let contents = gzip_at(&[], 6).repeat(60_000);
+
+        let polls = Cell::new(0u32);
+        let exceeded = preflight_gzip(
+            scripted(&contents, None),
+            contents.len() as u64,
+            NO_LIMIT,
+            &mut || {
+                polls.set(polls.get() + 1);
+                false
+            },
+            &mut |_| {},
+        );
+        assert!(matches!(
+            exceeded,
+            Err(PreflightError::CompressedInputBudgetExceeded { .. })
+        ));
+        let failing_poll = polls.get();
+
+        let polls = Cell::new(0u32);
+        let cancelled = preflight_gzip(
+            scripted(&contents, None),
+            contents.len() as u64,
+            NO_LIMIT,
+            &mut || {
+                polls.set(polls.get() + 1);
+                polls.get() >= failing_poll
+            },
+            &mut |_| {},
+        );
+        assert!(matches!(cancelled, Err(PreflightError::Cancelled)));
+    }
+
+    // The logical-size limit is a separate check and keeps its own error.
+    #[test]
+    fn logical_size_limit_is_independent_of_the_budget() {
+        let zeros = vec![0u8; 4 << 20];
+        let options = PreflightOptions {
+            max_logical_size: (1 << 20) - 1,
+        };
+        let (result, _) = preflight_contents("budget-vs-limit", &gzip_at(&zeros, 9), options);
+        assert!(matches!(
+            result,
+            Err(PreflightError::LogicalSizeLimitExceeded { limit }) if limit == (1 << 20) - 1
         ));
     }
 }

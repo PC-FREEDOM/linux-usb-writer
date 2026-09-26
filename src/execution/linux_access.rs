@@ -28,13 +28,88 @@ use zbus::{
 
 use crate::linux_backend::decode_device_number;
 
+// Why OpenDevice did not return a file descriptor. Classified only by the
+// D-Bus error name (a fixed, locale-independent identifier), never by the
+// message text. For display, diagnostics and logging only: no safety
+// decision depends on which variant this is, and a failed open is never
+// retried -- in particular never without O_EXCL.
+//
 // Fields are read only via the derived Debug impl (rustc's dead-code lint
 // doesn't count that as a use), which is how call sites report the failure.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub enum OpenDeviceError {
-    ConnectionFailed(String),
-    CallFailed(String),
+    // The system bus could not be reached.
+    Connection(String),
+    // polkit did not authorize the open.
+    NotAuthorized(AuthorizationDenial),
+    // Any other D-Bus error reply. This includes UDisks2's generic
+    // org.freedesktop.UDisks2.Error.Failed, which is how the open(2) failure
+    // itself is reported -- EBUSY from O_EXCL (the device is in use), EIO,
+    // ENOENT, ... all alike. UDisks2 does not return the errno, only a
+    // message with its text, so the cause is not classified further.
+    Rejected {
+        name: String,
+        message: Option<String>,
+    },
+    // A failure that is not a D-Bus error reply (the connection was lost, the
+    // reply could not be read, ...).
+    Transport(String),
+}
+
+// The three authorization errors UDisks2 defines (udisksenums.h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthorizationDenial {
+    // org.freedesktop.UDisks2.Error.NotAuthorized
+    NotAuthorized,
+    // org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain: authorization is
+    // possible, e.g. by authenticating, but was not obtained.
+    CanObtain,
+    // org.freedesktop.UDisks2.Error.NotAuthorizedDismissed: an
+    // authentication prompt was shown and dismissed.
+    Dismissed,
+}
+
+// Exact error-name match only; any other name is not an authorization error.
+fn authorization_denial(error_name: &str) -> Option<AuthorizationDenial> {
+    match error_name {
+        "org.freedesktop.UDisks2.Error.NotAuthorized" => Some(AuthorizationDenial::NotAuthorized),
+        "org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain" => {
+            Some(AuthorizationDenial::CanObtain)
+        }
+        "org.freedesktop.UDisks2.Error.NotAuthorizedDismissed" => {
+            Some(AuthorizationDenial::Dismissed)
+        }
+        _ => None,
+    }
+}
+
+// A D-Bus error reply, by its name. The message is kept as it is, for
+// display only; it is never looked at here.
+fn error_reply(error_name: &str, message: Option<&str>) -> OpenDeviceError {
+    match authorization_denial(error_name) {
+        Some(denial) => OpenDeviceError::NotAuthorized(denial),
+        None => OpenDeviceError::Rejected {
+            name: error_name.to_string(),
+            message: message.map(str::to_string),
+        },
+    }
+}
+
+// zbus reports every D-Bus error reply as `Error::MethodError(name, detail,
+// reply)`; `Error::FDO` carries a standard org.freedesktop.DBus.Error.* one
+// that zbus has already decoded. Everything else is not a reply from the
+// service at all.
+fn open_device_error(error: zbus::Error) -> OpenDeviceError {
+    use zbus::DBusError;
+
+    match error {
+        zbus::Error::MethodError(name, message, _reply) => {
+            error_reply(name.as_str(), message.as_deref())
+        }
+        zbus::Error::FDO(error) => error_reply(error.name().as_str(), error.description()),
+        other => OpenDeviceError::Transport(other.to_string()),
+    }
 }
 
 pub struct OpenedDeviceHandle {
@@ -213,14 +288,15 @@ fn open_device_arguments(access: OpenAccess) -> (&'static str, HashMap<String, O
 // interactive authentication, this call simply blocks until the user's own
 // polkit agent (e.g. a graphical prompt) is answered or the request times
 // out/is denied. An exclusive open refused because the device is in use
-// fails here like any other open failure (`CallFailed`), before any FD
-// exists.
+// fails here like any other open failure (`OpenDeviceError::Rejected`),
+// before any FD exists. There is exactly one OpenDevice call: a failure is
+// returned as it is, never retried with other access or flags.
 pub fn open_device(
     block_path: &str,
     access: OpenAccess,
 ) -> Result<OpenedDeviceHandle, OpenDeviceError> {
-    let connection = Connection::system()
-        .map_err(|error| OpenDeviceError::ConnectionFailed(error.to_string()))?;
+    let connection =
+        Connection::system().map_err(|error| OpenDeviceError::Connection(error.to_string()))?;
 
     let block = Proxy::new(
         &connection,
@@ -228,13 +304,13 @@ pub fn open_device(
         block_path,
         "org.freedesktop.UDisks2.Block",
     )
-    .map_err(|error| OpenDeviceError::CallFailed(error.to_string()))?;
+    .map_err(open_device_error)?;
 
     let (mode, options) = open_device_arguments(access);
 
     let fd: zbus::zvariant::OwnedFd = block
         .call("OpenDevice", &(mode, options))
-        .map_err(|error| OpenDeviceError::CallFailed(error.to_string()))?;
+        .map_err(open_device_error)?;
 
     let std_fd: std::os::fd::OwnedFd = fd.into();
 
@@ -437,6 +513,169 @@ pub(crate) fn assert_fd_closed_for_test(raw_fd: RawFd, target_before_drop: Optio
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // A D-Bus error reply to an OpenDevice call, as zbus hands it to us
+    // (`Error::MethodError`, built from a real error message).
+    fn method_error(name: &str, message: &str) -> zbus::Error {
+        let call =
+            zbus::Message::method_call("/org/freedesktop/UDisks2/block_devices/sdx", "OpenDevice")
+                .unwrap()
+                .build(&())
+                .unwrap();
+        let reply = zbus::Message::error(&call.header(), name)
+            .unwrap()
+            .build(&(message,))
+            .unwrap();
+
+        let error = zbus::Error::from(reply);
+        assert!(matches!(error, zbus::Error::MethodError(..)));
+        error
+    }
+
+    // OpenDevice errors 1-3. The three UDisks2 authorization errors are told
+    // apart by their exact name.
+    #[test]
+    fn authorization_errors_are_classified_by_exact_name() {
+        let cases = [
+            (
+                "org.freedesktop.UDisks2.Error.NotAuthorized",
+                AuthorizationDenial::NotAuthorized,
+            ),
+            (
+                "org.freedesktop.UDisks2.Error.NotAuthorizedCanObtain",
+                AuthorizationDenial::CanObtain,
+            ),
+            (
+                "org.freedesktop.UDisks2.Error.NotAuthorizedDismissed",
+                AuthorizationDenial::Dismissed,
+            ),
+        ];
+
+        for (name, expected) in cases {
+            let error =
+                open_device_error(method_error(name, "Not authorized to perform operation"));
+
+            assert!(
+                matches!(error, OpenDeviceError::NotAuthorized(denial) if denial == expected),
+                "{name}: {error:?}"
+            );
+        }
+    }
+
+    // OpenDevice errors 4-7. UDisks2's generic Error.Failed, and any name not
+    // known here, are Rejected with the name and message kept as they are.
+    #[test]
+    fn other_error_replies_are_rejected_with_name_and_message() {
+        for (name, message) in [
+            (
+                "org.freedesktop.UDisks2.Error.Failed",
+                "Error opening device /dev/sdx: Input/output error",
+            ),
+            ("org.example.Unknown.Error", "something else"),
+        ] {
+            let error = open_device_error(method_error(name, message));
+
+            match error {
+                OpenDeviceError::Rejected {
+                    name: kept_name,
+                    message: kept_message,
+                } => {
+                    assert_eq!(kept_name, name);
+                    assert_eq!(kept_message.as_deref(), Some(message));
+                }
+                other => panic!("{name}: expected Rejected, got {other:?}"),
+            }
+        }
+    }
+
+    // A standard org.freedesktop.DBus.Error.* reply that zbus hands over
+    // already decoded (`Error::FDO`) keeps its name the same way.
+    #[test]
+    fn decoded_standard_error_replies_keep_their_name() {
+        let error = open_device_error(zbus::Error::FDO(Box::new(zbus::fdo::Error::AccessDenied(
+            "denied".to_string(),
+        ))));
+
+        assert!(matches!(
+            error,
+            OpenDeviceError::Rejected { ref name, ref message }
+                if name == "org.freedesktop.DBus.Error.AccessDenied"
+                    && message.as_deref() == Some("denied")
+        ));
+    }
+
+    // OpenDevice errors 8. A failure that is not an error reply is Transport.
+    #[test]
+    fn failures_other_than_error_replies_are_transport() {
+        for error in [
+            zbus::Error::InvalidReply,
+            zbus::Error::Failure("connection lost".to_string()),
+        ] {
+            assert!(matches!(
+                open_device_error(error),
+                OpenDeviceError::Transport(_)
+            ));
+        }
+    }
+
+    // OpenDevice errors 9. Only the name classifies: a message saying the
+    // device is busy (or even saying "not authorized") does not change an
+    // Error.Failed reply, and a name that merely starts like an
+    // authorization error is not one. There is no Busy classification.
+    #[test]
+    fn message_text_never_affects_the_classification() {
+        for message in [
+            "Error opening device /dev/sdx: Device or resource busy",
+            "Not authorized to perform operation",
+        ] {
+            let error = open_device_error(method_error(
+                "org.freedesktop.UDisks2.Error.Failed",
+                message,
+            ));
+            assert!(
+                matches!(error, OpenDeviceError::Rejected { ref name, .. }
+                    if name == "org.freedesktop.UDisks2.Error.Failed"),
+                "{message}: {error:?}"
+            );
+        }
+
+        let error = open_device_error(method_error(
+            "org.freedesktop.UDisks2.Error.NotAuthorizedLater",
+            "Not authorized",
+        ));
+        assert!(
+            matches!(error, OpenDeviceError::Rejected { .. }),
+            "{error:?}"
+        );
+    }
+
+    // OpenDevice errors 10. `open_device` makes exactly one OpenDevice call,
+    // with the arguments of the access it was given: a failed exclusive open
+    // is returned, never retried read-only or without O_EXCL. (main.rs fixes
+    // each call site's access separately.)
+    #[test]
+    fn open_device_calls_open_device_exactly_once_with_the_given_access() {
+        let source = include_str!("linux_access.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("tests module marker")];
+
+        assert_eq!(production.matches(".call(\"OpenDevice\"").count(), 1);
+        assert_eq!(production.matches("open_device_arguments(").count(), 2);
+
+        let start = production
+            .find("\npub fn open_device(")
+            .expect("open_device definition");
+        let end = start
+            + production[start..]
+                .find("\n}\n")
+                .expect("end of open_device");
+        let body = &production[start..end];
+
+        assert_eq!(body.matches("open_device_arguments(access)").count(), 1);
+        assert!(!body.contains("OpenAccess::"));
+        assert!(!body.contains("O_EXCL"));
+    }
 
     // OpenDevice arguments. The write FD is a read-write, exclusive open:
     // mode "rw" plus `flags` = O_EXCL as a D-Bus `i` (i32) -- and nothing

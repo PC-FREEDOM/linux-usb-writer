@@ -69,7 +69,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use flate2::bufread::MultiGzDecoder;
 
 use super::source_identity::{SourceChanged, SourceIdentity};
-use super::{CompressedImageFile, CompressionFormat, FileImageReader};
+use super::{
+    CompressedImageFile, CompressionFormat, FileImageReader, ImageSource, ImageSourceAccess,
+};
 
 // Capacity of the `BufReader` above the source cursor: how much compressed
 // data one positional read fetches.
@@ -205,6 +207,59 @@ impl PreflightedCompressedImage {
     // `read()` (any error surfaces there).
     pub fn replay(&self) -> StrictReplayReader {
         StrictReplayReader::new(&self.file, self.compressed_size, self.logical_size)
+    }
+}
+
+// A validated compressed image as an `ImageSource`: what the write and Verify
+// paths read from. A thin wrapper -- everything it provides comes from the
+// `PreflightedCompressedImage` it owns:
+//
+//   - `logical_size()` is the decoded size Preflight measured, never the
+//     compressed file's size;
+//   - `open_reader()` is a fresh `replay()` (a `StrictReplayReader` from
+//     logical byte 0, over the same open file, with its own position), so
+//     the write and a later Full Verify each decode independently;
+//   - `access()` is `SequentialReplay`: a gzip stream cannot be read at an
+//     arbitrary offset without decoding everything before it, so `read_at`
+//     keeps the trait's `Unsupported` default and Quick Verify refuses this
+//     source;
+//   - `revalidate_identity()` checks against the snapshot `open_image` took,
+//     which Preflight did not refresh.
+//
+// Not `Clone`, like the value it wraps.
+#[derive(Debug)]
+pub struct CompressedImageSource {
+    preflighted: PreflightedCompressedImage,
+}
+
+impl CompressedImageSource {
+    pub fn new(preflighted: PreflightedCompressedImage) -> Self {
+        CompressedImageSource { preflighted }
+    }
+
+    // For display only, like `FileImageSource::path()`.
+    pub fn path(&self) -> &Path {
+        self.preflighted.path()
+    }
+}
+
+impl ImageSource for CompressedImageSource {
+    fn logical_size(&self) -> u64 {
+        self.preflighted.logical_size()
+    }
+
+    fn access(&self) -> ImageSourceAccess {
+        ImageSourceAccess::SequentialReplay
+    }
+
+    // Replay errors keep their typed payloads inside the `io::Error` (see
+    // `StrictReplayReader`); nothing here re-wraps them.
+    fn open_reader(&self) -> io::Result<Box<dyn Read>> {
+        Ok(Box::new(self.preflighted.replay()))
+    }
+
+    fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+        self.preflighted.revalidate_identity()
     }
 }
 
@@ -2553,5 +2608,188 @@ mod tests {
                 let _ = std::fs::remove_file(leftover);
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // CompressedImageSource: a validated gzip image through `ImageSource`.
+    // ---------------------------------------------------------------------
+
+    fn compressed_source(tag: &str, contents: &[u8]) -> (CompressedImageSource, PathBuf) {
+        let (image, path) = preflighted(tag, contents);
+        (CompressedImageSource::new(image), path)
+    }
+
+    // Reads a boxed reader to its end, the way `writer::write` and Full
+    // Verify consume `open_reader()`.
+    fn read_boxed(reader: &mut dyn Read) -> (Vec<u8>, Result<(), (io::ErrorKind, ReplayFailure)>) {
+        let mut delivered = Vec::new();
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => return (delivered, Ok(())),
+                Ok(n) => delivered.extend_from_slice(&buf[..n]),
+                Err(error) => {
+                    assert_ne!(error.kind(), io::ErrorKind::Interrupted);
+                    return (delivered, Err((error.kind(), ReplayFailure::of(&error))));
+                }
+            }
+        }
+    }
+
+    // A, B, C: built from a Preflighted image; reports the decoded size (not
+    // the compressed size); a reader yields the whole payload.
+    #[test]
+    fn compressed_source_reports_the_logical_size_and_reads_the_payload() {
+        let a = payload_a();
+        let member = gzip_member(&a);
+        let (source, path) = compressed_source("source-basic", &member);
+
+        assert_eq!(source.logical_size(), a.len() as u64);
+        assert_ne!(source.logical_size(), member.len() as u64);
+        assert_eq!(source.path(), path.as_path());
+
+        let (delivered, end) = read_boxed(&mut *source.open_reader().unwrap());
+        assert_eq!(end, Ok(()));
+        assert_eq!(delivered, a);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // D, E: every `open_reader()` starts at logical byte 0 with its own
+    // position -- a reader left half-read does not affect the next one, and
+    // a second full read (as Full Verify would do after the write) decodes
+    // the same payload again.
+    #[test]
+    fn compressed_source_readers_are_independent() {
+        let (a, b) = (payload_a(), payload_b());
+        let expected = [a.clone(), b.clone()].concat();
+        let (source, path) = compressed_source(
+            "source-independent",
+            &[gzip_member(&a), gzip_member(&b)].concat(),
+        );
+
+        let mut first = source.open_reader().unwrap();
+        let mut head = vec![0u8; 1000];
+        first.read_exact(&mut head).unwrap();
+        assert_eq!(head, expected[..1000]);
+
+        let (write_pass, end) = read_boxed(&mut *source.open_reader().unwrap());
+        assert_eq!(end, Ok(()));
+        assert_eq!(write_pass, expected);
+
+        let (verify_pass, end) = read_boxed(&mut *source.open_reader().unwrap());
+        assert_eq!(end, Ok(()));
+        assert_eq!(verify_pass, expected);
+
+        let (rest, end) = read_boxed(&mut *first);
+        assert_eq!(end, Ok(()));
+        assert_eq!(rest, expected[1000..]);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // F, G, H: after rename or path replacement, readers still decode the
+    // opened file (never the replacement), and the source reports the change.
+    #[test]
+    fn compressed_source_keeps_the_opened_file_and_reports_path_operations() {
+        type Operation = fn(&Path);
+        let operations: [(&str, Operation); 2] = [
+            ("rename", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+            }),
+            ("replace", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+                std::fs::write(path, gzip_member(b"a different image")).unwrap();
+            }),
+        ];
+        let a = payload_a();
+
+        for (name, operate) in operations {
+            let (source, path) = compressed_source(&format!("source-{name}"), &gzip_member(&a));
+
+            let_the_clock_tick();
+            operate(&path);
+
+            let (delivered, end) = read_boxed(&mut *source.open_reader().unwrap());
+            assert_eq!(end, Ok(()), "{name}");
+            assert_eq!(delivered, a, "{name}: still the opened file");
+            assert!(source_changed(source.revalidate_identity()), "{name}");
+
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("moved"));
+        }
+    }
+
+    // I: unchanged, the source revalidates; changed after Preflight, it
+    // reports the change against the open-time snapshot.
+    #[test]
+    fn compressed_source_revalidates_against_the_open_time_snapshot() {
+        let member = gzip_member(&payload_a());
+        let (source, path) = compressed_source("source-identity", &member);
+        for _ in 0..3 {
+            source.revalidate_identity().unwrap();
+        }
+
+        let_the_clock_tick();
+        rewrite_in_place(&path, &member);
+        assert!(source_changed(source.revalidate_identity()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // J: the strict end-of-stream contract holds through `open_reader()`: a
+    // damaged CRC or ISIZE withholds the final bytes and fails with the typed
+    // category, as with `replay()` directly.
+    #[test]
+    fn compressed_source_readers_keep_the_strict_end_of_stream() {
+        let a = payload_a();
+        for (label, offset_from_end) in [("crc", 8u64), ("isize", 4u64)] {
+            let (source, path) = compressed_source(&format!("source-{label}"), &gzip_member(&a));
+            flip_byte_in_place(&path, offset_from_end);
+
+            let mut reader = source.open_reader().unwrap();
+            let (delivered, end) = read_boxed(&mut *reader);
+            assert!(delivered.len() < a.len(), "{label}: final bytes withheld");
+            assert_eq!(
+                end,
+                Err((io::ErrorKind::InvalidInput, ReplayFailure::Corrupt)),
+                "{label}"
+            );
+            let error = reader.read(&mut [0u8; 16]).unwrap_err();
+            assert_eq!(ReplayFailure::of(&error), ReplayFailure::Corrupt, "{label}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // K (known limitation, not solved here): a same-size rewrite into a
+    // different valid gzip stream of the same decoded size replays cleanly --
+    // replay alone cannot tell. Only the Source Identity checkpoints report
+    // it.
+    #[test]
+    fn compressed_source_same_size_valid_rewrite_is_caught_only_by_identity() {
+        let original = gzip_at(&vec![0x11u8; 4096], 0);
+        let rewritten = gzip_at(&vec![0x22u8; 4096], 0);
+        assert_eq!(original.len(), rewritten.len());
+        let (source, path) = compressed_source("source-same-size", &original);
+
+        let_the_clock_tick();
+        rewrite_in_place(&path, &rewritten);
+
+        let (delivered, end) = read_boxed(&mut *source.open_reader().unwrap());
+        assert_eq!(end, Ok(()));
+        assert_eq!(
+            delivered,
+            vec![0x22u8; 4096],
+            "the replay reads the new bytes"
+        );
+        assert!(source_changed(source.revalidate_identity()));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // L: sequential replay only -- no random access.
+    #[test]
+    fn compressed_source_is_sequential_replay_only() {
+        let (source, path) = compressed_source("source-access", &gzip_member(&payload_a()));
+        assert_eq!(source.access(), ImageSourceAccess::SequentialReplay);
+        let error = source.read_at(0, &mut [0u8; 16]).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let _ = std::fs::remove_file(&path);
     }
 }

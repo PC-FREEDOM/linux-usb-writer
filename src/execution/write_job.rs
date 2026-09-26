@@ -2836,13 +2836,29 @@ mod tests {
         verify_mode: VerifyMode,
         cancel: CancelHandle,
     ) -> (std::path::PathBuf, WritingExecution, DeviceSnapshot) {
+        let source = FileImageSource::new(source_path).expect("open source image for verify test");
+        gate_pass_writing_execution_for_image(
+            tag,
+            SelectedImage::new(Box::new(source)),
+            target_size,
+            verify_mode,
+            cancel,
+        )
+    }
+
+    // The same, for any already-built `SelectedImage` (e.g. a compressed
+    // source).
+    fn gate_pass_writing_execution_for_image(
+        tag: &str,
+        selected_image: SelectedImage,
+        target_size: u64,
+        verify_mode: VerifyMode,
+        cancel: CancelHandle,
+    ) -> (std::path::PathBuf, WritingExecution, DeviceSnapshot) {
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-
-        let source = FileImageSource::new(source_path).expect("open source image for verify test");
-        let selected_image = SelectedImage::new(Box::new(source));
 
         let snapshot = base_device(target_size);
         let state = core::select(snapshot.clone()).unwrap();
@@ -4702,6 +4718,88 @@ mod tests {
 
             let _ = std::fs::remove_file(&target_path);
             remove_source_files(&path);
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // A Preflighted gzip image through the existing write / Verify path
+    // (`CompressedImageSource`; not wired into `main.rs`).
+    // ---------------------------------------------------------------------
+
+    fn gzip_selected_image(tag: &str, payload: &[u8]) -> (SelectedImage, std::path::PathBuf) {
+        use crate::image_source::compressed::{CompressedImageSource, PreflightOptions};
+        use crate::image_source::{OpenedImage, open_image};
+        use std::io::Write as _;
+
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        let path = write_temp_image_file(tag, &encoder.finish().unwrap());
+        let path = {
+            let gz = path.with_extension("img.gz");
+            std::fs::rename(&path, &gz).unwrap();
+            gz
+        };
+
+        let compressed = match open_image(&path) {
+            Ok(OpenedImage::Compressed(file)) => file,
+            other => panic!("expected a compressed image, got {other:?}"),
+        };
+        let options = PreflightOptions {
+            max_logical_size: u64::MAX,
+        };
+        let preflighted = compressed.preflight(options, || false, |_| {}).unwrap();
+        let source = CompressedImageSource::new(preflighted);
+        (SelectedImage::new(Box::new(source)), path)
+    }
+
+    // The write reads one replay; Full Verify opens a second, independent
+    // replay from logical byte 0 and matches. Quick is refused (the source is
+    // sequential only), after the same write.
+    #[test]
+    fn gzip_source_writes_and_full_verifies_through_the_existing_path() {
+        let payload = patterned_data(writer::DEFAULT_CHUNK_SIZE * 2 + 777);
+
+        for mode in [VerifyMode::Full, VerifyMode::Quick] {
+            let context = format!("{mode:?}");
+            let (image, path) = gzip_selected_image(&format!("gzip-{mode:?}"), &payload);
+            assert_eq!(image.logical_size(), payload.len() as u64);
+            assert_eq!(image.access(), ImageSourceAccess::SequentialReplay);
+
+            let (target_path, writing_execution, snapshot) = gate_pass_writing_execution_for_image(
+                &format!("gzip-{mode:?}"),
+                image,
+                payload.len() as u64,
+                mode,
+                CancelHandle::new(),
+            );
+            let (image, sync_succeeded) = write_and_sync(writing_execution, &context);
+            assert_eq!(std::fs::read(&target_path).unwrap(), payload, "{context}");
+
+            let verifying = verifying_from_sync_succeeded(
+                sync_succeeded,
+                image,
+                CancelHandle::new(),
+                &snapshot,
+                &target_path,
+            );
+            let (_image, outcome) = verifying.run(|_| {});
+            match (mode, outcome) {
+                (VerifyMode::Full, VerifyOutcome::Succeeded(succeeded)) => {
+                    assert_eq!(succeeded.verified_bytes, payload.len() as u64);
+                }
+                (VerifyMode::Quick, VerifyOutcome::Failed(failed)) => {
+                    assert!(
+                        matches!(failed.reason, VerifyFailureReason::UnsupportedAccess),
+                        "{:?}",
+                        failed.reason
+                    );
+                    assert_eq!(failed.verified_bytes, 0);
+                }
+                (_, other) => panic!("{context}: unexpected outcome {other:?}"),
+            }
+
+            let _ = std::fs::remove_file(&target_path);
+            let _ = std::fs::remove_file(&path);
         }
     }
 }

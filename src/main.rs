@@ -906,7 +906,7 @@ fn pause_before_verify_for_test() -> bool {
 // string accepted with no safety checks. `image_path` is opened by
 // `image_source::open_image()` exactly once; the source built from that
 // open file (a `FileImageSource` for a raw image, a `CompressedImageSource`
-// for a validated gzip image) becomes the `SelectedImage` (`selected_image`
+// for a validated gzip or xz image) becomes the `SelectedImage` (`selected_image`
 // below), held by this one variable, unchanged, from that point until it is
 // moved into `AuthorizedExecution::bind()` -- it is never re-opened, never
 // reconstructed, and no second source/`SelectedImage` is ever created for
@@ -961,7 +961,7 @@ fn run_write_test(
 
     // Cancel wiring (Ctrl+C -> CancelHandle): one shared handle, created and
     // wired to Ctrl+C as soon as target selection has succeeded -- before
-    // the image is opened, so image preparation (including a gzip image's
+    // the image is opened, so image preparation (including a compressed image's
     // Preflight, which receives a `|| cancel.is_requested()` closure rather
     // than the handle itself) is covered. Ctrl+C during argument parsing or
     // device enumeration (above) keeps its ordinary "just terminate the
@@ -991,21 +991,12 @@ fn run_write_test(
     //
     // Every refusal here happens before the target is opened. A refusal or
     // failure returns `Completed`, exactly like the pre-existing image-open
-    // failure path; a cancellation during a gzip image's Preflight returns
+    // failure path; a cancellation during a compressed image's Preflight returns
     // `Cancelled` (exit 130), like every other cancellation.
     let source: Box<dyn image_source::ImageSource> = match image_source::open_image(&image_path) {
         Ok(image_source::OpenedImage::Raw(source)) => Box::new(source),
-        Ok(image_source::OpenedImage::Compressed(compressed))
-            if compressed.format() != image_source::CompressionFormat::Gzip =>
-        {
-            // Recognized xz: never written as raw, and not supported yet.
-            for line in format_compressed_image_not_supported_yet(compressed.format()) {
-                println!("write-test: {line}");
-            }
-            return Ok(WriteTestExit::Completed);
-        }
         Ok(image_source::OpenedImage::Compressed(compressed)) => {
-            // gzip: validated end to end (Preflight) before anything else,
+            // gzip or xz, alike: validated end to end (Preflight) before anything else,
             // with the decoded size bounded by the target's capacity, so the
             // confirmation below shows the exact image size and an image
             // that cannot be written is refused before the target is opened.
@@ -2049,18 +2040,6 @@ fn format_cancelled_after_sync() -> Vec<String> {
     ]
 }
 
-// Shown when `open_image` recognized the image as gzip/xz. Such an image is
-// never written as raw bytes; decompressing it is not implemented yet.
-fn format_compressed_image_not_supported_yet(
-    format: image_source::CompressionFormat,
-) -> Vec<String> {
-    vec![
-        format!("detected format: {} (compressed image)", format.name()),
-        "writing compressed images is not supported yet; the image was not written.".to_string(),
-        "the target device has not been opened or modified.".to_string(),
-    ]
-}
-
 // Why a compressed image was not accepted for writing. Every case stops
 // before the target is opened.
 #[derive(Debug)]
@@ -2164,9 +2143,6 @@ fn format_compressed_image_rejected(rejection: &CompressedImageRejection) -> Vec
                 "the compressed image needs too much input per byte of output (refused as a resource limit)".to_string()
             }
             PreflightError::Io(error) => format!("failed to read the compressed image: {error}"),
-            PreflightError::UnsupportedFormat(format) => {
-                format!("{} images are not supported yet", format.name())
-            }
         },
         CompressedImageRejection::SourceChanged(changed) => changed.to_string(),
     };
@@ -2357,10 +2333,9 @@ mod tests {
     use super::confirmation_matches;
     use super::{
         OffMainThread, PromptInput, WriteTestArgsError, WriteTestExit, exit_after_successful_sync,
-        format_cancelled_after_sync, format_cancelled_before_confirmation,
-        format_compressed_image_not_supported_yet, format_hard_hazards, format_identity_comparison,
-        format_image_format_rejected, format_instance_comparison, format_sync_worker_panicked,
-        format_verify_cancelled, format_verify_cancelled_before_start,
+        format_cancelled_after_sync, format_cancelled_before_confirmation, format_hard_hazards,
+        format_identity_comparison, format_image_format_rejected, format_instance_comparison,
+        format_sync_worker_panicked, format_verify_cancelled, format_verify_cancelled_before_start,
         format_verify_diagnostics_summary, format_verify_diagnostics_unavailable,
         format_verify_failure_reason, format_verify_succeeded, format_write_cancelled,
         parse_verify_mode, parse_write_test_trailing_args, run_off_main_thread,
@@ -2941,27 +2916,6 @@ mod tests {
     // Image format refusals (XZ/GZIP Phase 1): pure formatters only.
     // ---------------------------------------------------------------------
 
-    // F1. A recognized gzip/xz image names the detected format, says it was
-    // not written, and that the target was not touched.
-    #[test]
-    fn format_compressed_image_not_supported_yet_names_format_and_target_state() {
-        for (format, name) in [
-            (crate::image_source::CompressionFormat::Gzip, "gzip"),
-            (crate::image_source::CompressionFormat::Xz, "xz"),
-        ] {
-            let lines = format_compressed_image_not_supported_yet(format);
-            assert_eq!(
-                lines[0],
-                format!("detected format: {name} (compressed image)")
-            );
-            assert!(lines.iter().any(|line| line.contains("was not written")));
-            assert_eq!(
-                lines.last().unwrap(),
-                "the target device has not been opened or modified."
-            );
-        }
-    }
-
     // F2. An unsupported format names the format and says it was not treated
     // as raw; the target was not touched.
     #[test]
@@ -3519,6 +3473,277 @@ mod tests {
             matches!(result, Err(CompressedImageRejection::SourceChanged(_))),
             "{result:?}"
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // xz preparation: the same `prepare_compressed_image` as gzip -- the
+    // format only picks the decoder inside Preflight.
+    // ---------------------------------------------------------------------
+
+    // A temporary `.img.xz` file, removed when dropped.
+    struct TempXz(std::path::PathBuf);
+
+    impl Drop for TempXz {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn xz_bytes(payload: &[u8], check: liblzma::stream::Check) -> Vec<u8> {
+        use std::io::Write as _;
+        let stream = liblzma::stream::Stream::new_easy_encoder(0, check).unwrap();
+        let mut encoder = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn crc64_xz(payload: &[u8]) -> Vec<u8> {
+        xz_bytes(payload, liblzma::stream::Check::Crc64)
+    }
+
+    fn temp_xz(tag: &str, contents: &[u8]) -> TempXz {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-main-test-{tag}-{}-{id}.img.xz",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        TempXz(path)
+    }
+
+    fn open_xz(file: &TempXz) -> CompressedImageFile {
+        match open_image(&file.0) {
+            Ok(OpenedImage::Compressed(compressed)) => {
+                assert_eq!(
+                    compressed.format(),
+                    crate::image_source::CompressionFormat::Xz
+                );
+                compressed
+            }
+            other => panic!("expected a compressed image, got {other:?}"),
+        }
+    }
+
+    fn prepare_xz(
+        tag: &str,
+        contents: &[u8],
+        mode: VerifyMode,
+        limit: u64,
+    ) -> Result<crate::image_source::compressed::CompressedImageSource, CompressedImageRejection>
+    {
+        let file = temp_xz(tag, contents);
+        prepare_compressed_image(open_xz(&file), mode, limit, || false, |_| {})
+    }
+
+    // Rewrites a single stream's Check ID (header and footer, CRC32s
+    // recomputed; same check-field size) or its first Block's LZMA2
+    // dictionary byte (Block Header CRC32 recomputed). Fixed .xz offsets of
+    // a stream this test just encoded.
+    fn xz_patched(stream: &[u8], check_id: Option<u8>, dictionary_byte: Option<u8>) -> Vec<u8> {
+        let crc32 = |bytes: &[u8]| {
+            let mut crc = flate2::Crc::new();
+            crc.update(bytes);
+            crc.sum().to_le_bytes()
+        };
+        let mut patched = stream.to_vec();
+        if let Some(id) = check_id {
+            let footer = patched.len() - 12;
+            patched[7] = id;
+            patched[footer + 9] = id;
+            let header_crc = crc32(&patched[6..8]);
+            patched[8..12].copy_from_slice(&header_crc);
+            let footer_crc = crc32(&patched[footer + 4..footer + 10]);
+            patched[footer..footer + 4].copy_from_slice(&footer_crc);
+        }
+        if let Some(byte) = dictionary_byte {
+            let header_len = (patched[12] as usize + 1) * 4;
+            assert_eq!(&patched[13..16], &[0x00, 0x21, 0x01], "one LZMA2 filter");
+            patched[16] = byte;
+            let crc_at = 12 + header_len - 4;
+            let crc = crc32(&patched[12..crc_at]);
+            patched[crc_at..crc_at + 4].copy_from_slice(&crc);
+        }
+        patched
+    }
+
+    // None and Full: a single stream, and concatenated streams with Stream
+    // Padding, are validated to their exact decoded size; the source is the
+    // same sequential-replay `CompressedImageSource` gzip produces.
+    #[test]
+    fn prepare_compressed_image_accepts_valid_xz_for_none_and_full() {
+        let data = payload();
+        let (half_a, half_b) = data.split_at(data.len() / 2);
+        let single = xz_bytes(&data, liblzma::stream::Check::Sha256);
+        let concatenated = [
+            crc64_xz(half_a),
+            vec![0u8; 8],
+            xz_bytes(half_b, liblzma::stream::Check::Crc32),
+            vec![0u8; 4],
+        ]
+        .concat();
+
+        for (name, compressed) in [("single", &single), ("concatenated", &concatenated)] {
+            for mode in [VerifyMode::None, VerifyMode::Full] {
+                let file = temp_xz(&format!("prepare-xz-{name}"), compressed);
+                let mut last = None;
+                let source = prepare_compressed_image(
+                    open_xz(&file),
+                    mode,
+                    data.len() as u64,
+                    || false,
+                    |progress| last = Some(progress),
+                )
+                .unwrap_or_else(|rejection| panic!("{name} {mode:?}: {rejection:?}"));
+
+                assert_eq!(source.logical_size(), data.len() as u64);
+                assert_eq!(source.access(), ImageSourceAccess::SequentialReplay);
+                source.revalidate_identity().unwrap();
+                let last = last.expect("progress reported");
+                assert_eq!(last.logical_produced, data.len() as u64);
+                assert_eq!(last.compressed_consumed, compressed.len() as u64);
+            }
+        }
+    }
+
+    // L1 for xz: Quick is refused before any validation work, and never
+    // turned into Full or None.
+    #[test]
+    fn prepare_compressed_image_refuses_quick_for_xz_before_validating() {
+        let file = temp_xz("prepare-xz-quick", &crc64_xz(&payload()));
+        let result = prepare_compressed_image(
+            open_xz(&file),
+            VerifyMode::Quick,
+            u64::MAX,
+            || panic!("Quick must be refused before Preflight polls for cancellation"),
+            |_| panic!("Quick must be refused before Preflight reports progress"),
+        );
+        assert!(matches!(
+            result,
+            Err(CompressedImageRejection::QuickVerifyUnsupported(
+                crate::image_source::CompressionFormat::Xz
+            ))
+        ));
+    }
+
+    // Bad xz images are refused by Preflight with their typed reason --
+    // before the target is opened.
+    #[test]
+    fn prepare_compressed_image_rejects_bad_xz_with_typed_reasons() {
+        let data = payload();
+        let good = crc64_xz(&data);
+        let reject = |tag: &str, contents: &[u8], limit: u64| {
+            expect_preflight_error(prepare_xz(tag, contents, VerifyMode::Full, limit))
+        };
+
+        let mut corrupt = good.clone();
+        let footer_crc = corrupt.len() - 12;
+        corrupt[footer_crc] ^= 0xFF;
+        let error = reject("prepare-xz-corrupt", &corrupt, u64::MAX);
+        assert!(matches!(error, PreflightError::Corrupt(_)), "{error:?}");
+
+        let error = reject("prepare-xz-truncated", &good[..good.len() / 2], u64::MAX);
+        assert!(matches!(error, PreflightError::Incomplete(_)), "{error:?}");
+
+        let none = xz_bytes(&data, liblzma::stream::Check::None);
+        let error = reject("prepare-xz-none", &none, u64::MAX);
+        assert!(
+            matches!(error, PreflightError::IntegrityCheckMissing),
+            "{error:?}"
+        );
+
+        let reserved = xz_patched(&good, Some(5), None);
+        let error = reject("prepare-xz-reserved", &reserved, u64::MAX);
+        assert!(
+            matches!(error, PreflightError::UnsupportedIntegrityCheck),
+            "{error:?}"
+        );
+
+        let huge_dictionary = xz_patched(&good, None, Some(40));
+        let error = reject("prepare-xz-memlimit", &huge_dictionary, u64::MAX);
+        assert!(
+            matches!(error, PreflightError::DecoderMemoryLimitExceeded { .. }),
+            "{error:?}"
+        );
+
+        let limit = data.len() as u64 - 1;
+        let error = reject("prepare-xz-oversized", &good, limit);
+        assert!(
+            matches!(error, PreflightError::LogicalSizeLimitExceeded { limit: l } if l == limit),
+            "{error:?}"
+        );
+        assert!(
+            prepare_xz(
+                "prepare-xz-exact",
+                &good,
+                VerifyMode::None,
+                data.len() as u64
+            )
+            .is_ok()
+        );
+    }
+
+    // Post-Preflight source check for xz: the file changes during Preflight
+    // (at its final progress report) and the source is refused.
+    #[test]
+    fn prepare_compressed_image_refuses_an_xz_source_changed_during_preflight() {
+        let compressed = crc64_xz(&payload());
+        let file = temp_xz("prepare-xz-changed", &compressed);
+        let path = file.0.clone();
+        let data_len = payload().len() as u64;
+        let result = prepare_compressed_image(
+            open_xz(&file),
+            VerifyMode::Full,
+            u64::MAX,
+            || false,
+            |progress: PreflightProgress| {
+                if progress.logical_produced == data_len
+                    && progress.compressed_consumed == compressed.len() as u64
+                {
+                    use std::os::unix::fs::FileExt as _;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let same = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    same.write_all_at(&compressed[..16], 0).unwrap();
+                }
+            },
+        );
+        assert!(
+            matches!(result, Err(CompressedImageRejection::SourceChanged(_))),
+            "{result:?}"
+        );
+    }
+
+    // The xz-specific Preflight rejections are displayed like every other
+    // one: nothing was written, the target was not touched.
+    #[test]
+    fn format_compressed_image_rejected_covers_xz_reasons() {
+        let rejections = [
+            CompressedImageRejection::QuickVerifyUnsupported(
+                crate::image_source::CompressionFormat::Xz,
+            ),
+            CompressedImageRejection::Preflight(PreflightError::IntegrityCheckMissing),
+            CompressedImageRejection::Preflight(PreflightError::UnsupportedIntegrityCheck),
+            CompressedImageRejection::Preflight(PreflightError::DecoderMemoryLimitExceeded {
+                limit: 512 * 1024 * 1024,
+            }),
+            CompressedImageRejection::Preflight(PreflightError::DecoderFailure(
+                std::io::Error::other("simulated"),
+            )),
+        ];
+        for rejection in &rejections {
+            let lines = format_compressed_image_rejected(rejection);
+            assert!(
+                lines[0].starts_with("compressed image rejected: "),
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines.last().unwrap(),
+                "the target device has not been opened or modified."
+            );
+        }
+        let quick = format_compressed_image_rejected(&rejections[0]);
+        assert!(quick[0].contains("xz") && quick[0].contains("full") && quick[0].contains("none"));
     }
 
     // Every rejection message says nothing was written and the target was

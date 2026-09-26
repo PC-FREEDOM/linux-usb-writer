@@ -4981,4 +4981,389 @@ mod tests {
         let _ = std::fs::remove_file(&target_path);
         remove_source_files(&path);
     }
+
+    // ---------------------------------------------------------------------
+    // xz through the same production preparation and the same write /
+    // Verify path as gzip. Nothing here is xz-specific except the file: the
+    // Gate, `bind()`, the writer, the source checkpoints and Verify are the
+    // generic ones, reached through the `CompressedImageSource` that
+    // `crate::prepare_compressed_image` returns.
+    // ---------------------------------------------------------------------
+
+    fn xz_bytes(payload: &[u8], check: liblzma::stream::Check) -> Vec<u8> {
+        use std::io::Write as _;
+
+        let stream = liblzma::stream::Stream::new_easy_encoder(0, check).unwrap();
+        let mut encoder = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn temp_xz_image(tag: &str, contents: &[u8]) -> std::path::PathBuf {
+        let path = write_temp_image_file(tag, contents);
+        let xz = path.with_extension("img.xz");
+        std::fs::rename(&path, &xz).unwrap();
+        xz
+    }
+
+    fn prepared_xz_source(
+        path: &std::path::Path,
+        verify_mode: VerifyMode,
+        target_capacity: u64,
+    ) -> crate::image_source::compressed::CompressedImageSource {
+        let compressed = open_gzip_image(path); // any compressed image; xz here
+        assert_eq!(
+            compressed.format(),
+            crate::image_source::CompressionFormat::Xz
+        );
+        crate::prepare_compressed_image(compressed, verify_mode, target_capacity, || false, |_| {})
+            .unwrap_or_else(|rejection| panic!("xz preparation failed: {rejection:?}"))
+    }
+
+    // Counts `open_reader()` calls on the source it wraps, delegating
+    // everything else unchanged -- to observe how many fresh replays the
+    // generic write / Verify path opens.
+    struct CountingSource {
+        inner: crate::image_source::compressed::CompressedImageSource,
+        opened: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ImageSource for CountingSource {
+        fn logical_size(&self) -> u64 {
+            self.inner.logical_size()
+        }
+
+        fn access(&self) -> ImageSourceAccess {
+            self.inner.access()
+        }
+
+        fn open_reader(&self) -> io::Result<Box<dyn Read>> {
+            self.opened
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.open_reader()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read_at(offset, buf)
+        }
+
+        fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+            self.inner.revalidate_identity()
+        }
+    }
+
+    // A multi-chunk payload as one xz stream, and split over concatenated
+    // streams (different checks) with Stream Padding between and after.
+    fn xz_pipeline_fixtures(payload: &[u8]) -> [(&'static str, Vec<u8>); 2] {
+        use liblzma::stream::Check;
+
+        let third = payload.len() / 3;
+        [
+            ("single", xz_bytes(payload, Check::Crc64)),
+            (
+                "concatenated",
+                [
+                    xz_bytes(&payload[..third], Check::Crc32),
+                    vec![0u8; 8],
+                    xz_bytes(&payload[third..2 * third], Check::Sha256),
+                    xz_bytes(&payload[2 * third..], Check::Crc64),
+                    vec![0u8; 4],
+                ]
+                .concat(),
+            ),
+        ]
+    }
+
+    // None: Preflight -> one fresh replay for the write -> sync -> Verify
+    // skipped (no second replay). Full: the same, then Full Verify opens a
+    // second, fresh replay and matches every byte. The target holds the
+    // decoded bytes; the writer only ever saw a plain byte stream.
+    #[test]
+    fn xz_image_writes_through_the_production_pipeline() {
+        let payload = patterned_data(writer::DEFAULT_CHUNK_SIZE * 2 + 777);
+
+        for (name, contents) in xz_pipeline_fixtures(&payload) {
+            for mode in [VerifyMode::None, VerifyMode::Full] {
+                let context = format!("{name} {mode:?}");
+                let path = temp_xz_image(&format!("xz-pipeline-{name}-{mode:?}"), &contents);
+                let opened = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let source = CountingSource {
+                    inner: prepared_xz_source(&path, mode, payload.len() as u64),
+                    opened: std::sync::Arc::clone(&opened),
+                };
+                let image = SelectedImage::new(Box::new(source));
+                assert_eq!(image.logical_size(), payload.len() as u64, "{context}");
+                assert_eq!(image.access(), ImageSourceAccess::SequentialReplay);
+
+                let (target_path, writing_execution, snapshot) =
+                    gate_pass_writing_execution_for_image(
+                        &format!("xz-pipeline-{name}-{mode:?}"),
+                        image,
+                        payload.len() as u64,
+                        mode,
+                        CancelHandle::new(),
+                    );
+                assert_eq!(opened.load(std::sync::atomic::Ordering::SeqCst), 1);
+                let (image, sync_succeeded) = write_and_sync(writing_execution, &context);
+                assert_eq!(std::fs::read(&target_path).unwrap(), payload, "{context}");
+
+                match mode {
+                    VerifyMode::None => {
+                        match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+                            VerifyStart::Skipped(_, succeeded) => assert!(succeeded.skipped),
+                            VerifyStart::Pending(_) => panic!("{context}: expected Skipped"),
+                        }
+                        assert_eq!(
+                            opened.load(std::sync::atomic::Ordering::SeqCst),
+                            1,
+                            "{context}: no replay for Verify None"
+                        );
+                    }
+                    _ => {
+                        let verifying = verifying_from_sync_succeeded(
+                            sync_succeeded,
+                            image,
+                            CancelHandle::new(),
+                            &snapshot,
+                            &target_path,
+                        );
+                        match verifying.run(|_| {}) {
+                            (_, VerifyOutcome::Succeeded(succeeded)) => {
+                                assert_eq!(succeeded.verified_bytes, payload.len() as u64);
+                            }
+                            (_, other) => panic!("{context}: expected Succeeded, got {other:?}"),
+                        }
+                        assert_eq!(
+                            opened.load(std::sync::atomic::Ordering::SeqCst),
+                            2,
+                            "{context}: Full Verify opens its own fresh replay"
+                        );
+                    }
+                }
+
+                let _ = std::fs::remove_file(&target_path);
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    // L2 for xz: a compressed image that reached the Gate with Quick
+    // authorized (bypassing L1) is refused by `bind()` before any write.
+    #[test]
+    fn xz_image_with_quick_verify_is_refused_at_bind() {
+        use crate::image_source::compressed::{CompressedImageSource, PreflightOptions};
+
+        let payload = patterned_data(64 * 1024);
+        let path = temp_xz_image(
+            "xz-quick-l2",
+            &xz_bytes(&payload, liblzma::stream::Check::Crc64),
+        );
+        let options = PreflightOptions {
+            max_logical_size: u64::MAX,
+        };
+        let preflighted = open_gzip_image(&path)
+            .preflight(options, || false, |_| {})
+            .unwrap();
+        let image = SelectedImage::new(Box::new(CompressedImageSource::new(preflighted)));
+
+        let (target_path, authorized, _snapshot) = gate_pass_authorized_for_image(
+            "xz-quick-l2",
+            &image,
+            payload.len() as u64,
+            VerifyMode::Quick,
+        );
+        let result = AuthorizedExecution::bind(authorized, image);
+
+        assert!(matches!(
+            result,
+            Err(ImageBindingError::QuickVerifyUnsupported)
+        ));
+        assert!(std::fs::read(&target_path).unwrap().is_empty());
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The generic source checkpoints apply to an xz source exactly as to
+    // gzip / raw: pre-write (path replaced after preparation: nothing
+    // written), post-write, pre-verify and post-verify (the file renamed at
+    // those points). The replacement is never read.
+    #[test]
+    fn xz_image_source_changes_are_caught_at_every_checkpoint() {
+        let payload = patterned_data(64 * 1024);
+        let contents = xz_bytes(&payload, liblzma::stream::Check::Crc64);
+        let rename = |path: &std::path::Path| {
+            std::fs::rename(path, path.with_extension("moved")).unwrap();
+        };
+
+        // Pre-write.
+        let path = temp_xz_image("xz-cp-pre-write", &contents);
+        let image = SelectedImage::new(Box::new(prepared_xz_source(
+            &path,
+            VerifyMode::Full,
+            payload.len() as u64,
+        )));
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution_for_image(
+            "xz-cp-pre-write",
+            image,
+            payload.len() as u64,
+            VerifyMode::Full,
+            CancelHandle::new(),
+        );
+        let_the_clock_tick();
+        rename(&path);
+        std::fs::write(&path, b"a different file").unwrap();
+        let (_image, outcome) =
+            writing_execution.write(|_| panic!("nothing may be written after the source changed"));
+        let failed = expect_write_source_changed(outcome, "xz pre-write");
+        assert_eq!(failed.bytes_written, 0);
+        assert!(std::fs::read(&target_path).unwrap().is_empty());
+        let _ = std::fs::remove_file(&target_path);
+        remove_source_files(&path);
+
+        // Post-write (Verify None: the check still runs).
+        let path = temp_xz_image("xz-cp-post-write", &contents);
+        let image = SelectedImage::new(Box::new(prepared_xz_source(
+            &path,
+            VerifyMode::None,
+            payload.len() as u64,
+        )));
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution_for_image(
+            "xz-cp-post-write",
+            image,
+            payload.len() as u64,
+            VerifyMode::None,
+            CancelHandle::new(),
+        );
+        let_the_clock_tick();
+        let total = payload.len() as u64;
+        let (_image, outcome) = writing_execution.write(|progress| {
+            if progress.bytes_written == total {
+                rename(&path);
+            }
+        });
+        let failed = expect_write_source_changed(outcome, "xz post-write");
+        assert_eq!(failed.bytes_written, total);
+        assert!(failed.target_may_be_modified);
+        let _ = std::fs::remove_file(&target_path);
+        remove_source_files(&path);
+
+        // Pre-verify and post-verify (Full).
+        for pre_verify in [true, false] {
+            let context = if pre_verify {
+                "xz pre-verify"
+            } else {
+                "xz post-verify"
+            };
+            let path = temp_xz_image(&format!("xz-cp-{pre_verify}"), &contents);
+            let image = SelectedImage::new(Box::new(prepared_xz_source(
+                &path,
+                VerifyMode::Full,
+                payload.len() as u64,
+            )));
+            let (target_path, writing_execution, snapshot) = gate_pass_writing_execution_for_image(
+                &format!("xz-cp-{pre_verify}"),
+                image,
+                payload.len() as u64,
+                VerifyMode::Full,
+                CancelHandle::new(),
+            );
+            let (image, sync_succeeded) = write_and_sync(writing_execution, context);
+            let verifying = verifying_from_sync_succeeded(
+                sync_succeeded,
+                image,
+                CancelHandle::new(),
+                &snapshot,
+                &target_path,
+            );
+            let_the_clock_tick();
+            if pre_verify {
+                rename(&path);
+            }
+            let (_image, outcome) = verifying.run(|progress| {
+                assert!(!pre_verify, "{context}: Verify must not start");
+                if progress.verified_bytes == progress.total_bytes {
+                    rename(&path);
+                }
+            });
+            let failed = expect_verify_source_changed(outcome, context);
+            let expected = if pre_verify { 0 } else { payload.len() as u64 };
+            assert_eq!(failed.verified_bytes, expected, "{context}");
+            let _ = std::fs::remove_file(&target_path);
+            remove_source_files(&path);
+        }
+    }
+
+    // Ctrl+C during an xz write, and during an xz Full Verify, stops at the
+    // next chunk through the ordinary cancel path.
+    #[test]
+    fn xz_image_write_and_full_verify_can_be_cancelled() {
+        let payload = multi_chunk_data();
+        let contents = xz_bytes(&payload, liblzma::stream::Check::Crc64);
+        let chunk = writer::DEFAULT_CHUNK_SIZE as u64;
+
+        let path = temp_xz_image("xz-cancel-write", &contents);
+        let cancel = CancelHandle::new();
+        let image = SelectedImage::new(Box::new(prepared_xz_source(
+            &path,
+            VerifyMode::Full,
+            payload.len() as u64,
+        )));
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution_for_image(
+            "xz-cancel-write",
+            image,
+            payload.len() as u64,
+            VerifyMode::Full,
+            cancel.clone(),
+        );
+        let (_image, outcome) = writing_execution.write(|progress| {
+            if progress.bytes_written == chunk {
+                cancel.request_cancel(CancelReason::UserRequested);
+            }
+        });
+        match outcome {
+            WriteAttemptOutcome::Cancelled(cancelled) => {
+                assert_eq!(cancelled.bytes_written, chunk);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+
+        let path = temp_xz_image("xz-cancel-verify", &contents);
+        let cancel = CancelHandle::new();
+        let image = SelectedImage::new(Box::new(prepared_xz_source(
+            &path,
+            VerifyMode::Full,
+            payload.len() as u64,
+        )));
+        let (target_path, writing_execution, snapshot) = gate_pass_writing_execution_for_image(
+            "xz-cancel-verify",
+            image,
+            payload.len() as u64,
+            VerifyMode::Full,
+            CancelHandle::new(),
+        );
+        let (image, sync_succeeded) = write_and_sync(writing_execution, "xz cancel verify");
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            cancel.clone(),
+            &snapshot,
+            &target_path,
+        );
+        let (_image, outcome) = verifying.run(|progress| {
+            if progress.verified_bytes == chunk {
+                cancel.request_cancel(CancelReason::UserRequested);
+            }
+        });
+        match outcome {
+            VerifyOutcome::Cancelled(cancelled) => {
+                assert_eq!(cancelled.mode, VerifyMode::Full);
+                assert_eq!(cancelled.verified_bytes, chunk);
+            }
+            other => panic!("expected Cancelled, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+    }
 }

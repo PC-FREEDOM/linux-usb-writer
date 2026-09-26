@@ -196,10 +196,6 @@ pub enum PreflightError {
     },
     // Reading the compressed file itself failed.
     Io(io::Error),
-    // Validation for this compression format is not implemented. Every
-    // `CompressionFormat` is validated now, so Preflight no longer returns
-    // this; kept until the callers that display it are updated.
-    UnsupportedFormat(CompressionFormat),
 }
 
 // A compressed image whose whole stream has been decoded and validated.

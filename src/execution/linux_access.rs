@@ -151,6 +151,10 @@ pub struct FdMetadata {
     pub minor: u32,
     // From a read-only BLKGETSIZE64 ioctl; None if it could not be obtained.
     pub size: Option<u64>,
+    // The disk sequence number of the block device this FD is bound to, from
+    // a read-only BLKGETDISKSEQ ioctl; None if it could not be obtained (not
+    // a block device, or a kernel older than 5.15).
+    pub diskseq: Option<u64>,
     // Where /proc/self/fd/<n> resolves to, for human-readable diagnostics only.
     pub proc_fd_target: Option<String>,
 }
@@ -267,6 +271,31 @@ fn read_size_via_ioctl(fd: RawFd) -> Option<u64> {
     }
 }
 
+// BLKGETDISKSEQ = _IOR(0x12, 128, __u64), from <linux/fs.h> (Linux 5.15+).
+// Reports the sequence number of the disk the FD is bound to: the same value
+// /sys/block/<name>/diskseq shows, which the kernel gives every newly created
+// disk and every media change. A read-only ioctl that needs no privilege.
+// The request number is taken from linux-raw-sys, which carries the value for
+// each architecture, rather than written here. Any failure (ENOTTY for a
+// regular file or a kernel without this ioctl) is reported as None.
+fn read_diskseq_via_ioctl(fd: RawFd) -> Option<u64> {
+    let mut diskseq: u64 = 0;
+
+    // SAFETY: `fd` is a valid, open file descriptor for the lifetime of this
+    // call (borrowed from `OpenedDeviceHandle`, which owns it), and the
+    // pointer argument points to a valid local `u64`, the size this ioctl
+    // writes. This ioctl is read-only: it cannot mutate the device.
+    let result = unsafe {
+        libc::ioctl(
+            fd,
+            linux_raw_sys::ioctl::BLKGETDISKSEQ as libc::Ioctl,
+            &mut diskseq as *mut u64,
+        )
+    };
+
+    if result == 0 { Some(diskseq) } else { None }
+}
+
 impl OpenedDeviceHandle {
     // Test-only construction path. Lets unit tests (in `core.rs`) exercise
     // the Write Gate's handle-ownership handoff into `PreparedWrite` against
@@ -343,6 +372,7 @@ impl OpenedDeviceHandle {
         let raw_fd = self.file.as_raw_fd();
 
         let size = read_size_via_ioctl(raw_fd);
+        let diskseq = read_diskseq_via_ioctl(raw_fd);
         let proc_fd_target = std::fs::read_link(format!("/proc/self/fd/{raw_fd}"))
             .ok()
             .map(|path| path.to_string_lossy().into_owned());
@@ -351,6 +381,7 @@ impl OpenedDeviceHandle {
             major,
             minor,
             size,
+            diskseq,
             proc_fd_target,
         })
     }

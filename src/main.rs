@@ -399,6 +399,8 @@ fn run_open_test(block_path: String) -> zbus::Result<()> {
             );
             println!("FD size (BLKGETSIZE64): {:?}", meta.size);
             println!("Expected size: {}", baseline.size);
+            println!("FD diskseq (BLKGETDISKSEQ): {:?}", meta.diskseq);
+            println!("Expected diskseq: {:?}", baseline.diskseq);
 
             if let Some(target) = &meta.proc_fd_target {
                 println!("/proc/self/fd target: {target}");
@@ -541,8 +543,8 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
 
     if let Some(meta) = &metadata {
         println!(
-            "prepare-test: FD major:minor={}:{} size={:?}",
-            meta.major, meta.minor, meta.size
+            "prepare-test: FD major:minor={}:{} size={:?} diskseq={:?}",
+            meta.major, meta.minor, meta.size, meta.diskseq
         );
     }
 
@@ -1240,8 +1242,8 @@ fn run_write_test(
 
     if let Some(meta) = &metadata {
         println!(
-            "write-test: FD major:minor={}:{} size={:?}",
-            meta.major, meta.minor, meta.size
+            "write-test: FD major:minor={}:{} size={:?} diskseq={:?}",
+            meta.major, meta.minor, meta.size, meta.diskseq
         );
     }
 
@@ -1565,8 +1567,8 @@ fn run_write_test(
 
                             if let Some(meta) = &metadata {
                                 println!(
-                                    "write-test: verify FD major:minor={}:{} size={:?}",
-                                    meta.major, meta.minor, meta.size
+                                    "write-test: verify FD major:minor={}:{} size={:?} diskseq={:?}",
+                                    meta.major, meta.minor, meta.size, meta.diskseq
                                 );
                             }
 

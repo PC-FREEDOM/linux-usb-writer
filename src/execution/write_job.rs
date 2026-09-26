@@ -1868,6 +1868,7 @@ mod tests {
             major: snapshot.major,
             minor: snapshot.minor,
             size: Some(snapshot.size),
+            diskseq: snapshot.diskseq,
             proc_fd_target: None,
         }
     }
@@ -4138,6 +4139,61 @@ mod tests {
             Ok(_) => panic!("expected FD binding mismatch rejection"),
         };
         assert!(matches!(error, VerifyStartError::FdBindingMismatch));
+    }
+
+    // The Verify FD goes through the same diskseq check as the write FD: a
+    // diskseq that could not be read is refused as insufficient, a different
+    // one as a mismatch, before any byte is read.
+    #[test]
+    fn begin_verify_finalize_rejects_missing_or_different_fd_diskseq() {
+        let cases = [(None, "missing"), (Some(1), "different")];
+
+        for (diskseq_offset, label) in cases {
+            let image_size = 1000u64;
+            let data = vec![5u8; image_size as usize];
+            let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+                &format!("verify-start-fd-diskseq-{label}"),
+                &data,
+                image_size,
+                VerifyMode::Full,
+            );
+
+            let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+                VerifyStart::Pending(p) => p,
+                VerifyStart::Skipped(..) => panic!("expected Pending"),
+            };
+            let ready = pending
+                .check_target(SnapshotFetchOutcome::Found(snapshot.clone()))
+                .unwrap_or_else(|(_, e, _)| panic!("check_target should succeed, got {e:?}"));
+
+            let read_file = std::fs::OpenOptions::new()
+                .read(true)
+                .open(&target_path)
+                .expect("reopen target read-only");
+            let handle = OpenedDeviceHandle::from_file_for_test(read_file);
+
+            let mut metadata = fd_metadata_matching(&snapshot);
+            metadata.diskseq =
+                diskseq_offset.and_then(|offset| snapshot.diskseq.map(|diskseq| diskseq + offset));
+
+            let result = ready.finalize(Some(handle), Some(&metadata));
+            let _ = std::fs::remove_file(&target_path);
+
+            let (_returned_image, error) = match result {
+                Err(rejection) => rejection,
+                Ok(_) => panic!("{label}: expected an FD binding rejection"),
+            };
+            match label {
+                "missing" => assert!(
+                    matches!(error, VerifyStartError::FdBindingInsufficient),
+                    "{label}: {error:?}"
+                ),
+                _ => assert!(
+                    matches!(error, VerifyStartError::FdBindingMismatch),
+                    "{label}: {error:?}"
+                ),
+            }
+        }
     }
 
     // V23 (write FD retirement). begin_verify() closes the write-mode fd

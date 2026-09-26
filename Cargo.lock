@@ -485,6 +485,7 @@ dependencies = [
  "flate2",
  "libc",
  "liblzma",
+ "linux-raw-sys",
  "zbus",
 ]
 

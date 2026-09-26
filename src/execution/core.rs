@@ -650,7 +650,16 @@ pub enum FdBindingCheck {
 // different question from Device Identity (same physical drive?) or Device
 // Instance (same block-device generation?): it only asks whether *this
 // specific FD* is bound to the *device node* the caller expects, using the
-// kernel's own st_rdev/BLKGETSIZE64, independent of D-Bus entirely.
+// kernel's own st_rdev/BLKGETSIZE64/BLKGETDISKSEQ, independent of D-Bus
+// entirely.
+//
+// Three checks, all required: major:minor, size, and diskseq. The diskseq
+// check catches what the other two cannot -- a different disk of the same
+// size appearing under the same device node between the gate and the open
+// (the kernel gives every new disk and every media change a new diskseq).
+// A definite difference in any of them is a Mismatch, even when another
+// value is missing; a missing value alone is InsufficientInformation, never
+// a Match.
 pub fn check_fd_binding(
     current: &DeviceSnapshot,
     fd_metadata: Option<&FdMetadata>,
@@ -663,11 +672,23 @@ pub fn check_fd_binding(
         return FdBindingCheck::Mismatch;
     }
 
-    match fd_metadata.size {
-        Some(size) if size != current.size => FdBindingCheck::Mismatch,
-        Some(_) => FdBindingCheck::Match,
-        None => FdBindingCheck::InsufficientInformation,
+    if fd_metadata.size.is_some_and(|size| size != current.size) {
+        return FdBindingCheck::Mismatch;
     }
+
+    match (fd_metadata.diskseq, current.diskseq) {
+        (Some(fd_diskseq), Some(current_diskseq)) if fd_diskseq != current_diskseq => {
+            return FdBindingCheck::Mismatch;
+        }
+        (Some(_), Some(_)) => {}
+        _ => return FdBindingCheck::InsufficientInformation,
+    }
+
+    if fd_metadata.size.is_none() {
+        return FdBindingCheck::InsufficientInformation;
+    }
+
+    FdBindingCheck::Match
 }
 
 // ---------------------------------------------------------------------
@@ -1794,11 +1815,12 @@ mod tests {
         assert!(matches!(reselected, SelectionState::Selected { .. }));
     }
 
-    fn fd_metadata(major: u32, minor: u32, size: Option<u64>) -> FdMetadata {
+    fn fd_metadata(major: u32, minor: u32, size: Option<u64>, diskseq: Option<u64>) -> FdMetadata {
         FdMetadata {
             major,
             minor,
             size,
+            diskseq,
             proc_fd_target: None,
         }
     }
@@ -1857,7 +1879,12 @@ mod tests {
     #[test]
     fn fd_binding_matching_major_minor_and_size_is_match() {
         let snapshot = base_device();
-        let metadata = fd_metadata(snapshot.major, snapshot.minor, Some(snapshot.size));
+        let metadata = fd_metadata(
+            snapshot.major,
+            snapshot.minor,
+            Some(snapshot.size),
+            snapshot.diskseq,
+        );
 
         assert_eq!(
             check_fd_binding(&snapshot, Some(&metadata)),
@@ -1869,7 +1896,12 @@ mod tests {
     #[test]
     fn fd_binding_major_mismatch_is_mismatch() {
         let snapshot = base_device();
-        let metadata = fd_metadata(snapshot.major + 1, snapshot.minor, Some(snapshot.size));
+        let metadata = fd_metadata(
+            snapshot.major + 1,
+            snapshot.minor,
+            Some(snapshot.size),
+            snapshot.diskseq,
+        );
 
         assert_eq!(
             check_fd_binding(&snapshot, Some(&metadata)),
@@ -1881,7 +1913,12 @@ mod tests {
     #[test]
     fn fd_binding_minor_mismatch_is_mismatch() {
         let snapshot = base_device();
-        let metadata = fd_metadata(snapshot.major, snapshot.minor + 1, Some(snapshot.size));
+        let metadata = fd_metadata(
+            snapshot.major,
+            snapshot.minor + 1,
+            Some(snapshot.size),
+            snapshot.diskseq,
+        );
 
         assert_eq!(
             check_fd_binding(&snapshot, Some(&metadata)),
@@ -1893,7 +1930,12 @@ mod tests {
     #[test]
     fn fd_binding_size_mismatch_is_mismatch() {
         let snapshot = base_device();
-        let metadata = fd_metadata(snapshot.major, snapshot.minor, Some(snapshot.size + 1));
+        let metadata = fd_metadata(
+            snapshot.major,
+            snapshot.minor,
+            Some(snapshot.size + 1),
+            snapshot.diskseq,
+        );
 
         assert_eq!(
             check_fd_binding(&snapshot, Some(&metadata)),
@@ -1909,6 +1951,134 @@ mod tests {
 
         assert_eq!(
             check_fd_binding(&snapshot, None),
+            FdBindingCheck::InsufficientInformation
+        );
+    }
+
+    // FD-binding F. The FD's diskseq equals the snapshot's (and major:minor
+    // and size match) -> Match.
+    #[test]
+    fn fd_binding_matching_diskseq_is_match() {
+        let snapshot = base_device();
+        assert!(snapshot.diskseq.is_some());
+        let metadata = matching_fd_metadata(&snapshot);
+
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&metadata)),
+            FdBindingCheck::Match
+        );
+    }
+
+    // FD-binding G. Same device node and size, different diskseq: another
+    // disk now sits behind the node -> Mismatch.
+    #[test]
+    fn fd_binding_diskseq_mismatch_is_mismatch() {
+        let snapshot = base_device();
+        let mut metadata = matching_fd_metadata(&snapshot);
+        metadata.diskseq = snapshot.diskseq.map(|diskseq| diskseq + 1);
+
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&metadata)),
+            FdBindingCheck::Mismatch
+        );
+    }
+
+    // FD-binding H. The FD's diskseq could not be read -> never assumed to
+    // match.
+    #[test]
+    fn fd_binding_missing_fd_diskseq_is_insufficient_information() {
+        let snapshot = base_device();
+        let mut metadata = matching_fd_metadata(&snapshot);
+        metadata.diskseq = None;
+
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&metadata)),
+            FdBindingCheck::InsufficientInformation
+        );
+    }
+
+    // FD-binding I. The snapshot has no diskseq to compare against ->
+    // InsufficientInformation, even though the FD reported one.
+    #[test]
+    fn fd_binding_missing_snapshot_diskseq_is_insufficient_information() {
+        let mut snapshot = base_device();
+        let metadata = matching_fd_metadata(&snapshot);
+        snapshot.diskseq = None;
+
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&metadata)),
+            FdBindingCheck::InsufficientInformation
+        );
+    }
+
+    // FD-binding J. A matching diskseq never outweighs a major:minor or size
+    // mismatch.
+    #[test]
+    fn fd_binding_matching_diskseq_does_not_hide_other_mismatches() {
+        let snapshot = base_device();
+
+        let mut other_node = matching_fd_metadata(&snapshot);
+        other_node.minor += 1;
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&other_node)),
+            FdBindingCheck::Mismatch
+        );
+
+        let mut other_size = matching_fd_metadata(&snapshot);
+        other_size.size = Some(snapshot.size + 1);
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&other_size)),
+            FdBindingCheck::Mismatch
+        );
+    }
+
+    // FD-binding K. A definite mismatch wins over a missing value, whichever
+    // of the three checks each comes from.
+    #[test]
+    fn fd_binding_mismatch_takes_priority_over_missing_information() {
+        let snapshot = base_device();
+
+        let mut node_and_no_diskseq = matching_fd_metadata(&snapshot);
+        node_and_no_diskseq.major += 1;
+        node_and_no_diskseq.diskseq = None;
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&node_and_no_diskseq)),
+            FdBindingCheck::Mismatch
+        );
+
+        let mut size_and_no_diskseq = matching_fd_metadata(&snapshot);
+        size_and_no_diskseq.size = Some(snapshot.size + 1);
+        size_and_no_diskseq.diskseq = None;
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&size_and_no_diskseq)),
+            FdBindingCheck::Mismatch
+        );
+
+        let mut diskseq_and_no_size = matching_fd_metadata(&snapshot);
+        diskseq_and_no_size.diskseq = snapshot.diskseq.map(|diskseq| diskseq + 1);
+        diskseq_and_no_size.size = None;
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&diskseq_and_no_size)),
+            FdBindingCheck::Mismatch
+        );
+    }
+
+    // FD-binding L. A regular file is not a block device: BLKGETDISKSEQ fails
+    // on it, `metadata()` reports that as None (no panic), and the binding
+    // then refuses it even when every other value is made to match.
+    #[test]
+    fn fd_binding_regular_file_has_no_diskseq_and_is_insufficient() {
+        let snapshot = base_device();
+        let (_path, handle) = test_handle_with_temp_file("no-diskseq");
+
+        let real = handle.metadata().expect("fstat of a regular file");
+        assert_eq!(real.diskseq, None);
+
+        let mut metadata = matching_fd_metadata(&snapshot);
+        metadata.diskseq = real.diskseq;
+
+        assert_eq!(
+            check_fd_binding(&snapshot, Some(&metadata)),
             FdBindingCheck::InsufficientInformation
         );
     }
@@ -1943,7 +2113,12 @@ mod tests {
     }
 
     fn matching_fd_metadata(snapshot: &DeviceSnapshot) -> FdMetadata {
-        fd_metadata(snapshot.major, snapshot.minor, Some(snapshot.size))
+        fd_metadata(
+            snapshot.major,
+            snapshot.minor,
+            Some(snapshot.size),
+            snapshot.diskseq,
+        )
     }
 
     const TEST_IMAGE_SIZE: u64 = 1_000_000;
@@ -2302,7 +2477,12 @@ mod tests {
     #[test]
     fn finalize_prepared_write_rejects_fd_binding_mismatch() {
         let snapshot = base_device();
-        let metadata = fd_metadata(snapshot.major + 1, snapshot.minor, Some(snapshot.size));
+        let metadata = fd_metadata(
+            snapshot.major + 1,
+            snapshot.minor,
+            Some(snapshot.size),
+            snapshot.diskseq,
+        );
         let ready = ReadyToOpen {
             plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
             current: snapshot,
@@ -2334,6 +2514,32 @@ mod tests {
         let result = finalize_prepared_write(ready, Some(handle), None);
 
         assert!(matches!(result, Err(WriteGateError::FdBindingInsufficient)));
+    }
+
+    // finalize (diskseq). The write FD's diskseq could not be read ->
+    // rejected before a PreparedWrite exists; a different diskseq ->
+    // rejected as a mismatch.
+    #[test]
+    fn finalize_prepared_write_rejects_missing_or_different_fd_diskseq() {
+        let snapshot = base_device();
+        let ready = || ReadyToOpen {
+            plan: WritePlan::new(TEST_IMAGE_SIZE, snapshot.size, DEFAULT_CHUNK_SIZE).unwrap(),
+            current: snapshot.clone(),
+            verify_mode: VerifyMode::None,
+            image_generation: ImageSelection::new(TEST_IMAGE_SIZE).image_generation(),
+        };
+
+        let mut missing = matching_fd_metadata(&snapshot);
+        missing.diskseq = None;
+        let (_path, handle) = test_handle_with_temp_file("no-fd-diskseq");
+        let result = finalize_prepared_write(ready(), Some(handle), Some(&missing));
+        assert!(matches!(result, Err(WriteGateError::FdBindingInsufficient)));
+
+        let mut different = matching_fd_metadata(&snapshot);
+        different.diskseq = snapshot.diskseq.map(|diskseq| diskseq + 1);
+        let (_path, handle) = test_handle_with_temp_file("other-fd-diskseq");
+        let result = finalize_prepared_write(ready(), Some(handle), Some(&different));
+        assert!(matches!(result, Err(WriteGateError::FdBindingMismatch)));
     }
 
     // finalize (ownership). On success, PreparedWrite is now the sole owner

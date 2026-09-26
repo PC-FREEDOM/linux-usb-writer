@@ -8,4 +8,5 @@ ctrlc = "3.5.2"
 flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend", "runtime_detection"] }
 libc = "0.2.189"
 liblzma = { version = "0.4.8", features = ["static"] }
+linux-raw-sys = { version = "0.12.1", default-features = false, features = ["ioctl"] }
 zbus = { version = "5.19.0", features = ["blocking-api"] }

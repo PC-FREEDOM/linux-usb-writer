@@ -2134,6 +2134,20 @@ fn format_compressed_image_rejected(rejection: &CompressedImageRejection) -> Vec
             PreflightError::Incomplete(error) => {
                 format!("the compressed image is incomplete (truncated): {error}")
             }
+            PreflightError::IntegrityCheckMissing => {
+                "the compressed image has no integrity check, so its content cannot be verified"
+                    .to_string()
+            }
+            PreflightError::UnsupportedIntegrityCheck => {
+                "the compressed image uses an integrity check type that cannot be verified"
+                    .to_string()
+            }
+            PreflightError::DecoderMemoryLimitExceeded { limit } => format!(
+                "decompressing the image would need more memory than the decoder's safety limit ({limit} bytes)"
+            ),
+            PreflightError::DecoderFailure(error) => {
+                format!("the decompressor failed (not caused by the image data): {error}")
+            }
             PreflightError::LogicalSizeOverflow => {
                 "the decompressed size is too large to represent".to_string()
             }

@@ -6,7 +6,7 @@
 // measured on the way. Nothing here writes anywhere or knows about targets;
 // the decoded bytes are counted and discarded.
 //
-// Layering of the gzip decode pipeline (bottom to top):
+// Layering of the decode pipeline (bottom to top):
 //
 //   source cursor    positional reads (`pread`) over the one `File` that
 //                    `open_image` opened, starting at byte 0, clamped to the
@@ -16,16 +16,29 @@
 //                    check before every `fill_buf()` (cancellation, then the
 //                    Compressed Input Budget below), and tags any error from
 //                    below as a source I/O error
-//   MultiGzDecoder   every member, CRC32 + ISIZE per member, and any trailing
-//                    bytes rejected (behavior pinned by `gzip_behavior` tests);
-//                    held in `FormatDecoder`, which the decode loops use
+//   FormatDecoder    the format's decoder, which the decode loops use:
+//     gzip           `MultiGzDecoder`: every member, CRC32 + ISIZE per
+//                    member, and any trailing bytes rejected (behavior pinned
+//                    by `gzip_behavior` tests)
+//     xz             liblzma's .xz stream decoder (never the auto decoder, so
+//                    legacy .lzma / .lz data is refused): every concatenated
+//                    stream, Stream Padding accepted only in multiples of
+//                    four zero bytes (the .xz format's own rule -- unlike
+//                    gzip, where trailing zeros are refused), every Block
+//                    Check, Index and Stream Footer verified; a stream
+//                    without an integrity check (Check=None) or with a check
+//                    type liblzma cannot verify is refused, and so is a Block
+//                    needing more than `XZ_DECODER_MEMLIMIT` of decoder
+//                    memory (behavior pinned by `xz_behavior` tests)
 //
 // Errors are classified by type, never by message text: cancellation, budget
 // exhaustion and source I/O failures travel through the decoder as typed
 // payloads (`PreflightCancelled` / `InputBudgetExceeded` /
-// `SourceReadError`), which `flate2` passes through unchanged (see
-// `gzip_behavior::errors_from_below_the_decoder_propagate_unchanged`);
-// anything else came from the decoder itself.
+// `SourceReadError`), which both decoders pass through unchanged (see
+// `gzip_behavior::errors_from_below_the_decoder_propagate_unchanged` and
+// `xz_behavior::x23_errors_from_below_the_decoder_propagate_unchanged`);
+// liblzma's own errors carry a typed `liblzma::stream::Error`; anything else
+// came from the decoder itself.
 //
 // Compressed Input Budget (a resource / responsiveness policy -- not a
 // corruption check and not a decompression-bomb check): a valid gzip stream
@@ -68,6 +81,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use flate2::bufread::MultiGzDecoder;
+use liblzma::bufread::XzDecoder;
+use liblzma::stream::{CONCATENATED, Stream, TELL_NO_CHECK, TELL_UNSUPPORTED_CHECK};
 
 use super::source_identity::{SourceChanged, SourceIdentity};
 use super::{
@@ -91,6 +106,18 @@ const INPUT_BUDGET_RATE_DENOMINATOR: u64 = 64;
 // advanced by at least this much since the last report (and once more on
 // success), so a huge image produces a bounded, steady stream of reports.
 const PROGRESS_STEP: u64 = 1024 * 1024;
+// XZ decoder memory limit: the most memory liblzma may estimate a Block's
+// filter chain needs (essentially its dictionary) -- checked when each Block
+// Header is read, before that memory is allocated. Not a limit on the
+// process's own memory use. Covers every standard preset (`xz -9` needs
+// about 65 MiB); a Block declaring more is refused with
+// `DecoderMemoryLimitExceeded`. Fixed for v0.1.
+const XZ_DECODER_MEMLIMIT: u64 = 512 * 1024 * 1024;
+// XZ decoder flags: report Check=None and unsupported check types (without
+// these liblzma decodes such streams without verifying anything), and decode
+// every concatenated stream and the Stream Padding between them (without it
+// the decoder ends after the first stream).
+const XZ_DECODER_FLAGS: u32 = TELL_NO_CHECK | TELL_UNSUPPORTED_CHECK | CONCATENATED;
 
 // Limits applied while validating. Chosen by the caller (e.g. from the
 // selected target's capacity); this module never looks at targets.
@@ -120,13 +147,31 @@ pub enum PreflightError {
     Cancelled,
     // The compressed data is damaged: an invalid header, corrupt compressed
     // data, a checksum/size mismatch, or bytes after the last valid member
-    // (the decoder's own error is kept for diagnostics).
+    // or stream -- for xz also invalid Stream Padding and options liblzma
+    // cannot decode (unknown filters, reserved bits) (the decoder's own error
+    // is kept for diagnostics).
     Corrupt(io::Error),
     // The compressed data ended before a complete stream (the decoder's own
     // error is kept). Short trailing garbage after a valid member also
     // surfaces here: the decoder cannot tell it apart from a truncated next
     // member, and either way the image is rejected.
     Incomplete(io::Error),
+    // xz only: a stream carries no integrity check (Check=None), so its
+    // content could not be verified. Refused in every stream of the file.
+    IntegrityCheckMissing,
+    // xz only: a stream's integrity check type is not one liblzma can verify
+    // (a reserved or unknown Check ID). Refused in every stream of the file.
+    UnsupportedIntegrityCheck,
+    // xz only: a Block needs more decoder memory than `limit` (see
+    // `XZ_DECODER_MEMLIMIT`). The data is not necessarily damaged; decoding
+    // it is refused as a resource policy.
+    DecoderMemoryLimitExceeded {
+        limit: u64,
+    },
+    // The decoder itself could not start or continue (e.g. it could not
+    // allocate memory, or reported an internal error) -- not attributed to
+    // the compressed data. The decoder's own error is kept.
+    DecoderFailure(io::Error),
     // The decoded size does not fit in a `u64`.
     LogicalSizeOverflow,
     // The decoded size exceeds `PreflightOptions::max_logical_size`.
@@ -151,7 +196,9 @@ pub enum PreflightError {
     },
     // Reading the compressed file itself failed.
     Io(io::Error),
-    // Validation for this compression format is not implemented yet.
+    // Validation for this compression format is not implemented. Every
+    // `CompressionFormat` is validated now, so Preflight no longer returns
+    // this; kept until the callers that display it are updated.
     UnsupportedFormat(CompressionFormat),
 }
 
@@ -284,15 +331,12 @@ impl CompressedImageFile {
         mut is_cancelled: impl FnMut() -> bool,
         mut on_progress: impl FnMut(PreflightProgress),
     ) -> Result<PreflightedCompressedImage, PreflightError> {
-        if self.format != CompressionFormat::Gzip {
-            return Err(PreflightError::UnsupportedFormat(self.format));
-        }
-
         let file = Arc::new(self.file);
         let input =
             BufReader::with_capacity(INPUT_BUFFER_LEN, source_cursor(&file, self.compressed_size));
 
-        let logical_size = preflight_gzip(
+        let logical_size = preflight_stream(
+            self.format,
             input,
             self.compressed_size,
             options,
@@ -324,10 +368,18 @@ fn source_cursor(file: &Arc<File>, end: u64) -> FileImageReader {
     }
 }
 
-// Validates a gzip stream read from `input` and returns its decoded size.
-// Generic over the input so tests can inject source failures; production
-// passes the buffered source cursor.
-fn preflight_gzip(
+// Validates a `format` stream read from `input` and returns its decoded
+// size. The same decode loop, checks and success conditions serve every
+// format; only the decoder differs. Generic over the input so tests can
+// inject source failures; production passes the buffered source cursor.
+//
+// Success needs all of: the decoder's own clean end of stream (for xz,
+// after every concatenated stream and the Stream Padding), a decoded size
+// within `options`, and exactly the whole compressed size consumed. Output
+// that merely reaches some size is never taken as success: a damaged
+// footer, Index or check can still be reported after all of it.
+fn preflight_stream(
+    format: CompressionFormat,
     input: impl BufRead,
     compressed_size: u64,
     options: PreflightOptions,
@@ -352,7 +404,13 @@ fn preflight_gzip(
             Ok(())
         };
 
-        let mut decoder = FormatDecoder::gzip(CountingBufRead::new(input, hook));
+        let counted = CountingBufRead::new(input, hook);
+        let mut decoder = match format {
+            CompressionFormat::Gzip => FormatDecoder::gzip(counted),
+            CompressionFormat::Xz => {
+                FormatDecoder::xz(counted).map_err(PreflightError::DecoderFailure)?
+            }
+        };
         let decoded = decode_to_end(&mut decoder, options, &logical_produced);
         (decoded, decoder.input().consumed())
     };
@@ -516,7 +574,8 @@ fn add_logical_bytes(current: u64, n: usize, limit: u64) -> Result<u64, Prefligh
 
 // Maps an error that came out of the decoder to a `PreflightError`: typed
 // payloads injected below the decoder first (cancellation, source I/O),
-// then the decoder's own errors by kind. Message text is never inspected.
+// then liblzma's typed errors, then the decoder's own errors by kind.
+// Message text is never inspected.
 fn classify_error(error: io::Error) -> PreflightError {
     if error
         .get_ref()
@@ -545,6 +604,24 @@ fn classify_error(error: io::Error) -> PreflightError {
         return match inner.downcast::<SourceReadError>() {
             Ok(source) => PreflightError::Io(source.0),
             Err(other) => PreflightError::Io(io::Error::other(other)),
+        };
+    }
+
+    // liblzma's own errors (xz only; gzip errors never carry this payload).
+    if let Some(lzma) = error
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<liblzma::stream::Error>())
+        .copied()
+    {
+        use liblzma::stream::Error as Lzma;
+        return match lzma {
+            Lzma::NoCheck => PreflightError::IntegrityCheckMissing,
+            Lzma::UnsupportedCheck => PreflightError::UnsupportedIntegrityCheck,
+            Lzma::MemLimit => PreflightError::DecoderMemoryLimitExceeded {
+                limit: XZ_DECODER_MEMLIMIT,
+            },
+            Lzma::Mem | Lzma::Program => PreflightError::DecoderFailure(error),
+            Lzma::Data | Lzma::Format | Lzma::Options => PreflightError::Corrupt(error),
         };
     }
 
@@ -655,6 +732,7 @@ impl std::error::Error for SourceReadError {
 // counted input for the exact-consumption checks.
 enum FormatDecoder<R: BufRead> {
     Gzip(MultiGzDecoder<R>),
+    Xz(XzDecoder<R>),
 }
 
 impl<R: BufRead> FormatDecoder<R> {
@@ -664,10 +742,20 @@ impl<R: BufRead> FormatDecoder<R> {
         FormatDecoder::Gzip(MultiGzDecoder::new(input))
     }
 
+    // liblzma's .xz stream decoder with `XZ_DECODER_MEMLIMIT` and
+    // `XZ_DECODER_FLAGS` (see the module comment and `xz_behavior`).
+    // Fails only if liblzma cannot set the decoder up (e.g. out of memory);
+    // the error carries liblzma's typed `Error`.
+    fn xz(input: R) -> io::Result<Self> {
+        let stream = Stream::new_stream_decoder(XZ_DECODER_MEMLIMIT, XZ_DECODER_FLAGS)?;
+        Ok(FormatDecoder::Xz(XzDecoder::new_stream(input, stream)))
+    }
+
     // The input the decoder reads from, never the decoder's own buffering.
     fn input(&self) -> &R {
         match self {
             FormatDecoder::Gzip(decoder) => decoder.get_ref(),
+            FormatDecoder::Xz(decoder) => decoder.get_ref(),
         }
     }
 }
@@ -676,6 +764,7 @@ impl<R: BufRead> Read for FormatDecoder<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             FormatDecoder::Gzip(decoder) => decoder.read(buf),
+            FormatDecoder::Xz(decoder) => decoder.read(buf),
         }
     }
 }
@@ -1392,7 +1481,8 @@ mod tests {
             checks.get() > 100
         };
 
-        let result = preflight_gzip(
+        let result = preflight_stream(
+            CompressionFormat::Gzip,
             scripted(&contents, None),
             contents.len() as u64,
             NO_LIMIT,
@@ -1421,7 +1511,8 @@ mod tests {
             io::ErrorKind::Other,
         ] {
             for fail_at in [0, 5, 500] {
-                let result = preflight_gzip(
+                let result = preflight_stream(
+                    CompressionFormat::Gzip,
                     scripted(&contents, Some((fail_at, kind))),
                     contents.len() as u64,
                     NO_LIMIT,
@@ -1445,7 +1536,8 @@ mod tests {
         // Count how many polls a full, uncancelled run makes, then cancel at
         // points spread across that range (first poll through the last one).
         let total_polls = Cell::new(0u32);
-        preflight_gzip(
+        preflight_stream(
+            CompressionFormat::Gzip,
             scripted(&contents, None),
             contents.len() as u64,
             NO_LIMIT,
@@ -1461,7 +1553,8 @@ mod tests {
 
         for cancel_after in [0, 1, total / 2, total - 1] {
             let checks = Cell::new(0u32);
-            let result = preflight_gzip(
+            let result = preflight_stream(
+                CompressionFormat::Gzip,
                 scripted(&contents, None),
                 contents.len() as u64,
                 NO_LIMIT,
@@ -1483,7 +1576,8 @@ mod tests {
     fn decoder_errors_are_never_io() {
         let member = gzip_member(&payload_a());
         for contents in [flip(&member, 8), member[..member.len() - 3].to_vec()] {
-            let result = preflight_gzip(
+            let result = preflight_stream(
+                CompressionFormat::Gzip,
                 scripted(&contents, None),
                 contents.len() as u64,
                 NO_LIMIT,
@@ -1506,7 +1600,8 @@ mod tests {
     #[test]
     fn clean_end_without_consuming_the_whole_input_is_rejected() {
         let contents = gzip_member(&payload_a());
-        let result = preflight_gzip(
+        let result = preflight_stream(
+            CompressionFormat::Gzip,
             scripted(&contents, None),
             contents.len() as u64 + 1,
             NO_LIMIT,
@@ -1538,26 +1633,562 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Formats not implemented yet.
+    // xz Preflight: the same entry point, loop and success conditions as
+    // gzip, with liblzma's .xz stream decoder (behavior pinned in detail by
+    // `xz_behavior`; these tests go through `CompressedImageFile::preflight`
+    // or `preflight_stream`).
     // ---------------------------------------------------------------------
 
-    #[test]
-    fn xz_is_not_validated_yet() {
+    // One .xz stream with one Block (preset 0: a 256 KiB dictionary).
+    fn xz_stream(payload: &[u8], check: liblzma::stream::Check) -> Vec<u8> {
+        let stream = Stream::new_easy_encoder(0, check).unwrap();
+        let mut encoder = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn crc64_stream(payload: &[u8]) -> Vec<u8> {
+        xz_stream(payload, liblzma::stream::Check::Crc64)
+    }
+
+    fn write_xz_file(tag: &str, contents: &[u8]) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "linux-usb-writer-preflight-test-xz-{}.img.xz",
+            "linux-usb-writer-preflight-test-{tag}-{}-{id}.img.xz",
             std::process::id()
         ));
-        std::fs::write(&path, [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04]).unwrap();
-        let file = match open_image(&path) {
-            Ok(OpenedImage::Compressed(file)) => file,
-            other => panic!("expected Compressed, got {other:?}"),
-        };
-        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, contents).expect("write temp xz file");
+        path
+    }
 
-        let result = file.preflight(NO_LIMIT, || false, |_| {});
+    // `preflight_contents` for `.xz` files.
+    fn preflight_xz(
+        tag: &str,
+        contents: &[u8],
+        options: PreflightOptions,
+    ) -> (
+        Result<PreflightedCompressedImage, PreflightError>,
+        Vec<PreflightProgress>,
+    ) {
+        let path = write_xz_file(tag, contents);
+        let file = open_compressed(&path);
+        assert_eq!(file.format(), CompressionFormat::Xz);
+        let mut reports = Vec::new();
+        let result = file.preflight(options, || false, |progress| reports.push(progress));
+        let _ = std::fs::remove_file(&path);
+        (result, reports)
+    }
+
+    // Asserts `contents` validates to exactly `expected_size` decoded bytes,
+    // with the whole compressed file consumed (the final progress report is
+    // exact).
+    fn assert_xz_validated(tag: &str, contents: &[u8], expected_size: u64) {
+        let (result, reports) = preflight_xz(tag, contents, NO_LIMIT);
+        let preflighted = result.unwrap_or_else(|error| panic!("{tag}: {error:?}"));
+        assert_eq!(preflighted.format(), CompressionFormat::Xz);
+        assert_eq!(preflighted.logical_size(), expected_size, "{tag}");
+        assert_eq!(preflighted.compressed_size(), contents.len() as u64);
+        assert_eq!(
+            reports.last(),
+            Some(&PreflightProgress {
+                compressed_consumed: contents.len() as u64,
+                compressed_total: contents.len() as u64,
+                logical_produced: expected_size,
+            }),
+            "{tag}"
+        );
+    }
+
+    fn xz_error(tag: &str, contents: &[u8]) -> PreflightError {
+        match preflight_xz(tag, contents, NO_LIMIT).0 {
+            Err(error) => error,
+            Ok(preflighted) => panic!(
+                "{tag}: expected a rejection, validated {} bytes",
+                preflighted.logical_size()
+            ),
+        }
+    }
+
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut crc = flate2::Crc::new();
+        crc.update(bytes);
+        crc.sum()
+    }
+
+    // Offsets inside a single .xz stream, located from the Stream Footer's
+    // Backward Size: where the Index starts, and where the footer starts.
+    fn xz_index_start(stream: &[u8]) -> usize {
+        let footer = stream.len() - 12;
+        let backward = u32::from_le_bytes(stream[footer + 4..footer + 8].try_into().unwrap());
+        footer - (backward as usize + 1) * 4
+    }
+
+    // Rewrites the Check ID in a single stream's Stream Header and Footer,
+    // recomputing both CRC32s (IDs must share a check-field size). See
+    // `xz_behavior::with_check_id`.
+    fn with_check_id(stream: &[u8], check_id: u8) -> Vec<u8> {
+        let mut patched = stream.to_vec();
+        patched[7] = check_id;
+        let header_crc = crc32(&patched[6..8]);
+        patched[8..12].copy_from_slice(&header_crc.to_le_bytes());
+        let footer = patched.len() - 12;
+        patched[footer + 9] = check_id;
+        let footer_crc = crc32(&patched[footer + 4..footer + 10]);
+        patched[footer..footer + 4].copy_from_slice(&footer_crc.to_le_bytes());
+        patched
+    }
+
+    // Rewrites the LZMA2 dictionary byte of a single stream's first Block
+    // Header and recomputes its CRC32. See
+    // `xz_behavior::with_declared_dictionary`.
+    fn with_declared_dictionary(stream: &[u8], dictionary_byte: u8) -> Vec<u8> {
+        let mut patched = stream.to_vec();
+        let header_len = (patched[12] as usize + 1) * 4;
+        assert_eq!(&patched[13..16], &[0x00, 0x21, 0x01], "one LZMA2 filter");
+        patched[16] = dictionary_byte;
+        let crc_at = 12 + header_len - 4;
+        let crc = crc32(&patched[12..crc_at]);
+        patched[crc_at..crc_at + 4].copy_from_slice(&crc.to_le_bytes());
+        patched
+    }
+
+    // X1-X3: every check type liblzma can verify is accepted, with the
+    // exact decoded size and the whole file consumed.
+    #[test]
+    fn xz_with_every_supported_check_is_validated_with_its_exact_size() {
+        use liblzma::stream::Check;
+        let a = payload_a();
+
+        for (name, check) in [
+            ("crc32", Check::Crc32),
+            ("crc64", Check::Crc64),
+            ("sha256", Check::Sha256),
+        ] {
+            assert_xz_validated(&format!("xz-{name}"), &xz_stream(&a, check), a.len() as u64);
+        }
+    }
+
+    // X4-X5: concatenated streams are one image; its size is the sum.
+    #[test]
+    fn xz_concatenated_streams_are_validated_as_one_image() {
+        use liblzma::stream::Check;
+        let (a, b) = (payload_a(), payload_b());
+        let sa = xz_stream(&a, Check::Crc32);
+        let sb = xz_stream(&b, Check::Sha256);
+        let empty = crc64_stream(&[]);
+        let ab = (a.len() + b.len()) as u64;
+
+        assert_xz_validated("xz-concat-2", &[sa.clone(), sb.clone()].concat(), ab);
+        assert_xz_validated("xz-concat-3", &[sa, empty, sb].concat(), ab);
+    }
+
+    // X6-X7: Stream Padding (multiples of four zero bytes) is accepted
+    // between streams and after the last one -- the .xz format's own rule,
+    // unlike gzip's refusal of trailing zeros.
+    #[test]
+    fn xz_stream_padding_between_and_after_streams_is_accepted() {
+        let (a, b) = (payload_a(), payload_b());
+        let (sa, sb) = (crc64_stream(&a), crc64_stream(&b));
+        let ab = (a.len() + b.len()) as u64;
+        let zeros = |len: usize| vec![0u8; len];
+
+        assert_xz_validated(
+            "xz-pad-between",
+            &[sa.clone(), zeros(8), sb.clone()].concat(),
+            ab,
+        );
+        assert_xz_validated(
+            "xz-pad-final-4",
+            &[sa.clone(), zeros(4)].concat(),
+            a.len() as u64,
+        );
+        assert_xz_validated("xz-pad-both", &[sa, zeros(4), sb, zeros(12)].concat(), ab);
+    }
+
+    // X16: padding of any other length is corrupt.
+    #[test]
+    fn xz_invalid_stream_padding_is_corrupt() {
+        let a = payload_a();
+        let (sa, sb) = (crc64_stream(&a), crc64_stream(&payload_b()));
+
+        for len in [1, 2, 3, 5, 6, 7] {
+            let tail = [sa.clone(), vec![0u8; len]].concat();
+            let error = xz_error("xz-pad-bad-tail", &tail);
+            assert!(
+                matches!(error, PreflightError::Corrupt(_)),
+                "{len}: {error:?}"
+            );
+
+            let between = [sa.clone(), vec![0u8; len], sb.clone()].concat();
+            let error = xz_error("xz-pad-bad-between", &between);
+            assert!(
+                matches!(error, PreflightError::Corrupt(_)),
+                "{len}: {error:?}"
+            );
+        }
+    }
+
+    // X8-X9: Check=None is refused, in the first stream and in a later one.
+    #[test]
+    fn xz_without_an_integrity_check_is_refused_in_any_stream() {
+        use liblzma::stream::Check;
+        let a = payload_a();
+        let none = xz_stream(&payload_b(), Check::None);
+
+        let error = xz_error("xz-none-first", &none);
+        assert!(
+            matches!(error, PreflightError::IntegrityCheckMissing),
+            "{error:?}"
+        );
+
+        let later = [crc64_stream(&a), vec![0u8; 4], none].concat();
+        let error = xz_error("xz-none-second", &later);
+        assert!(
+            matches!(error, PreflightError::IntegrityCheckMissing),
+            "{error:?}"
+        );
+    }
+
+    // X10: a reserved Check ID is refused, in the first stream and in a
+    // later one.
+    #[test]
+    fn xz_with_an_unsupported_check_is_refused_in_any_stream() {
+        let reserved = with_check_id(&crc64_stream(&payload_b()), 5);
+
+        let error = xz_error("xz-reserved-first", &reserved);
+        assert!(
+            matches!(error, PreflightError::UnsupportedIntegrityCheck),
+            "{error:?}"
+        );
+
+        let later = [crc64_stream(&payload_a()), reserved].concat();
+        let error = xz_error("xz-reserved-second", &later);
+        assert!(
+            matches!(error, PreflightError::UnsupportedIntegrityCheck),
+            "{error:?}"
+        );
+    }
+
+    // X11: a Block declaring a 1.5 GiB dictionary exceeds the 512 MiB decoder
+    // memory limit (refused before that memory is allocated); a 64 MiB
+    // dictionary (`xz -9`) is within it.
+    #[test]
+    fn xz_over_the_decoder_memory_limit_is_refused() {
+        let a = payload_a();
+        let stream = crc64_stream(&a);
+
+        let error = xz_error("xz-memlimit", &with_declared_dictionary(&stream, 40));
+        assert!(
+            matches!(
+                error,
+                PreflightError::DecoderMemoryLimitExceeded { limit } if limit == XZ_DECODER_MEMLIMIT
+            ),
+            "{error:?}"
+        );
+        assert_eq!(XZ_DECODER_MEMLIMIT, 512 * 1024 * 1024);
+
+        assert_xz_validated(
+            "xz-memlimit-64m",
+            &with_declared_dictionary(&stream, 28),
+            a.len() as u64,
+        );
+    }
+
+    // X12-X13: damage found only after the whole payload was decoded -- a
+    // Block Check, the Index, the Stream Footer -- is corrupt: reaching the
+    // payload's size is never taken as success.
+    #[test]
+    fn xz_damage_after_the_payload_is_corrupt() {
+        let stream = crc64_stream(&payload_a());
+        let index = xz_index_start(&stream);
+        let footer = stream.len() - 12;
+
+        for (name, position) in [
+            ("block-check", index - 1),
+            ("index-count", index + 1),
+            ("index-crc", footer - 1),
+            ("footer-crc", footer),
+            ("footer-backward-size", footer + 4),
+            ("footer-magic", footer + 11),
+        ] {
+            let error = xz_error(
+                &format!("xz-{name}"),
+                &flip(&stream, stream.len() - position),
+            );
+            assert!(
+                matches!(error, PreflightError::Corrupt(_)),
+                "{name}: {error:?}"
+            );
+        }
+    }
+
+    // X14: a truncated file is incomplete, wherever it is cut -- in the
+    // header, the Block, the Index or the footer. A bare header fragment (the
+    // old "xz is not validated yet" fixture) is incomplete too.
+    #[test]
+    fn truncated_xz_is_incomplete() {
+        let stream = crc64_stream(&payload_b());
+        let mut cuts: Vec<usize> = (7..stream.len()).step_by(97).collect();
+        cuts.extend([12, stream.len() - 12, stream.len() - 1]);
+
+        for cut in cuts {
+            let error = xz_error("xz-truncated", &stream[..cut]);
+            assert!(
+                matches!(error, PreflightError::Incomplete(_)),
+                "{cut}: {error:?}"
+            );
+        }
+
+        let fragment = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04];
+        let error = xz_error("xz-fragment", &fragment);
+        assert!(matches!(error, PreflightError::Incomplete(_)), "{error:?}");
+    }
+
+    // X15: trailing garbage is never accepted -- incomplete when shorter
+    // than a Stream Header (12 bytes), corrupt otherwise.
+    #[test]
+    fn xz_trailing_garbage_is_refused() {
+        let stream = crc64_stream(&payload_a());
+
+        for len in [1, 5, 11] {
+            let error = xz_error(
+                "xz-garbage-short",
+                &[stream.clone(), vec![0xAA; len]].concat(),
+            );
+            assert!(
+                matches!(error, PreflightError::Incomplete(_)),
+                "{len}: {error:?}"
+            );
+        }
+        for len in [12, 64] {
+            let error = xz_error(
+                "xz-garbage-long",
+                &[stream.clone(), vec![0xAA; len]].concat(),
+            );
+            assert!(
+                matches!(error, PreflightError::Corrupt(_)),
+                "{len}: {error:?}"
+            );
+        }
+    }
+
+    // X17: the logical size limit applies as for gzip: exactly at the limit
+    // is allowed, one byte over is refused.
+    #[test]
+    fn xz_logical_size_limit_is_enforced() {
+        let a = payload_a();
+        let contents = [crc64_stream(&a), crc64_stream(&a)].concat();
+        let size = 2 * a.len() as u64;
+
+        let (at_limit, _) = preflight_xz(
+            "xz-limit-at",
+            &contents,
+            PreflightOptions {
+                max_logical_size: size,
+            },
+        );
+        assert_eq!(at_limit.unwrap().logical_size(), size);
+
+        let (over, _) = preflight_xz(
+            "xz-limit-over",
+            &contents,
+            PreflightOptions {
+                max_logical_size: size - 1,
+            },
+        );
+        assert!(
+            matches!(over, Err(PreflightError::LogicalSizeLimitExceeded { limit }) if limit == size - 1),
+            "{over:?}"
+        );
+    }
+
+    // X18: cancellation -- before anything is read, during decoding, and
+    // while the decoder is only consuming Stream Padding (no output).
+    #[test]
+    fn xz_preflight_can_be_cancelled() {
+        let contents = crc64_stream(&payload_a());
+
+        let path = write_xz_file("xz-cancel-before", &contents);
+        let mut reports = 0;
+        let result = open_compressed(&path).preflight(NO_LIMIT, || true, |_| reports += 1);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(PreflightError::Cancelled)));
+        assert_eq!(reports, 0);
+
+        // Large enough for many decoder reads (the xz decoder polls its input
+        // once per read, so a 64 KiB image finishes within three checks).
+        let path = write_xz_file(
+            "xz-cancel-during",
+            &crc64_stream(&pseudo_random(1 << 20, 5)),
+        );
+        let checks = Cell::new(0u32);
+        let result = open_compressed(&path).preflight(
+            NO_LIMIT,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+            |_| {},
+        );
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(result, Err(PreflightError::Cancelled)));
+
+        let padded = [contents, vec![0u8; 256 * 1024]].concat();
+        let checks = Cell::new(0u32);
+        let mut is_cancelled = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 2_000
+        };
+        let result = preflight_stream(
+            CompressionFormat::Xz,
+            scripted(&padded, None),
+            padded.len() as u64,
+            NO_LIMIT,
+            &mut is_cancelled,
+            &mut |_| {},
+        );
+        assert!(
+            matches!(result, Err(PreflightError::Cancelled)),
+            "{result:?}"
+        );
+    }
+
+    // X19: the Compressed Input Budget applies unchanged: ordinary xz is
+    // accepted within the documented bound; a run of empty streams, or a
+    // very long Stream Padding, is refused within the cap plus one input
+    // buffer -- as a resource policy, though the data is valid.
+    #[test]
+    fn xz_compressed_input_budget_applies_unchanged() {
+        let random = pseudo_random(1 << 20, 23);
+        let contents = crc64_stream(&random);
+        let (result, reports) = preflight_xz("xz-budget-ok", &contents, NO_LIMIT);
+        assert_eq!(result.unwrap().logical_size(), random.len() as u64);
+        for report in reports {
+            let logical = report.logical_produced;
+            assert!(
+                report.compressed_consumed
+                    <= INPUT_BUDGET_CAP + logical + logical / 64 + INPUT_BUFFER_LEN as u64
+            );
+        }
+
+        let empty_run = crc64_stream(&[]).repeat(80_000);
+        let (consumed, logical) = match xz_error("xz-budget-empty", &empty_run) {
+            PreflightError::CompressedInputBudgetExceeded {
+                compressed_consumed,
+                logical_produced,
+            } => (compressed_consumed, logical_produced),
+            other => panic!("expected CompressedInputBudgetExceeded, got {other:?}"),
+        };
+        assert_eq!(logical, 0);
+        assert!(consumed > INPUT_BUDGET_CAP);
+        assert!(consumed <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64);
+
+        let long_padding = [crc64_stream(b"x"), vec![0u8; 4 << 20]].concat();
+        let error = xz_error("xz-budget-padding", &long_padding);
+        assert!(
+            matches!(error, PreflightError::CompressedInputBudgetExceeded { .. }),
+            "{error:?}"
+        );
+    }
+
+    // X20: a failing source is `Io`, never corrupt or incomplete -- at every
+    // point of the stream, including inside the Stream Padding.
+    #[test]
+    fn xz_source_failures_are_io() {
+        let contents = [crc64_stream(&payload_b()), vec![0u8; 256]].concat();
+
+        for fail_at in [0, 13, contents.len() / 2, contents.len() - 100] {
+            for kind in [io::ErrorKind::UnexpectedEof, io::ErrorKind::InvalidData] {
+                let result = preflight_stream(
+                    CompressionFormat::Xz,
+                    scripted(&contents, Some((fail_at, kind))),
+                    contents.len() as u64,
+                    NO_LIMIT,
+                    &mut || false,
+                    &mut |_| {},
+                );
+                match result {
+                    Err(PreflightError::Io(error)) => assert_eq!(error.kind(), kind),
+                    other => panic!("fail_at={fail_at} {kind:?}: expected Io, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    // X20: a clean end is only success with the whole compressed size
+    // consumed: a stream followed by bytes the cursor never reaches (the
+    // size given is larger than the data) is not success.
+    #[test]
+    fn xz_success_requires_exact_input_consumption() {
+        let contents = crc64_stream(&payload_a());
+
+        let exact = preflight_stream(
+            CompressionFormat::Xz,
+            scripted(&contents, None),
+            contents.len() as u64,
+            NO_LIMIT,
+            &mut || false,
+            &mut |_| {},
+        );
+        assert_eq!(exact.unwrap(), payload_a().len() as u64);
+
+        let result = preflight_stream(
+            CompressionFormat::Xz,
+            scripted(&contents, None),
+            contents.len() as u64 + 4,
+            NO_LIMIT,
+            &mut || false,
+            &mut |_| {},
+        );
+        assert!(
+            matches!(
+                result,
+                Err(PreflightError::InputConsumptionMismatch { consumed, compressed_size })
+                    if consumed == contents.len() as u64 && compressed_size == consumed + 4
+            ),
+            "{result:?}"
+        );
+    }
+
+    // Every typed liblzma error maps to its Preflight category; the crate's
+    // untyped end-of-input error is incomplete. (Mem / Program / decoder
+    // setup failures cannot be provoked from data, so the mapping itself is
+    // checked here.)
+    #[test]
+    fn liblzma_errors_are_classified_by_type() {
+        use liblzma::stream::Error as Lzma;
+        let classify = |lzma: Lzma| classify_error(io::Error::from(lzma));
+
         assert!(matches!(
-            result,
-            Err(PreflightError::UnsupportedFormat(CompressionFormat::Xz))
+            classify(Lzma::NoCheck),
+            PreflightError::IntegrityCheckMissing
+        ));
+        assert!(matches!(
+            classify(Lzma::UnsupportedCheck),
+            PreflightError::UnsupportedIntegrityCheck
+        ));
+        assert!(matches!(
+            classify(Lzma::MemLimit),
+            PreflightError::DecoderMemoryLimitExceeded { limit } if limit == XZ_DECODER_MEMLIMIT
+        ));
+        for lzma in [Lzma::Mem, Lzma::Program] {
+            assert!(
+                matches!(classify(lzma), PreflightError::DecoderFailure(_)),
+                "{lzma:?}"
+            );
+        }
+        for lzma in [Lzma::Data, Lzma::Format, Lzma::Options] {
+            assert!(
+                matches!(classify(lzma), PreflightError::Corrupt(_)),
+                "{lzma:?}"
+            );
+        }
+
+        let premature = io::Error::new(io::ErrorKind::UnexpectedEof, "premature eof");
+        assert!(matches!(
+            classify_error(premature),
+            PreflightError::Incomplete(_)
         ));
     }
 
@@ -1920,7 +2551,8 @@ mod tests {
         let contents = gzip_at(&[], 6).repeat(60_000);
 
         let polls = Cell::new(0u32);
-        let exceeded = preflight_gzip(
+        let exceeded = preflight_stream(
+            CompressionFormat::Gzip,
             scripted(&contents, None),
             contents.len() as u64,
             NO_LIMIT,
@@ -1937,7 +2569,8 @@ mod tests {
         let failing_poll = polls.get();
 
         let polls = Cell::new(0u32);
-        let cancelled = preflight_gzip(
+        let cancelled = preflight_stream(
+            CompressionFormat::Gzip,
             scripted(&contents, None),
             contents.len() as u64,
             NO_LIMIT,

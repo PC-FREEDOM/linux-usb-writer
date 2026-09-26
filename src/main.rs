@@ -616,6 +616,167 @@ fn confirmation_matches(input: &str, expected_device: &str) -> bool {
     input.trim() == expected_device
 }
 
+// How often `wait_for_prompt_input` re-checks for cancellation while no
+// input has arrived yet. Bounds how long a Ctrl+C during the Human
+// Confirmation prompt can go unnoticed; small enough to feel immediate,
+// large enough that the idle wait costs nothing measurable.
+const PROMPT_CANCEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
+// The result of waiting for one line of prompt input while also watching for
+// cancellation. `Line`/`Eof`/`Error` are exactly what a plain
+// `stdin().read_line()` could report (`Ok(n > 0)`/`Ok(0)`/`Err`); `Cancelled`
+// is the one outcome a blocking `read_line()` on the main thread could never
+// produce here -- `ctrlc` installs its SIGINT handler with `SA_RESTART`, so
+// the kernel silently restarts an in-progress `read()` after Ctrl+C instead
+// of interrupting it (see reports/latest.md's D3 technical verification).
+#[derive(Debug)]
+enum PromptInput {
+    Line(String),
+    Eof,
+    Error(std::io::Error),
+    Cancelled,
+}
+
+// Starts a dedicated thread that performs exactly one blocking
+// `stdin().read_line()` and sends its result back over the returned
+// channel. The thread never observes cancellation itself -- it is simply
+// left blocked in `read_line()` if the caller stops waiting (see
+// `wait_for_prompt_input`); on that path the caller returns
+// `WriteTestExit::Cancelled`, and `main()`'s top-level `std::process::exit`
+// then ends the process, reader thread included. Stdin is never read again
+// by anything else after a cancellation, so the abandoned thread's stdin
+// lock can never block other code. A thread-spawn failure is returned to
+// the caller rather than panicking.
+fn spawn_prompt_reader() -> std::io::Result<std::sync::mpsc::Receiver<PromptInput>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+
+    std::thread::Builder::new()
+        .name("prompt-reader".into())
+        .spawn(move || {
+            let mut line = String::new();
+            let input = match std::io::stdin().read_line(&mut line) {
+                Ok(0) => PromptInput::Eof,
+                Ok(_) => PromptInput::Line(line),
+                Err(error) => PromptInput::Error(error),
+            };
+            // The receiver may already be gone (the caller stopped waiting
+            // because of a cancellation); nothing more to do in that case.
+            let _ = sender.send(input);
+        })?;
+
+    Ok(receiver)
+}
+
+// Waits for the prompt reader's result while checking `is_cancelled` before
+// every wait and after every received input. Cancellation always wins: an
+// input that arrives at (nearly) the same moment as a Ctrl+C is discarded in
+// favor of `Cancelled`, so a correctly typed confirmation can never carry a
+// run past a cancellation that was already requested. Takes the receiver
+// and the cancellation check as parameters (not `stdin`/`CancelHandle`
+// directly) so every branch is unit-testable without a terminal. A
+// disconnected channel without a result (the reader thread died without
+// sending) is reported as `Error`, never as a confirmation.
+fn wait_for_prompt_input(
+    receiver: &std::sync::mpsc::Receiver<PromptInput>,
+    is_cancelled: impl Fn() -> bool,
+    poll_interval: std::time::Duration,
+) -> PromptInput {
+    loop {
+        if is_cancelled() {
+            return PromptInput::Cancelled;
+        }
+
+        match receiver.recv_timeout(poll_interval) {
+            Ok(input) => {
+                if is_cancelled() {
+                    return PromptInput::Cancelled;
+                }
+                return input;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if is_cancelled() {
+                    return PromptInput::Cancelled;
+                }
+                return PromptInput::Error(std::io::Error::other(
+                    "prompt reader ended without reporting a result",
+                ));
+            }
+        }
+    }
+}
+
+// How a unit of blocking work handed to `run_off_main_thread` ended.
+// `NotStarted` hands the input back untouched (the worker thread could not
+// be created, so the work never began), letting the caller decide how to
+// proceed without having lost the value.
+#[derive(Debug)]
+enum OffMainThread<T, R> {
+    Finished(R),
+    Panicked,
+    NotStarted(T, std::io::Error),
+}
+
+// Runs `work(input)` on a dedicated, scoped worker thread and blocks the
+// calling (main) thread in `join()` until it finishes. Exists for
+// `Syncing::sync()`: `fsync()` on a block device keeps the calling thread
+// in uninterruptible sleep, and the kernel delivers a terminal SIGINT to the
+// main thread first -- so when the main thread itself was in `fsync()`,
+// ctrlc's OS-level handler only ran once `fsync()` returned, and the
+// `request_cancel()` its dispatch thread performs could lose the race
+// against the post-sync cancel check (see reports/latest.md). Waiting in
+// `join()` instead is an interruptible wait, so a Ctrl+C during sync is
+// handled while sync is still running. This narrows the window to a
+// Ctrl+C landing at (nearly) the same moment sync completes; it does not
+// make that residual race impossible.
+//
+// The work itself is never interrupted: `join()` always waits for it to
+// finish. A panic inside `work` is reported as `Panicked` rather than
+// propagated into the main thread; the input was consumed by the worker in
+// that case (its destructors ran there during unwinding).
+fn run_off_main_thread<T: Send, R: Send>(
+    input: T,
+    work: impl FnOnce(T) -> R + Send,
+) -> OffMainThread<T, R> {
+    let mut slot = Some(input);
+    let slot_ref = &mut slot;
+
+    let joined = std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .name("sync-worker".into())
+            .spawn_scoped(scope, move || {
+                let input = slot_ref
+                    .take()
+                    .expect("worker input is present until the worker takes it");
+                work(input)
+            })
+            .map(|handle| handle.join())
+    });
+
+    match joined {
+        Ok(Ok(result)) => OffMainThread::Finished(result),
+        Ok(Err(_panic_payload)) => OffMainThread::Panicked,
+        Err(spawn_error) => match slot.take() {
+            Some(input) => OffMainThread::NotStarted(input, spawn_error),
+            None => OffMainThread::Panicked,
+        },
+    }
+}
+
+// What `run_write_test` does right after sync reported success: stop as
+// `Cancelled` if a cancellation was requested (sync has already finished,
+// so the full image is on the target and only verification is skipped), or
+// `None` to continue into Verify. Deliberately only for the success path:
+// a sync failure is always reported as that failure, never masked by a
+// cancellation that happened at the same time.
+fn exit_after_successful_sync(cancel_requested: bool) -> Option<WriteTestExit> {
+    if cancel_requested {
+        Some(WriteTestExit::Cancelled)
+    } else {
+        None
+    }
+}
+
 // How `run_write_test` finished, for `main()` to turn into a process exit
 // code -- see `write_test_exit_code` below. Deliberately not richer than
 // this (no byte counts, no phase): every message a human needs has already
@@ -647,7 +808,8 @@ fn write_test_exit_code(exit: WriteTestExit) -> Option<i32> {
 }
 
 // Installs the process-wide Ctrl+C (SIGINT) handler that lets a user
-// actually cancel an in-progress `write-test` write or Verify -- the
+// actually cancel an in-progress `write-test` image preparation, Human
+// Confirmation prompt, write, or Verify -- the
 // missing "last mile" identified by the v0.1 audit: `write_job::CancelHandle`
 // itself, and every write/Verify loop's use of it, already existed and were
 // already unit-tested; nothing anywhere in this crate could ever trigger
@@ -668,6 +830,15 @@ fn write_test_exit_code(exit: WriteTestExit) -> Option<i32> {
 // Deliberately a small, named function rather than an inline closure at the
 // call site: this is the one and only place in this crate that touches
 // `ctrlc` at all, so isolating it here keeps that fact easy to audit.
+//
+// Because the handler only ever sets a flag, it cannot by itself end a
+// blocking read: `ctrlc` registers with `SA_RESTART`, so a `read_line()`
+// in progress on the main thread simply resumes after Ctrl+C. The Human
+// Confirmation prompt therefore reads stdin on a separate thread and polls
+// this flag instead (`spawn_prompt_reader`/`wait_for_prompt_input`), which
+// keeps this closure a one-liner and keeps `std::process::exit` confined to
+// `main()`. The `--test-pause-before-verify` prompt deliberately still
+// blocks on the main thread (known limitation of that test-only mode).
 fn install_cancel_handler(cancel: write_job::CancelHandle) -> Result<(), ctrlc::Error> {
     ctrlc::set_handler(move || {
         cancel.request_cancel(write_job::CancelReason::UserRequested);
@@ -786,6 +957,30 @@ fn run_write_test(
         unreachable!("is_ready_to_open just confirmed Selected");
     };
 
+    // Cancel wiring (Ctrl+C -> CancelHandle): one shared handle, created and
+    // wired to Ctrl+C as soon as target selection has succeeded -- before
+    // the image is opened, so image preparation (and, in future, a
+    // compressed image's Preflight Scan, which will receive a
+    // `|| cancel.is_requested()` closure rather than the handle itself) is
+    // already covered. Ctrl+C during argument parsing or device enumeration
+    // (above) keeps its ordinary "just terminate the process" behavior:
+    // nothing has been opened yet at that point. The same `cancel` is
+    // checked after the image is opened, watched during the Human
+    // Confirmation prompt, cloned into `begin_write()`, checked again after
+    // sync, and cloned into `begin_verify()` -- one Ctrl+C anywhere from here
+    // through the end of Verify is honored by whichever phase happens to be
+    // running. It is one-shot: there is no way to reset it, so a cancelled
+    // run can never continue.
+    let cancel = write_job::CancelHandle::new();
+
+    if let Err(error) = install_cancel_handler(cancel.clone()) {
+        println!("write-test: failed to install the Ctrl+C handler: {error:?}");
+        println!(
+            "write-test: refusing to start a destructive write without a working cancel path."
+        );
+        return Ok(WriteTestExit::Completed);
+    }
+
     // The one and only place `image_path` is opened this invocation.
     // `selected_image` is what travels, as a single variable, all the way
     // to `AuthorizedExecution::bind()` below -- `selection()` (a cheap Copy)
@@ -803,6 +998,16 @@ fn run_write_test(
         "\nwrite-test: image selected from {image_path} (image_size={} bytes)",
         selected_image.logical_size()
     );
+
+    // Ctrl+C may have arrived while the image was being opened. Nothing on
+    // the target side has been opened at this point (OpenDevice only happens
+    // after confirmation), so stopping here is unconditionally safe.
+    if cancel.is_requested() {
+        for line in format_cancelled_before_confirmation() {
+            println!("write-test: {line}");
+        }
+        return Ok(WriteTestExit::Cancelled);
+    }
 
     // ---- Pre-write Safety Summary / Destructive Warning / Human Confirmation ----
     // Reuses `baseline`/`baseline_assessment` from the same `state` that
@@ -843,11 +1048,32 @@ fn run_write_test(
     print!("> ");
     let _ = std::io::stdout().flush();
 
-    let mut confirmation_input = String::new();
-    let confirmed = match std::io::stdin().read_line(&mut confirmation_input) {
-        Ok(0) => false, // EOF (e.g. stdin closed or redirected from an empty source): treat as "no answer given", never as an implicit yes.
-        Ok(_) => confirmation_matches(&confirmation_input, &expected_device),
-        Err(_) => false,
+    // stdin is read on a separate thread so a Ctrl+C here is noticed within
+    // `PROMPT_CANCEL_POLL_INTERVAL` instead of being swallowed by the
+    // `SA_RESTART`-restarted `read_line()` (see `install_cancel_handler`).
+    let prompt_input = match spawn_prompt_reader() {
+        Ok(receiver) => wait_for_prompt_input(
+            &receiver,
+            || cancel.is_requested(),
+            PROMPT_CANCEL_POLL_INTERVAL,
+        ),
+        Err(error) => PromptInput::Error(error),
+    };
+
+    let confirmed = match prompt_input {
+        PromptInput::Line(input) => confirmation_matches(&input, &expected_device),
+        PromptInput::Eof => false, // EOF (e.g. stdin closed or redirected from an empty source): treat as "no answer given", never as an implicit yes.
+        PromptInput::Error(error) => {
+            println!("write-test: failed to read the confirmation input: {error}");
+            false
+        }
+        PromptInput::Cancelled => {
+            println!();
+            for line in format_cancelled_before_confirmation() {
+                println!("write-test: {line}");
+            }
+            return Ok(WriteTestExit::Cancelled);
+        }
     };
 
     if !confirmed {
@@ -856,26 +1082,6 @@ fn run_write_test(
     }
 
     println!("write-test: confirmation accepted for {expected_device}");
-
-    // Cancel wiring (Ctrl+C -> CancelHandle): one shared handle, created and
-    // wired to Ctrl+C only now that a destructive operation is genuinely
-    // about to happen -- not at process startup, and not before this point,
-    // so Ctrl+C during argument parsing, device enumeration, or this very
-    // confirmation prompt keeps its ordinary "just terminate the process"
-    // behavior (nothing has been opened or written yet, so there is nothing
-    // to clean up). The same `cancel` is cloned into `begin_write()` below
-    // and, further down, into `begin_verify()` -- one Ctrl+C anywhere from
-    // here through the end of Verify is honored by whichever phase happens
-    // to be running, instead of being scoped to only one of them.
-    let cancel = write_job::CancelHandle::new();
-
-    if let Err(error) = install_cancel_handler(cancel.clone()) {
-        println!("write-test: failed to install the Ctrl+C handler: {error:?}");
-        println!(
-            "write-test: refusing to start a destructive write without a working cancel path."
-        );
-        return Ok(WriteTestExit::Completed);
-    }
 
     // `verify_mode` is the CLI's own choice (see the `write-test` dispatch in
     // `main()`), frozen into the `ConfirmationToken`/`WritePlan` below via
@@ -1050,12 +1256,56 @@ fn run_write_test(
             // Write success -> sync, in the same straight line, with no
             // branch that returns early and skips it.
             println!("write-test: syncing...");
-            match succeeded.begin_sync().sync() {
+            // Sync runs on a worker thread while this (main) thread waits in
+            // an interruptible `join()` -- see `run_off_main_thread` for why
+            // this matters for a Ctrl+C pressed during sync. Sync is still
+            // awaited to completion; it is never interrupted.
+            let syncing = succeeded.begin_sync();
+            let sync_outcome = match run_off_main_thread(syncing, |syncing| syncing.sync()) {
+                OffMainThread::Finished(outcome) => outcome,
+                OffMainThread::NotStarted(syncing, error) => {
+                    // Durability first: if no worker thread can be created,
+                    // sync on this thread rather than skip it. A Ctrl+C
+                    // during this sync may only be observed once it returns
+                    // (the post-sync check below still runs).
+                    println!(
+                        "write-test: could not start the sync worker thread ({error}); syncing on the main thread instead"
+                    );
+                    syncing.sync()
+                }
+                OffMainThread::Panicked => {
+                    for line in format_sync_worker_panicked() {
+                        println!("write-test: {line}");
+                    }
+                    if cancel.is_requested() {
+                        println!(
+                            "write-test: cancellation was also requested; the sync failure above is the result"
+                        );
+                    }
+                    return Ok(WriteTestExit::Completed);
+                }
+            };
+
+            match sync_outcome {
                 write_job::SyncAttemptOutcome::Succeeded(sync_succeeded) => {
                     println!(
                         "write-test: sync succeeded -- write + sync completed ({} bytes)",
                         sync_succeeded.bytes_written
                     );
+
+                    // Sync itself is never interrupted (durability first),
+                    // but a Ctrl+C accepted while it ran must not be silently
+                    // turned into `Completed` -- for any `VerifyMode`,
+                    // including `None`, which never reaches the Quick/Full
+                    // early cancel check further below. That later check
+                    // stays: it still covers a cancellation arriving after
+                    // this point (e.g. during the test-only pause).
+                    if let Some(exit) = exit_after_successful_sync(cancel.is_requested()) {
+                        for line in format_cancelled_after_sync() {
+                            println!("write-test: {line}");
+                        }
+                        return Ok(exit);
+                    }
 
                     // ---- Built-in Verify (self-contained: this arm always
                     // returns, so `selected_image` being consumed here --
@@ -1063,12 +1313,12 @@ fn run_write_test(
                     // trailing print below, which only the *other* three
                     // arms (which never touch `selected_image`) can reach.
                     // `cancel.clone()`, the same shared handle Ctrl+C was
-                    // wired to after Human Confirmation -- a cancellation
-                    // requested at any point up to now (during write, during
-                    // the blocking `sync_all()` above, or simply while the
-                    // user was reading these messages) is still honored: see
-                    // the early cancel check right after the TEST PAUSE
-                    // block below. ----
+                    // wired to right after target selection -- a
+                    // cancellation requested during write or sync was
+                    // already honored by the post-sync check above; one
+                    // requested after that check is still honored by the
+                    // early cancel check right after the TEST PAUSE block
+                    // below. ----
                     match sync_succeeded.begin_verify(selected_image, cancel.clone()) {
                         write_job::VerifyStart::Skipped(image, succeeded) => {
                             println!("write-test: {}", format_verify_succeeded(&succeeded));
@@ -1121,12 +1371,11 @@ fn run_write_test(
                                 return Ok(WriteTestExit::Completed);
                             }
 
-                            // Cancel wiring: a Ctrl+C requested at any point
-                            // up to here (during write, during sync's
-                            // blocking `sync_all()`, during the TEST PAUSE
-                            // above, or simply while reading these messages)
-                            // must be honored now, before any further D-Bus
-                            // call or FD is opened for Verify.
+                            // Cancel wiring: a Ctrl+C requested after the
+                            // post-sync check (during the TEST PAUSE above,
+                            // or simply while reading these messages) must be
+                            // honored now, before any further D-Bus call or
+                            // FD is opened for Verify.
                             // `begin_verify()` itself does not check this
                             // (it only branches on `VerifyMode` -- see its
                             // own doc comment in `write_job.rs`), so this is
@@ -1331,6 +1580,14 @@ fn run_write_test(
                         "write-test: retry_requires_fresh_gate={} -- not retrying automatically",
                         failed.retry_requires_fresh_gate
                     );
+                    // A real sync failure is never masked by a cancellation
+                    // requested at the same time: the result stays the
+                    // failure (`Completed`, as before); this only notes it.
+                    if cancel.is_requested() {
+                        println!(
+                            "write-test: cancellation was also requested; the sync failure above is the result"
+                        );
+                    }
                     WriteTestExit::Completed
                 }
             }
@@ -1655,21 +1912,67 @@ fn format_verify_diagnostics_unavailable() -> Vec<String> {
 // pattern: no `println!` here, only line content for the caller to prefix.
 // ---------------------------------------------------------------------
 
-// A cancelled write is never a success: `target may contain a partial
-// image` and `verification was not attempted` are stated unconditionally,
-// regardless of `bytes_written` -- even a cancellation observed before any
-// chunk completed must not be worded as if the target were untouched
-// (`writer::write()`'s own pre-loop cancel check can still report
-// `bytes_written == 0`, which is still "cancelled", not "nothing to worry
-// about").
+// A cancelled write is never a success: it is always reported as a
+// cancellation, and `verification was not attempted` is stated
+// unconditionally. What it says about the target follows
+// `target_may_be_modified` -- the Job layer's safety-biased field for
+// exactly this question -- OR'd with `bytes_written > 0` as a defensive
+// fallback, so any disagreement between the two is resolved toward
+// "partial image". Only when both say nothing was written (a cancellation
+// `writer::write()` observed before its first chunk) does this say so. The
+// target was still opened read-write by then, so the wording is "no data was
+// written", never "not opened"/"untouched".
 fn format_write_cancelled(cancelled: &write_job::Cancelled) -> Vec<String> {
+    let target_line = if cancelled.target_may_be_modified || cancelled.bytes_written > 0 {
+        "target may contain a partial image"
+    } else {
+        "no data was written to the target device"
+    };
+
     vec![
         format!(
             "write cancelled after {} of {} bytes",
             cancelled.bytes_written, cancelled.image_size
         ),
-        "target may contain a partial image".to_string(),
+        target_line.to_string(),
         "verification was not attempted".to_string(),
+    ]
+}
+
+// Shown when a cancellation is observed before the Human Confirmation step
+// completed -- after the image was opened, or while waiting at the prompt.
+// At that point the target has not been opened by this program at all
+// (OpenDevice only happens after confirmation), which is what makes the
+// second line a statement of fact rather than a hope.
+fn format_cancelled_before_confirmation() -> Vec<String> {
+    vec![
+        "cancelled before confirmation.".to_string(),
+        "the target device has not been opened or modified.".to_string(),
+    ]
+}
+
+// Shown when a cancellation requested while sync was running is observed
+// right after sync succeeded. Sync is never interrupted, so by then the full
+// image has been written and synced; only verification is skipped. Worded so
+// it cannot be read as a partial write.
+fn format_cancelled_after_sync() -> Vec<String> {
+    vec![
+        "cancellation was requested during sync; sync was allowed to finish.".to_string(),
+        "write + sync completed successfully; the full image is on the target.".to_string(),
+        "verification was not started.".to_string(),
+    ]
+}
+
+// Shown when the sync worker thread panicked instead of returning a
+// `SyncAttemptOutcome`. Treated like a sync failure: the write had
+// completed, but sync never reported success, so durability is not
+// confirmed. The write-mode FD was released when the worker unwound.
+fn format_sync_worker_panicked() -> Vec<String> {
+    vec![
+        "sync FAILED: the sync worker thread panicked before reporting a result".to_string(),
+        "the image was written, but sync did not report success; durability is not confirmed."
+            .to_string(),
+        "verification was not started.".to_string(),
     ]
 }
 
@@ -1813,19 +2116,25 @@ fn run_writer_test_inner(temp_path: &std::path::Path) -> Result<(), String> {
 mod tests {
     use super::confirmation_matches;
     use super::{
-        format_hard_hazards, format_identity_comparison, format_instance_comparison,
+        OffMainThread, PromptInput, WriteTestArgsError, WriteTestExit, exit_after_successful_sync,
+        format_cancelled_after_sync, format_cancelled_before_confirmation, format_hard_hazards,
+        format_identity_comparison, format_instance_comparison, format_sync_worker_panicked,
         format_verify_cancelled, format_verify_cancelled_before_start,
         format_verify_diagnostics_summary, format_verify_diagnostics_unavailable,
         format_verify_failure_reason, format_verify_succeeded, format_write_cancelled,
-        parse_verify_mode, parse_write_test_trailing_args, write_test_exit_code,
-        WriteTestArgsError, WriteTestExit,
+        parse_verify_mode, parse_write_test_trailing_args, run_off_main_thread,
+        wait_for_prompt_input, write_test_exit_code,
     };
     use crate::device::DeviceSnapshot;
     use crate::execution::core::{self, HardHazardReason, VerifyMode};
     use crate::execution::write_job::{
-        CancelReason, Cancelled, VerifyCancelled, VerifyFailureReason, VerifySucceeded,
+        CancelHandle, CancelReason, Cancelled, VerifyCancelled, VerifyFailureReason,
+        VerifySucceeded,
     };
     use crate::identity::{IdentityComparison, InstanceComparison};
+    use std::cell::Cell;
+    use std::sync::mpsc;
+    use std::time::Duration;
 
     // A. Exact match -> true.
     #[test]
@@ -2278,8 +2587,10 @@ mod tests {
         );
     }
 
-    // Z2. A write cancelled before any chunk completed (bytes_written == 0)
-    // is still reported as a cancellation, never implying nothing happened.
+    // Z2. A write cancelled before any chunk completed (bytes_written == 0,
+    // target_may_be_modified == false) is still reported as a cancellation,
+    // but says no data was written -- never "partial image", and never "not
+    // opened" (the target was opened read-write by then).
     #[test]
     fn format_write_cancelled_reports_zero_bytes_before_any_chunk() {
         let cancelled = Cancelled {
@@ -2291,7 +2602,328 @@ mod tests {
         };
 
         let lines = format_write_cancelled(&cancelled);
-        assert_eq!(lines[0], "write cancelled after 0 of 1000000 bytes");
+        assert_eq!(
+            lines,
+            vec![
+                "write cancelled after 0 of 1000000 bytes".to_string(),
+                "no data was written to the target device".to_string(),
+                "verification was not attempted".to_string(),
+            ]
+        );
+        assert!(lines.iter().all(|line| !line.contains("partial image")));
+        assert!(lines.iter().all(|line| !line.contains("not opened")));
+    }
+
+    // Z2b. Defensive: if `target_may_be_modified` is true even though
+    // `bytes_written == 0` (not produced by today's `Writing::write()`, but
+    // the field is the safety-biased authority), the safe-side "partial
+    // image" wording wins.
+    #[test]
+    fn format_write_cancelled_zero_bytes_but_possibly_modified_reports_partial() {
+        let cancelled = Cancelled {
+            image_size: 1_000_000,
+            bytes_written: 0,
+            reason: CancelReason::UserRequested,
+            target_may_be_modified: true,
+            retry_requires_fresh_gate: true,
+        };
+
+        let lines = format_write_cancelled(&cancelled);
+        assert_eq!(lines[1], "target may contain a partial image");
+        assert!(
+            lines
+                .iter()
+                .all(|line| !line.contains("no data was written"))
+        );
+    }
+
+    // Z2c. Defensive in the other direction: bytes were written but the flag
+    // says unmodified (also not produced today) -- still "partial image".
+    #[test]
+    fn format_write_cancelled_bytes_written_without_flag_reports_partial() {
+        let cancelled = Cancelled {
+            image_size: 1_000_000,
+            bytes_written: 4096,
+            reason: CancelReason::UserRequested,
+            target_may_be_modified: false,
+            retry_requires_fresh_gate: true,
+        };
+
+        assert_eq!(
+            format_write_cancelled(&cancelled)[1],
+            "target may contain a partial image"
+        );
+    }
+
+    // Z2d. Cancelled before confirmation: states the target was neither
+    // opened nor modified.
+    #[test]
+    fn format_cancelled_before_confirmation_states_target_untouched() {
+        assert_eq!(
+            format_cancelled_before_confirmation(),
+            vec![
+                "cancelled before confirmation.".to_string(),
+                "the target device has not been opened or modified.".to_string(),
+            ]
+        );
+    }
+
+    // Z2e. Cancelled during sync: states sync finished, the full image is on
+    // the target, and verification was not started -- never "partial".
+    #[test]
+    fn format_cancelled_after_sync_states_full_image_and_no_verification() {
+        let lines = format_cancelled_after_sync();
+
+        assert_eq!(
+            lines,
+            vec![
+                "cancellation was requested during sync; sync was allowed to finish.".to_string(),
+                "write + sync completed successfully; the full image is on the target.".to_string(),
+                "verification was not started.".to_string(),
+            ]
+        );
+        assert!(lines.iter().all(|line| !line.contains("partial")));
+    }
+
+    // ---------------------------------------------------------------------
+    // Sync off the main thread (S1): `run_off_main_thread` is exercised with
+    // plain closures standing in for `Syncing::sync()` -- no block device,
+    // no fsync. The real call site's `Syncing`/`SyncAttemptOutcome` Send
+    // bounds are enforced by the compiler at that call site itself.
+    // ---------------------------------------------------------------------
+
+    // S1a. A successful result is returned to the caller unchanged, and the
+    // work ran on a thread other than the caller's.
+    #[test]
+    fn off_main_thread_returns_success_from_another_thread() {
+        let caller = std::thread::current().id();
+
+        match run_off_main_thread(21u32, |value| (value * 2, std::thread::current().id())) {
+            OffMainThread::Finished((result, worker)) => {
+                assert_eq!(result, 42);
+                assert_ne!(worker, caller, "work must not run on the calling thread");
+            }
+            other => panic!("expected Finished, got {other:?}"),
+        }
+    }
+
+    // S1b. An error result (the stand-in for `SyncAttemptOutcome::Failed`) is
+    // returned as-is -- `Finished`, not `Panicked`: a failure the work
+    // reported is a result, not a crash.
+    #[test]
+    fn off_main_thread_returns_error_result_unchanged() {
+        let outcome = run_off_main_thread((), |()| -> Result<(), std::io::Error> {
+            Err(std::io::Error::other("sync failed"))
+        });
+
+        match outcome {
+            OffMainThread::Finished(Err(error)) => assert_eq!(error.to_string(), "sync failed"),
+            other => panic!("expected Finished(Err), got {other:?}"),
+        }
+    }
+
+    // S1c. A panic in the worker is reported as `Panicked` instead of
+    // propagating into the caller. (The panic message printed to stderr by
+    // the default hook is expected test output.)
+    #[test]
+    fn off_main_thread_reports_worker_panic() {
+        let outcome = run_off_main_thread((), |()| -> u32 {
+            panic!("simulated sync worker panic");
+        });
+
+        assert!(matches!(outcome, OffMainThread::Panicked));
+    }
+
+    // S1d. The caller blocks until the work has fully finished -- the work is
+    // never abandoned or interrupted, even if it takes a while.
+    #[test]
+    fn off_main_thread_waits_for_work_to_complete() {
+        let outcome = run_off_main_thread(Duration::from_millis(30), |delay| {
+            std::thread::sleep(delay);
+            "done"
+        });
+
+        assert!(matches!(outcome, OffMainThread::Finished("done")));
+    }
+
+    // S1e. After a successful sync: cancellation requested -> Cancelled
+    // (exit 130); not requested -> continue into Verify.
+    #[test]
+    fn exit_after_successful_sync_follows_cancel_flag() {
+        assert_eq!(
+            exit_after_successful_sync(true),
+            Some(WriteTestExit::Cancelled)
+        );
+        assert_eq!(write_test_exit_code(WriteTestExit::Cancelled), Some(130));
+        assert_eq!(exit_after_successful_sync(false), None);
+    }
+
+    // S1f. A panicked sync worker is reported as a sync failure: it never
+    // claims success or a full, synced image.
+    #[test]
+    fn format_sync_worker_panicked_reports_failure_without_claiming_durability() {
+        let lines = format_sync_worker_panicked();
+
+        assert!(lines[0].starts_with("sync FAILED"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("durability is not confirmed"))
+        );
+        assert!(lines.iter().all(|line| !line.contains("succeeded")));
+    }
+
+    // ---------------------------------------------------------------------
+    // Human Confirmation prompt wait (D3): `wait_for_prompt_input` is driven
+    // here with a plain channel and a plain closure -- no stdin, no terminal,
+    // no signal. A 1 ms poll interval keeps the waiting tests fast.
+    // ---------------------------------------------------------------------
+
+    const TEST_POLL: Duration = Duration::from_millis(1);
+
+    // P1. A line that arrives with no cancellation is returned unchanged.
+    #[test]
+    fn prompt_wait_returns_line() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PromptInput::Line("/dev/sdb\n".to_string()))
+            .unwrap();
+
+        match wait_for_prompt_input(&receiver, || false, TEST_POLL) {
+            PromptInput::Line(line) => assert_eq!(line, "/dev/sdb\n"),
+            other => panic!("expected Line, got {other:?}"),
+        }
+    }
+
+    // P2. EOF is passed through as Eof (never treated as a confirmation).
+    #[test]
+    fn prompt_wait_returns_eof() {
+        let (sender, receiver) = mpsc::channel();
+        sender.send(PromptInput::Eof).unwrap();
+
+        assert!(matches!(
+            wait_for_prompt_input(&receiver, || false, TEST_POLL),
+            PromptInput::Eof
+        ));
+    }
+
+    // P3. A read error is passed through as Error.
+    #[test]
+    fn prompt_wait_returns_input_error() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PromptInput::Error(std::io::Error::other("boom")))
+            .unwrap();
+
+        match wait_for_prompt_input(&receiver, || false, TEST_POLL) {
+            PromptInput::Error(error) => assert_eq!(error.to_string(), "boom"),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    // P4. Cancellation requested while waiting (no input ever arrives; the
+    // sender stays alive, like a reader thread blocked in read_line) ends the
+    // wait with Cancelled after a few polls.
+    #[test]
+    fn prompt_wait_returns_cancelled_when_cancel_arrives_while_waiting() {
+        let (_sender, receiver) = mpsc::channel::<PromptInput>();
+        let checks = Cell::new(0u32);
+
+        let result = wait_for_prompt_input(
+            &receiver,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 3
+            },
+            TEST_POLL,
+        );
+
+        assert!(matches!(result, PromptInput::Cancelled));
+        assert!(checks.get() > 3, "must have polled before cancelling");
+    }
+
+    // P4b. Same, driven by a real `CancelHandle` from another thread -- the
+    // exact `|| cancel.is_requested()` shape `run_write_test` uses.
+    #[test]
+    fn prompt_wait_observes_cancel_handle_from_another_thread() {
+        let (_sender, receiver) = mpsc::channel::<PromptInput>();
+        let cancel = CancelHandle::new();
+        let remote = cancel.clone();
+
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            remote.request_cancel(CancelReason::UserRequested);
+        });
+
+        let result = wait_for_prompt_input(&receiver, || cancel.is_requested(), TEST_POLL);
+        canceller.join().unwrap();
+
+        assert!(matches!(result, PromptInput::Cancelled));
+    }
+
+    // P5. Already cancelled before waiting starts: Cancelled, even though a
+    // (correct) line is already queued.
+    #[test]
+    fn prompt_wait_returns_cancelled_when_already_cancelled() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PromptInput::Line("/dev/sdb\n".to_string()))
+            .unwrap();
+
+        assert!(matches!(
+            wait_for_prompt_input(&receiver, || true, TEST_POLL),
+            PromptInput::Cancelled
+        ));
+    }
+
+    // P6. Input and cancellation at (nearly) the same moment: the first
+    // check sees no cancellation, the line is received, and the re-check
+    // right after receipt sees it -- cancellation wins and the line is
+    // discarded.
+    #[test]
+    fn prompt_wait_prefers_cancel_over_simultaneous_input() {
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(PromptInput::Line("/dev/sdb\n".to_string()))
+            .unwrap();
+        let checks = Cell::new(0u32);
+
+        let result = wait_for_prompt_input(
+            &receiver,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            },
+            TEST_POLL,
+        );
+
+        assert!(matches!(result, PromptInput::Cancelled));
+        assert_eq!(checks.get(), 2);
+    }
+
+    // P7. The reader ended without sending anything: reported as Error, never
+    // as a confirmation -- unless a cancellation was requested, which wins.
+    #[test]
+    fn prompt_wait_disconnected_reader_is_error_or_cancelled() {
+        let (sender, receiver) = mpsc::channel::<PromptInput>();
+        drop(sender);
+        assert!(matches!(
+            wait_for_prompt_input(&receiver, || false, TEST_POLL),
+            PromptInput::Error(_)
+        ));
+
+        let (sender, receiver) = mpsc::channel::<PromptInput>();
+        drop(sender);
+        let checks = Cell::new(0u32);
+        let result = wait_for_prompt_input(
+            &receiver,
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 1
+            },
+            TEST_POLL,
+        );
+        assert!(matches!(result, PromptInput::Cancelled));
     }
 
     // Z3. A cancelled Full Verify reports "Full", the bytes actually

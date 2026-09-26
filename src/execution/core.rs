@@ -1368,6 +1368,13 @@ impl AuthorizedWrite {
     pub(crate) fn image_size(&self) -> u64 {
         self.plan.image_size
     }
+
+    // `pub(crate)`, for the same consumer: `bind()` refuses a Quick Verify
+    // authorization paired with an image that cannot be read at random
+    // offsets.
+    pub(crate) fn verify_mode(&self) -> VerifyMode {
+        self.verify_mode
+    }
 }
 
 impl ActiveWrite {

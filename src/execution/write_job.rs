@@ -473,7 +473,7 @@ fn start_inner<R: Read>(
 }
 
 // Why `AuthorizedExecution::bind()` refused to bind an `AuthorizedWrite` to a
-// `SelectedImage`. Deliberately just 2 variants -- not a cryptographic
+// `SelectedImage`. The first two are identity checks -- not a cryptographic
 // content check, and not meant to be: `GenerationMismatch` is the real,
 // reachable case (the image was reselected, or a stale `AuthorizedWrite`
 // from an earlier Gate pass is being reused against a newer selection).
@@ -488,6 +488,13 @@ fn start_inner<R: Read>(
 pub enum ImageBindingError {
     GenerationMismatch,
     SizeMismatch,
+    // The Gate authorized Quick Verify, but the image cannot be read at
+    // random offsets (e.g. a compressed image): Quick Verify could never
+    // run, so the write is refused before it starts rather than after it.
+    // Defense in depth -- the CLI refuses this combination before any
+    // confirmation, and the verifier itself still refuses it
+    // (`VerifyFailureReason::UnsupportedAccess`).
+    QuickVerifyUnsupported,
 }
 
 // Proof that a Gate-authorized write (`AuthorizedWrite`) and a confirmed
@@ -532,6 +539,12 @@ impl AuthorizedExecution {
 
         if authorized.image_size() != image.logical_size() {
             return Err(ImageBindingError::SizeMismatch);
+        }
+
+        if authorized.verify_mode() == VerifyMode::Quick
+            && image.access() != ImageSourceAccess::RandomAccess
+        {
+            return Err(ImageBindingError::QuickVerifyUnsupported);
         }
 
         Ok(AuthorizedExecution { authorized, image })
@@ -2928,6 +2941,26 @@ mod tests {
         verify_mode: VerifyMode,
         cancel: CancelHandle,
     ) -> (std::path::PathBuf, WritingExecution, DeviceSnapshot) {
+        let (target_path, authorized, snapshot) =
+            gate_pass_authorized_for_image(tag, &selected_image, target_size, verify_mode);
+
+        let execution = AuthorizedExecution::bind(authorized, selected_image)
+            .expect("bind should succeed for a freshly minted SelectedImage");
+        let writing_execution = execution
+            .begin_write(cancel)
+            .expect("begin_write should succeed for a freshly opened reader");
+
+        (target_path, writing_execution, snapshot)
+    }
+
+    // The Gate part of `gate_pass_writing_execution_for_image`, up to the
+    // `AuthorizedWrite` (the target file exists, empty, and is opened).
+    fn gate_pass_authorized_for_image(
+        tag: &str,
+        selected_image: &SelectedImage,
+        target_size: u64,
+        verify_mode: VerifyMode,
+    ) -> (std::path::PathBuf, AuthorizedWrite, DeviceSnapshot) {
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -2964,15 +2997,8 @@ mod tests {
 
         let prepared = core::finalize_prepared_write(ready, Some(handle), Some(&metadata))
             .expect("finalize_prepared_write should succeed with matching FD metadata");
-        let authorized = prepared.begin();
 
-        let execution = AuthorizedExecution::bind(authorized, selected_image)
-            .expect("bind should succeed for a freshly minted SelectedImage");
-        let writing_execution = execution
-            .begin_write(cancel)
-            .expect("begin_write should succeed for a freshly opened reader");
-
-        (target_path, writing_execution, snapshot)
+        (target_path, prepared.begin(), snapshot)
     }
 
     // Drives `sync_succeeded` all the way to a `Verifying`, using
@@ -4795,51 +4821,65 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // A Preflighted gzip image through the existing write / Verify path
-    // (`CompressedImageSource`; not wired into `main.rs`).
+    // gzip through the production preparation (`crate::prepare_compressed_image`:
+    // Quick refusal, Preflight bounded by the target's capacity,
+    // post-Preflight source check) and then the existing write / Verify path.
     // ---------------------------------------------------------------------
 
-    fn gzip_selected_image(tag: &str, payload: &[u8]) -> (SelectedImage, std::path::PathBuf) {
-        use crate::image_source::compressed::{CompressedImageSource, PreflightOptions};
-        use crate::image_source::{OpenedImage, open_image};
+    fn temp_gzip_image(tag: &str, payload: &[u8]) -> std::path::PathBuf {
         use std::io::Write as _;
 
         let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
         encoder.write_all(payload).unwrap();
         let path = write_temp_image_file(tag, &encoder.finish().unwrap());
-        let path = {
-            let gz = path.with_extension("img.gz");
-            std::fs::rename(&path, &gz).unwrap();
-            gz
-        };
-
-        let compressed = match open_image(&path) {
-            Ok(OpenedImage::Compressed(file)) => file,
-            other => panic!("expected a compressed image, got {other:?}"),
-        };
-        let options = PreflightOptions {
-            max_logical_size: u64::MAX,
-        };
-        let preflighted = compressed.preflight(options, || false, |_| {}).unwrap();
-        let source = CompressedImageSource::new(preflighted);
-        (SelectedImage::new(Box::new(source)), path)
+        let gz = path.with_extension("img.gz");
+        std::fs::rename(&path, &gz).unwrap();
+        gz
     }
 
-    // The write reads one replay; Full Verify opens a second, independent
-    // replay from logical byte 0 and matches. Quick is refused (the source is
-    // sequential only), after the same write.
+    fn open_gzip_image(path: &std::path::Path) -> crate::image_source::CompressedImageFile {
+        use crate::image_source::{OpenedImage, open_image};
+
+        match open_image(path) {
+            Ok(OpenedImage::Compressed(file)) => file,
+            other => panic!("expected a compressed image, got {other:?}"),
+        }
+    }
+
+    // The production preparation, as `run_write_test` does it, with the
+    // target's capacity as the Preflight limit.
+    fn prepared_gzip_image(
+        path: &std::path::Path,
+        verify_mode: VerifyMode,
+        target_capacity: u64,
+    ) -> SelectedImage {
+        let source = crate::prepare_compressed_image(
+            open_gzip_image(path),
+            verify_mode,
+            target_capacity,
+            || false,
+            |_| {},
+        )
+        .unwrap_or_else(|rejection| panic!("gzip preparation failed: {rejection:?}"));
+        SelectedImage::new(Box::new(source))
+    }
+
+    // None: Preflight -> write (a replay) -> sync -> Verify skipped; the
+    // target holds the decoded payload. Full: the same, then Full Verify
+    // decodes a second, fresh replay and matches every byte.
     #[test]
-    fn gzip_source_writes_and_full_verifies_through_the_existing_path() {
+    fn gzip_image_writes_through_the_production_pipeline() {
         let payload = patterned_data(writer::DEFAULT_CHUNK_SIZE * 2 + 777);
 
-        for mode in [VerifyMode::Full, VerifyMode::Quick] {
+        for mode in [VerifyMode::None, VerifyMode::Full] {
             let context = format!("{mode:?}");
-            let (image, path) = gzip_selected_image(&format!("gzip-{mode:?}"), &payload);
+            let path = temp_gzip_image(&format!("gzip-pipeline-{mode:?}"), &payload);
+            let image = prepared_gzip_image(&path, mode, payload.len() as u64);
             assert_eq!(image.logical_size(), payload.len() as u64);
             assert_eq!(image.access(), ImageSourceAccess::SequentialReplay);
 
             let (target_path, writing_execution, snapshot) = gate_pass_writing_execution_for_image(
-                &format!("gzip-{mode:?}"),
+                &format!("gzip-pipeline-{mode:?}"),
                 image,
                 payload.len() as u64,
                 mode,
@@ -4848,31 +4888,97 @@ mod tests {
             let (image, sync_succeeded) = write_and_sync(writing_execution, &context);
             assert_eq!(std::fs::read(&target_path).unwrap(), payload, "{context}");
 
-            let verifying = verifying_from_sync_succeeded(
-                sync_succeeded,
-                image,
-                CancelHandle::new(),
-                &snapshot,
-                &target_path,
-            );
-            let (_image, outcome) = verifying.run(|_| {});
-            match (mode, outcome) {
-                (VerifyMode::Full, VerifyOutcome::Succeeded(succeeded)) => {
-                    assert_eq!(succeeded.verified_bytes, payload.len() as u64);
-                }
-                (VerifyMode::Quick, VerifyOutcome::Failed(failed)) => {
-                    assert!(
-                        matches!(failed.reason, VerifyFailureReason::UnsupportedAccess),
-                        "{:?}",
-                        failed.reason
+            match mode {
+                VerifyMode::None => match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+                    VerifyStart::Skipped(_, succeeded) => assert!(succeeded.skipped),
+                    VerifyStart::Pending(_) => panic!("{context}: expected Skipped"),
+                },
+                _ => {
+                    let verifying = verifying_from_sync_succeeded(
+                        sync_succeeded,
+                        image,
+                        CancelHandle::new(),
+                        &snapshot,
+                        &target_path,
                     );
-                    assert_eq!(failed.verified_bytes, 0);
+                    match verifying.run(|_| {}) {
+                        (_, VerifyOutcome::Succeeded(succeeded)) => {
+                            assert_eq!(succeeded.verified_bytes, payload.len() as u64);
+                        }
+                        (_, other) => panic!("{context}: expected Succeeded, got {other:?}"),
+                    }
                 }
-                (_, other) => panic!("{context}: unexpected outcome {other:?}"),
             }
 
             let _ = std::fs::remove_file(&target_path);
             let _ = std::fs::remove_file(&path);
         }
+    }
+
+    // L2: even if a compressed image reached the Gate with Quick authorized
+    // (bypassing the CLI's L1 refusal), `bind()` refuses it before any write:
+    // the target stays empty. L3 (`UnsupportedAccess` in the verifier) is
+    // covered by `quick_verify_refuses_a_non_random_access_source`.
+    #[test]
+    fn gzip_image_with_quick_verify_is_refused_at_bind() {
+        use crate::image_source::compressed::{CompressedImageSource, PreflightOptions};
+
+        let payload = patterned_data(64 * 1024);
+        let path = temp_gzip_image("gzip-quick-l2", &payload);
+        let options = PreflightOptions {
+            max_logical_size: u64::MAX,
+        };
+        let preflighted = open_gzip_image(&path)
+            .preflight(options, || false, |_| {})
+            .unwrap();
+        let image = SelectedImage::new(Box::new(CompressedImageSource::new(preflighted)));
+
+        let (target_path, authorized, _snapshot) = gate_pass_authorized_for_image(
+            "gzip-quick-l2",
+            &image,
+            payload.len() as u64,
+            VerifyMode::Quick,
+        );
+        let result = AuthorizedExecution::bind(authorized, image);
+
+        assert!(matches!(
+            result,
+            Err(ImageBindingError::QuickVerifyUnsupported)
+        ));
+        assert!(std::fs::read(&target_path).unwrap().is_empty());
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The path is replaced after the image was prepared: the prepared
+    // source keeps the file it opened, and the pre-write source gate refuses
+    // the write -- the replacement is never read and nothing is written.
+    #[test]
+    fn gzip_image_path_replacement_after_preparation_is_refused() {
+        let payload = patterned_data(64 * 1024);
+        let path = temp_gzip_image("gzip-replaced", &payload);
+        let image = prepared_gzip_image(&path, VerifyMode::Full, payload.len() as u64);
+
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution_for_image(
+            "gzip-replaced",
+            image,
+            payload.len() as u64,
+            VerifyMode::Full,
+            CancelHandle::new(),
+        );
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+        std::fs::write(&path, b"a different file").unwrap();
+
+        let (_image, outcome) =
+            writing_execution.write(|_| panic!("nothing may be written after the source changed"));
+        let failed = expect_write_source_changed(outcome, "replaced");
+        assert_eq!(failed.bytes_written, 0);
+        assert!(!failed.target_may_be_modified);
+        assert!(std::fs::read(&target_path).unwrap().is_empty());
+
+        let _ = std::fs::remove_file(&target_path);
+        remove_source_files(&path);
     }
 }

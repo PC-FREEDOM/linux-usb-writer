@@ -904,12 +904,13 @@ fn pause_before_verify_for_test() -> bool {
 // `block_path` is a UDisks2 block object path, exactly like every other CLI
 // mode above (`select`/`open-test`/`prepare-test`) -- not a raw `/dev/sdX`
 // string accepted with no safety checks. `image_path` is opened by
-// `image_source::FileImageSource::new()` exactly once; the resulting
-// `SelectedImage` (`selected_image` below) is held by this one variable,
-// unchanged, from that point until it is moved into
-// `AuthorizedExecution::bind()` -- it is never re-opened, never
-// reconstructed, and no second `FileImageSource`/`SelectedImage` is ever
-// created for the same invocation.
+// `image_source::open_image()` exactly once; the source built from that
+// open file (a `FileImageSource` for a raw image, a `CompressedImageSource`
+// for a validated gzip image) becomes the `SelectedImage` (`selected_image`
+// below), held by this one variable, unchanged, from that point until it is
+// moved into `AuthorizedExecution::bind()` -- it is never re-opened, never
+// reconstructed, and no second source/`SelectedImage` is ever created for
+// the same invocation.
 //
 // Still a linear CLI PoC, not a Controller: every step happens in this one
 // function, exactly like `run_prepare_test`. If OpenDevice needs polkit
@@ -948,26 +949,26 @@ fn run_write_test(
         return Ok(WriteTestExit::Completed);
     }
 
-    let core::SelectionState::Selected {
-        baseline,
-        baseline_assessment,
-        ..
-    } = &state
-    else {
-        unreachable!("is_ready_to_open just confirmed Selected");
+    // What a compressed image's Preflight needs from the target, read now:
+    // `state` itself is re-verified after Preflight (below), so no borrow of
+    // it is held across the image preparation.
+    let (target_capacity, target_block_path) = match &state {
+        core::SelectionState::Selected { baseline, .. } => {
+            (baseline.size, baseline.block_path.clone())
+        }
+        _ => unreachable!("is_ready_to_open just confirmed Selected"),
     };
 
     // Cancel wiring (Ctrl+C -> CancelHandle): one shared handle, created and
     // wired to Ctrl+C as soon as target selection has succeeded -- before
-    // the image is opened, so image preparation (and, in future, a
-    // compressed image's Preflight Scan, which will receive a
-    // `|| cancel.is_requested()` closure rather than the handle itself) is
-    // already covered. Ctrl+C during argument parsing or device enumeration
-    // (above) keeps its ordinary "just terminate the process" behavior:
-    // nothing has been opened yet at that point. The same `cancel` is
-    // checked after the image is opened, watched during the Human
-    // Confirmation prompt, cloned into `begin_write()`, checked again after
-    // sync, and cloned into `begin_verify()` -- one Ctrl+C anywhere from here
+    // the image is opened, so image preparation (including a gzip image's
+    // Preflight, which receives a `|| cancel.is_requested()` closure rather
+    // than the handle itself) is covered. Ctrl+C during argument parsing or
+    // device enumeration (above) keeps its ordinary "just terminate the
+    // process" behavior: nothing has been opened yet at that point. The
+    // same `cancel` is checked after the image is opened, watched during the
+    // Human Confirmation prompt, cloned into `begin_write()`, checked again
+    // after sync, and cloned into `begin_verify()` -- one Ctrl+C anywhere from here
     // through the end of Verify is honored by whichever phase happens to be
     // running. It is one-shot: there is no way to reset it, so a cancelled
     // run can never continue.
@@ -988,17 +989,68 @@ fn run_write_test(
     // to `AuthorizedExecution::bind()` below -- `selection()` (a cheap Copy)
     // is all that gets threaded through the Gate calls in between.
     //
-    // Every refusal here happens before the target is opened, and returns
-    // `Completed` exactly like the pre-existing image-open failure path.
-    let source = match image_source::open_image(&image_path) {
-        Ok(image_source::OpenedImage::Raw(source)) => source,
-        Ok(image_source::OpenedImage::Compressed(compressed)) => {
-            // Recognized gzip/xz: never written as raw. Decompression is
-            // not implemented yet, so stop here.
+    // Every refusal here happens before the target is opened. A refusal or
+    // failure returns `Completed`, exactly like the pre-existing image-open
+    // failure path; a cancellation during a gzip image's Preflight returns
+    // `Cancelled` (exit 130), like every other cancellation.
+    let source: Box<dyn image_source::ImageSource> = match image_source::open_image(&image_path) {
+        Ok(image_source::OpenedImage::Raw(source)) => Box::new(source),
+        Ok(image_source::OpenedImage::Compressed(compressed))
+            if compressed.format() != image_source::CompressionFormat::Gzip =>
+        {
+            // Recognized xz: never written as raw, and not supported yet.
             for line in format_compressed_image_not_supported_yet(compressed.format()) {
                 println!("write-test: {line}");
             }
             return Ok(WriteTestExit::Completed);
+        }
+        Ok(image_source::OpenedImage::Compressed(compressed)) => {
+            // gzip: validated end to end (Preflight) before anything else,
+            // with the decoded size bounded by the target's capacity, so the
+            // confirmation below shows the exact image size and an image
+            // that cannot be written is refused before the target is opened.
+            println!(
+                "write-test: detected format: {} (compressed image); validating it before writing (nothing is written yet)",
+                compressed.format().name()
+            );
+            let prepared = prepare_compressed_image(
+                compressed,
+                verify_mode,
+                target_capacity,
+                || cancel.is_requested(),
+                |progress| println!("write-test: {}", format_preflight_progress(&progress)),
+            );
+            let source = match prepared {
+                Ok(source) => source,
+                Err(CompressedImageRejection::Preflight(
+                    image_source::compressed::PreflightError::Cancelled,
+                )) => {
+                    for line in format_cancelled_before_confirmation() {
+                        println!("write-test: {line}");
+                    }
+                    return Ok(WriteTestExit::Cancelled);
+                }
+                Err(rejection) => {
+                    for line in format_compressed_image_rejected(&rejection) {
+                        println!("write-test: {line}");
+                    }
+                    return Ok(WriteTestExit::Completed);
+                }
+            };
+
+            // Validation can take a long time: re-verify the target (fresh
+            // snapshot; Identity / Instance / Safety) before continuing to
+            // the confirmation. The write-time re-check before OpenDevice
+            // still runs later, unchanged.
+            state = core::revalidate(state, collect_device_snapshot(&target_block_path));
+            if !core::is_ready_to_open(&state) {
+                println!("write-test: the target changed while the image was being validated:");
+                print_selection_state(&state);
+                println!("write-test: stopping before confirmation; nothing was written.");
+                return Ok(WriteTestExit::Completed);
+            }
+
+            Box::new(source)
         }
         Err(
             error @ (image_source::ImageSourceError::UnsupportedFormat(_)
@@ -1014,7 +1066,16 @@ fn run_write_test(
             return Ok(WriteTestExit::Completed);
         }
     };
-    let selected_image = image_source::SelectedImage::new(Box::new(source));
+    let selected_image = image_source::SelectedImage::new(source);
+
+    let core::SelectionState::Selected {
+        baseline,
+        baseline_assessment,
+        ..
+    } = &state
+    else {
+        unreachable!("is_ready_to_open confirmed Selected");
+    };
 
     println!(
         "\nwrite-test: image selected from {image_path} (image_size={} bytes)",
@@ -1996,6 +2057,109 @@ fn format_compressed_image_not_supported_yet(
     vec![
         format!("detected format: {} (compressed image)", format.name()),
         "writing compressed images is not supported yet; the image was not written.".to_string(),
+        "the target device has not been opened or modified.".to_string(),
+    ]
+}
+
+// Why a compressed image was not accepted for writing. Every case stops
+// before the target is opened.
+#[derive(Debug)]
+enum CompressedImageRejection {
+    // Quick Verify needs random access, which a compressed image cannot
+    // provide; refused before Preflight (and before any confirmation).
+    QuickVerifyUnsupported(image_source::CompressionFormat),
+    // Preflight did not validate the image (includes cancellation).
+    Preflight(image_source::compressed::PreflightError),
+    // Preflight succeeded, but the file is no longer in the state it was
+    // opened in (compared with the snapshot `open_image` took).
+    SourceChanged(image_source::source_identity::SourceChanged),
+}
+
+// Turns an opened compressed image into the source the write pipeline reads
+// from: refuses Quick Verify first (L1), then validates the whole stream
+// (Preflight, bounded by `max_logical_size` -- the target's capacity -- and
+// cancellable via `is_cancelled`), then confirms the file did not change
+// while it was being validated. The file is the one `open_image` opened; it
+// is moved, never re-opened.
+fn prepare_compressed_image(
+    compressed: image_source::CompressedImageFile,
+    verify_mode: core::VerifyMode,
+    max_logical_size: u64,
+    is_cancelled: impl FnMut() -> bool,
+    on_progress: impl FnMut(image_source::compressed::PreflightProgress),
+) -> Result<image_source::compressed::CompressedImageSource, CompressedImageRejection> {
+    if verify_mode == core::VerifyMode::Quick {
+        return Err(CompressedImageRejection::QuickVerifyUnsupported(
+            compressed.format(),
+        ));
+    }
+
+    let options = image_source::compressed::PreflightOptions { max_logical_size };
+    let preflighted = compressed
+        .preflight(options, is_cancelled, on_progress)
+        .map_err(CompressedImageRejection::Preflight)?;
+
+    preflighted
+        .revalidate_identity()
+        .map_err(CompressedImageRejection::SourceChanged)?;
+
+    Ok(image_source::compressed::CompressedImageSource::new(
+        preflighted,
+    ))
+}
+
+fn format_preflight_progress(progress: &image_source::compressed::PreflightProgress) -> String {
+    format!(
+        "validating compressed image: {}/{} compressed bytes read, {} bytes decoded",
+        progress.compressed_consumed, progress.compressed_total, progress.logical_produced
+    )
+}
+
+// Shown when a compressed image was not accepted (see
+// `CompressedImageRejection`). A cancellation uses
+// `format_cancelled_before_confirmation` instead.
+fn format_compressed_image_rejected(rejection: &CompressedImageRejection) -> Vec<String> {
+    use image_source::compressed::PreflightError;
+
+    let reason = match rejection {
+        CompressedImageRejection::QuickVerifyUnsupported(format) => format!(
+            "quick verification is not available for {} images (they cannot be read at random offsets); use verify-mode full or none",
+            format.name()
+        ),
+        CompressedImageRejection::Preflight(error) => match error {
+            PreflightError::Cancelled => "validation was cancelled".to_string(),
+            PreflightError::Corrupt(error) => {
+                format!("the compressed image is corrupt: {error}")
+            }
+            PreflightError::Incomplete(error) => {
+                format!("the compressed image is incomplete (truncated): {error}")
+            }
+            PreflightError::LogicalSizeOverflow => {
+                "the decompressed size is too large to represent".to_string()
+            }
+            PreflightError::LogicalSizeLimitExceeded { limit } => format!(
+                "the decompressed image is larger than the target device ({limit} bytes)"
+            ),
+            PreflightError::InputConsumptionMismatch {
+                consumed,
+                compressed_size,
+            } => format!(
+                "the compressed stream ended after {consumed} of {compressed_size} bytes"
+            ),
+            PreflightError::CompressedInputBudgetExceeded { .. } => {
+                "the compressed image needs too much input per byte of output (refused as a resource limit)".to_string()
+            }
+            PreflightError::Io(error) => format!("failed to read the compressed image: {error}"),
+            PreflightError::UnsupportedFormat(format) => {
+                format!("{} images are not supported yet", format.name())
+            }
+        },
+        CompressedImageRejection::SourceChanged(changed) => changed.to_string(),
+    };
+
+    vec![
+        format!("compressed image rejected: {reason}"),
+        "the image was not written.".to_string(),
         "the target device has not been opened or modified.".to_string(),
     ]
 }
@@ -3124,5 +3288,310 @@ mod tests {
     #[test]
     fn write_test_exit_code_maps_completed_to_none() {
         assert_eq!(write_test_exit_code(WriteTestExit::Completed), None);
+    }
+
+    // ---------------------------------------------------------------------
+    // gzip preparation (Quick L1, Preflight, post-Preflight source check)
+    // and the post-Preflight target re-check. All of this happens before
+    // the target is opened, so a rejection here cannot touch the target.
+    // ---------------------------------------------------------------------
+
+    use super::{
+        CompressedImageRejection, format_compressed_image_rejected, format_preflight_progress,
+        prepare_compressed_image,
+    };
+    use crate::image_source::compressed::{PreflightError, PreflightProgress};
+    use crate::image_source::{
+        CompressedImageFile, ImageSource, ImageSourceAccess, OpenedImage, open_image,
+    };
+
+    // A temporary `.img.gz` file, removed when dropped.
+    struct TempGzip(std::path::PathBuf);
+
+    impl Drop for TempGzip {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn gzip_bytes(payload: &[u8]) -> Vec<u8> {
+        use std::io::Write as _;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap()
+    }
+
+    fn temp_gzip(tag: &str, contents: &[u8]) -> TempGzip {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-main-test-{tag}-{}-{id}.img.gz",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).unwrap();
+        TempGzip(path)
+    }
+
+    fn open_gzip(file: &TempGzip) -> CompressedImageFile {
+        match open_image(&file.0) {
+            Ok(OpenedImage::Compressed(compressed)) => compressed,
+            other => panic!("expected a compressed image, got {other:?}"),
+        }
+    }
+
+    fn payload() -> Vec<u8> {
+        (0..200_000u32).map(|i| (i % 253) as u8).collect()
+    }
+
+    // None and Full: the whole stream is validated, the source reports the
+    // decoded size and sequential access, and progress ends at the exact
+    // totals.
+    #[test]
+    fn prepare_compressed_image_accepts_valid_gzip_for_none_and_full() {
+        let data = payload();
+        let compressed = gzip_bytes(&data);
+        for mode in [VerifyMode::None, VerifyMode::Full] {
+            let file = temp_gzip("prepare-ok", &compressed);
+            let mut last = None;
+            let source = prepare_compressed_image(
+                open_gzip(&file),
+                mode,
+                data.len() as u64,
+                || false,
+                |progress| last = Some(progress),
+            )
+            .unwrap_or_else(|rejection| panic!("{mode:?}: {rejection:?}"));
+
+            assert_eq!(source.logical_size(), data.len() as u64);
+            assert_eq!(source.access(), ImageSourceAccess::SequentialReplay);
+            source.revalidate_identity().unwrap();
+            let last = last.expect("progress reported");
+            assert_eq!(last.logical_produced, data.len() as u64);
+            assert_eq!(last.compressed_consumed, compressed.len() as u64);
+        }
+    }
+
+    // L1: Quick is refused before any validation work (no cancellation
+    // poll, no progress) -- and never silently turned into Full or None.
+    #[test]
+    fn prepare_compressed_image_refuses_quick_before_validating() {
+        let file = temp_gzip("prepare-quick", &gzip_bytes(&payload()));
+        let result = prepare_compressed_image(
+            open_gzip(&file),
+            VerifyMode::Quick,
+            u64::MAX,
+            || panic!("Quick must be refused before Preflight polls for cancellation"),
+            |_| panic!("Quick must be refused before Preflight reports progress"),
+        );
+        assert!(matches!(
+            result,
+            Err(CompressedImageRejection::QuickVerifyUnsupported(
+                crate::image_source::CompressionFormat::Gzip
+            ))
+        ));
+    }
+
+    fn expect_preflight_error(
+        result: Result<
+            crate::image_source::compressed::CompressedImageSource,
+            CompressedImageRejection,
+        >,
+    ) -> PreflightError {
+        match result {
+            Err(CompressedImageRejection::Preflight(error)) => error,
+            Err(other) => panic!("expected a Preflight rejection, got {other:?}"),
+            Ok(_) => panic!("expected a Preflight rejection, got a source"),
+        }
+    }
+
+    // Cancellation during Preflight is reported as such (the CLI maps it to
+    // the Cancelled exit).
+    #[test]
+    fn prepare_compressed_image_can_be_cancelled() {
+        let file = temp_gzip("prepare-cancel", &gzip_bytes(&payload()));
+        let error = expect_preflight_error(prepare_compressed_image(
+            open_gzip(&file),
+            VerifyMode::None,
+            u64::MAX,
+            || true,
+            |_| {},
+        ));
+        assert!(matches!(error, PreflightError::Cancelled));
+    }
+
+    // Corrupt, truncated and oversized images are rejected with their typed
+    // Preflight reason; the size limit is the one passed in (the target's
+    // capacity) and allows an image of exactly that size.
+    #[test]
+    fn prepare_compressed_image_rejects_bad_images_with_typed_reasons() {
+        let data = payload();
+        let good = gzip_bytes(&data);
+
+        let mut corrupt = good.clone();
+        let crc = corrupt.len() - 8;
+        corrupt[crc] ^= 0xFF;
+        let file = temp_gzip("prepare-corrupt", &corrupt);
+        let error = expect_preflight_error(prepare_compressed_image(
+            open_gzip(&file),
+            VerifyMode::None,
+            u64::MAX,
+            || false,
+            |_| {},
+        ));
+        assert!(matches!(error, PreflightError::Corrupt(_)), "{error:?}");
+
+        let file = temp_gzip("prepare-truncated", &good[..good.len() / 2]);
+        let error = expect_preflight_error(prepare_compressed_image(
+            open_gzip(&file),
+            VerifyMode::Full,
+            u64::MAX,
+            || false,
+            |_| {},
+        ));
+        assert!(matches!(error, PreflightError::Incomplete(_)), "{error:?}");
+
+        let file = temp_gzip("prepare-oversized", &good);
+        let limit = data.len() as u64 - 1;
+        let error = expect_preflight_error(prepare_compressed_image(
+            open_gzip(&file),
+            VerifyMode::None,
+            limit,
+            || false,
+            |_| {},
+        ));
+        assert!(
+            matches!(error, PreflightError::LogicalSizeLimitExceeded { limit: l } if l == limit),
+            "{error:?}"
+        );
+
+        let file = temp_gzip("prepare-exact-limit", &good);
+        assert!(
+            prepare_compressed_image(
+                open_gzip(&file),
+                VerifyMode::None,
+                data.len() as u64,
+                || false,
+                |_| {},
+            )
+            .is_ok()
+        );
+    }
+
+    // The file changes while Preflight runs (at its final progress report):
+    // validation itself succeeds, but the source is refused because it is
+    // compared with the snapshot `open_image` took.
+    #[test]
+    fn prepare_compressed_image_refuses_a_source_changed_during_preflight() {
+        let compressed = gzip_bytes(&payload());
+        let file = temp_gzip("prepare-changed", &compressed);
+        let path = file.0.clone();
+        let data_len = payload().len() as u64;
+        let result = prepare_compressed_image(
+            open_gzip(&file),
+            VerifyMode::None,
+            u64::MAX,
+            || false,
+            |progress: PreflightProgress| {
+                if progress.logical_produced == data_len {
+                    use std::os::unix::fs::FileExt as _;
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    let same = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                    same.write_all_at(&compressed[..16], 0).unwrap();
+                }
+            },
+        );
+        assert!(
+            matches!(result, Err(CompressedImageRejection::SourceChanged(_))),
+            "{result:?}"
+        );
+    }
+
+    // Every rejection message says nothing was written and the target was
+    // not touched; the Quick message points to the modes that do work.
+    #[test]
+    fn format_compressed_image_rejected_states_target_untouched() {
+        let rejections = [
+            CompressedImageRejection::QuickVerifyUnsupported(
+                crate::image_source::CompressionFormat::Gzip,
+            ),
+            CompressedImageRejection::Preflight(PreflightError::Corrupt(std::io::Error::other(
+                "bad crc",
+            ))),
+            CompressedImageRejection::Preflight(PreflightError::LogicalSizeLimitExceeded {
+                limit: 42,
+            }),
+            CompressedImageRejection::SourceChanged(
+                crate::image_source::source_identity::SourceChanged::Unverifiable(
+                    std::io::Error::other("simulated"),
+                ),
+            ),
+        ];
+        for rejection in &rejections {
+            let lines = format_compressed_image_rejected(rejection);
+            assert!(lines[0].starts_with("compressed image rejected: "));
+            assert_eq!(
+                lines.last().unwrap(),
+                "the target device has not been opened or modified."
+            );
+        }
+        let quick = format_compressed_image_rejected(&rejections[0]);
+        assert!(quick[0].contains("full") && quick[0].contains("none"));
+    }
+
+    #[test]
+    fn format_preflight_progress_shows_both_sides() {
+        let line = format_preflight_progress(&PreflightProgress {
+            compressed_consumed: 10,
+            compressed_total: 20,
+            logical_produced: 30,
+        });
+        assert!(line.contains("10/20") && line.contains("30 bytes decoded"));
+    }
+
+    // The post-Preflight target re-check (`core::revalidate` on a fresh
+    // snapshot, then `is_ready_to_open`): a target replaced, recreated or
+    // removed while Preflight ran is no longer ready to open.
+    #[test]
+    fn target_changed_during_preflight_is_not_ready_to_open() {
+        let selected = || core::select(base_snapshot()).unwrap();
+
+        let unchanged = core::revalidate(
+            selected(),
+            crate::device::SnapshotFetchOutcome::Found(base_snapshot()),
+        );
+        assert!(core::is_ready_to_open(&unchanged));
+
+        let mut replaced = base_snapshot();
+        replaced.serial = "OTHER-SERIAL".to_string();
+        let mut recreated = base_snapshot();
+        recreated.diskseq = Some(13);
+        let mut resized = base_snapshot();
+        resized.size = 4_000_000_000;
+        let mut mounted = base_snapshot();
+        mounted.mount_points = vec!["/".to_string()];
+
+        for (name, outcome) in [
+            (
+                "replaced",
+                crate::device::SnapshotFetchOutcome::Found(replaced),
+            ),
+            (
+                "recreated",
+                crate::device::SnapshotFetchOutcome::Found(recreated),
+            ),
+            (
+                "resized",
+                crate::device::SnapshotFetchOutcome::Found(resized),
+            ),
+            (
+                "mounted",
+                crate::device::SnapshotFetchOutcome::Found(mounted),
+            ),
+            ("removed", crate::device::SnapshotFetchOutcome::NotFound),
+        ] {
+            let state = core::revalidate(selected(), outcome);
+            assert!(!core::is_ready_to_open(&state), "{name}");
+        }
     }
 }

@@ -785,8 +785,14 @@ type ReplayDecoder = FormatDecoder<CountingBufRead<BufReader<FileImageReader>, R
 
 // Why a replay failed, as a category that survives the first error (an
 // `io::Error` cannot be cloned). Determined by type, never by message text.
+//
+// Every error a `StrictReplayReader` returns carries this category (see
+// `ReplayFailed`), so a caller that only sees the `io::Error` -- the write
+// pipeline and Full Verify see nothing else -- can tell a failed replay of a
+// compressed image, and why it failed, from any other read error with
+// `replay_failure`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReplayFailure {
+pub enum ReplayFailure {
     // The stream ended cleanly before producing `logical_size` bytes.
     EndedEarly,
     // The stream produced more than `logical_size` bytes.
@@ -819,7 +825,7 @@ impl ReplayFailure {
     fn of(error: &io::Error) -> ReplayFailure {
         if let Some(inner) = error.get_ref() {
             if let Some(failed) = inner.downcast_ref::<ReplayFailed>() {
-                return failed.0;
+                return failed.failure;
             }
             if inner.is::<InputBudgetExceeded>() {
                 return ReplayFailure::InputBudgetExceeded;
@@ -851,18 +857,44 @@ impl ReplayFailure {
     }
 }
 
-// Payload of the errors this module raises itself during a replay (end /
-// size mismatches), and of every error returned after the first failure.
+// Payload of every error a replay returns: the category, and -- for the
+// first failure, when it came from the decoder or the file -- the original
+// error as its source. Errors this module raises itself (end / size
+// mismatches) and every error after the first failure have no source.
 #[derive(Debug)]
-struct ReplayFailed(ReplayFailure);
+struct ReplayFailed {
+    failure: ReplayFailure,
+    source: Option<io::Error>,
+}
 
 impl fmt::Display for ReplayFailed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "compressed image replay failed: {:?}", self.0)
+        write!(f, "compressed image replay failed: {:?}", self.failure)?;
+        if let Some(source) = &self.source {
+            write!(f, " ({source})")?;
+        }
+        Ok(())
     }
 }
 
-impl std::error::Error for ReplayFailed {}
+impl std::error::Error for ReplayFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|source| source as &(dyn std::error::Error + 'static))
+    }
+}
+
+// The category of a failed replay, when `error` is one a `StrictReplayReader`
+// (or `replay()` setting one up) returned; None for any other error, such as
+// a read error of a raw image. Reads the typed payload only -- nothing is
+// inferred from the error's kind or message.
+pub fn replay_failure(error: &io::Error) -> Option<ReplayFailure> {
+    error
+        .get_ref()?
+        .downcast_ref::<ReplayFailed>()
+        .map(|failed| failed.failure)
+}
 
 // Payload of the error `replay()` returns when the decoder cannot be set up;
 // keeps the decoder's own error as its source.
@@ -886,7 +918,13 @@ fn replay_failed(failure: ReplayFailure) -> io::Error {
         ReplayFailure::EndedEarly => io::ErrorKind::UnexpectedEof,
         _ => io::ErrorKind::InvalidData,
     };
-    io::Error::new(kind, ReplayFailed(failure))
+    io::Error::new(
+        kind,
+        ReplayFailed {
+            failure,
+            source: None,
+        },
+    )
 }
 
 enum ReplayState {
@@ -952,8 +990,12 @@ impl StrictReplayReader {
         let counted = CountingBufRead::new(input, hook);
         let decoder = Box::new(match format {
             CompressionFormat::Gzip => FormatDecoder::gzip(counted),
-            CompressionFormat::Xz => FormatDecoder::xz(counted)
-                .map_err(|error| io::Error::other(DecoderSetupFailed(error)))?,
+            CompressionFormat::Xz => FormatDecoder::xz(counted).map_err(|error| {
+                io::Error::other(ReplayFailed {
+                    failure: ReplayFailure::DecoderFailure,
+                    source: Some(io::Error::other(DecoderSetupFailed(error))),
+                })
+            })?,
         });
 
         Ok(StrictReplayReader {
@@ -967,21 +1009,39 @@ impl StrictReplayReader {
         })
     }
 
-    // Records `error` as this reader's terminal failure and returns it.
+    // Records `error` as this reader's terminal failure and returns it,
+    // carrying its category (`ReplayFailed`) with the original error as the
+    // source. The kind is the original's -- except `Interrupted`, never
+    // reported (callers retry it; `read_decoder` already absorbs it, so this
+    // is only a guard).
     fn fail(&mut self, error: io::Error) -> io::Error {
         let failure = ReplayFailure::of(&error);
-        // Never report `Interrupted` (callers retry it); `read_decoder`
-        // already absorbs it, so this is only a guard.
-        let error = if error.kind() == io::ErrorKind::Interrupted {
-            io::Error::other(ReplayFailed(failure))
-        } else {
-            error
+        let kind = match error.kind() {
+            io::ErrorKind::Interrupted => io::ErrorKind::Other,
+            kind => kind,
         };
-        self.state = ReplayState::Failed {
-            kind: error.kind(),
-            failure,
-        };
-        error
+        self.state = ReplayState::Failed { kind, failure };
+
+        if replay_failure(&error).is_some() && error.kind() == kind {
+            return error;
+        }
+        io::Error::new(
+            kind,
+            ReplayFailed {
+                failure,
+                source: Some(error),
+            },
+        )
+    }
+
+    // Why this replay failed, once it has; None while it is still running
+    // and after it succeeded. The same category every error it returned
+    // carries.
+    pub fn failure(&self) -> Option<ReplayFailure> {
+        match self.state {
+            ReplayState::Failed { failure, .. } => Some(failure),
+            ReplayState::Active { .. } | ReplayState::Succeeded => None,
+        }
     }
 
     // Compressed bytes consumed so far (test instrumentation).
@@ -1027,7 +1087,13 @@ impl Read for StrictReplayReader {
         let (decoder, produced, credited) = match &mut self.state {
             ReplayState::Succeeded => return Ok(0),
             ReplayState::Failed { kind, failure } => {
-                return Err(io::Error::new(*kind, ReplayFailed(*failure)));
+                return Err(io::Error::new(
+                    *kind,
+                    ReplayFailed {
+                        failure: *failure,
+                        source: None,
+                    },
+                ));
             }
             ReplayState::Active { .. } if buf.is_empty() => return Ok(0),
             ReplayState::Active {
@@ -2731,6 +2797,13 @@ mod tests {
         contents
     }
 
+    // The payload of the original error a replay's first failure carries as
+    // its source (see `ReplayFailed`).
+    fn replay_source_payload<T: std::error::Error + 'static>(error: &io::Error) -> Option<&T> {
+        let failed = error.get_ref()?.downcast_ref::<ReplayFailed>()?;
+        failed.source.as_ref()?.get_ref()?.downcast_ref::<T>()
+    }
+
     #[derive(Debug)]
     struct ReplayRun {
         delivered: Vec<u8>,
@@ -2751,7 +2824,9 @@ mod tests {
                 }
                 Err(error) => {
                     assert_ne!(error.kind(), io::ErrorKind::Interrupted);
-                    break Err((error.kind(), ReplayFailure::of(&error)));
+                    let failure = replay_failure(&error).expect("the error carries its category");
+                    assert_eq!(reader.failure(), Some(failure));
+                    break Err((error.kind(), failure));
                 }
             }
         };
@@ -2767,7 +2842,14 @@ mod tests {
         for size in [0usize, 1, 4096] {
             let mut buf = vec![0u8; size];
             let error = reader.read(&mut buf).unwrap_err();
-            assert_eq!((error.kind(), ReplayFailure::of(&error)), expected);
+            assert_eq!(
+                (
+                    error.kind(),
+                    replay_failure(&error).expect("typed category")
+                ),
+                expected
+            );
+            assert_eq!(reader.failure(), Some(expected.1));
         }
     }
 
@@ -3143,9 +3225,7 @@ mod tests {
             }
         };
         assert_eq!(first_error.kind(), io::ErrorKind::InvalidData);
-        let exceeded = first_error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<InputBudgetExceeded>())
+        let exceeded = replay_source_payload::<InputBudgetExceeded>(&first_error)
             .expect("typed budget payload");
         assert!(exceeded.compressed_consumed <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64 + 64);
         assert_stays_failed(
@@ -3180,10 +3260,8 @@ mod tests {
             }
         };
         assert_eq!(delivered, zeros.len());
-        let exceeded = error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<InputBudgetExceeded>())
-            .expect("typed budget payload");
+        let exceeded =
+            replay_source_payload::<InputBudgetExceeded>(&error).expect("typed budget payload");
         let spent_after_bank = exceeded.compressed_consumed - bank.len() as u64;
         assert!(spent_after_bank <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64);
         let _ = std::fs::remove_file(&path);
@@ -3646,10 +3724,8 @@ mod tests {
             }
         };
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        let exceeded = error
-            .get_ref()
-            .and_then(|inner| inner.downcast_ref::<InputBudgetExceeded>())
-            .expect("typed budget payload");
+        let exceeded =
+            replay_source_payload::<InputBudgetExceeded>(&error).expect("typed budget payload");
         assert!(exceeded.compressed_consumed <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64 + 64);
         assert_stays_failed(
             &mut reader,
@@ -3954,7 +4030,8 @@ mod tests {
                 Ok(n) => delivered.extend_from_slice(&buf[..n]),
                 Err(error) => {
                     assert_ne!(error.kind(), io::ErrorKind::Interrupted);
-                    return (delivered, Err((error.kind(), ReplayFailure::of(&error))));
+                    let failure = replay_failure(&error).expect("the error carries its category");
+                    return (delivered, Err((error.kind(), failure)));
                 }
             }
         }
@@ -4115,5 +4192,114 @@ mod tests {
         let error = source.read_at(0, &mut [0u8; 16]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // The category of a failed replay, as callers that only see the
+    // `io::Error` recover it (`replay_failure`), and as the reader reports it
+    // (`StrictReplayReader::failure`).
+    // ---------------------------------------------------------------------
+
+    // Errors that did not come out of a replay carry no category, whatever
+    // their kind or message: nothing is inferred (unlike `ReplayFailure::of`,
+    // which only ever sees errors from inside a replay).
+    #[test]
+    fn replay_failure_is_none_for_errors_that_are_not_replay_failures() {
+        for error in [
+            io::Error::from(io::ErrorKind::UnexpectedEof),
+            io::Error::new(io::ErrorKind::InvalidData, "Corrupt"),
+            io::Error::other("compressed image replay failed: Corrupt"),
+            io::Error::other(SourceReadError(io::Error::other("disk"))),
+        ] {
+            assert_eq!(replay_failure(&error), None, "{error:?}");
+        }
+    }
+
+    // A replay that is running or has succeeded has no failure; an empty
+    // read changes nothing, before, during or after.
+    #[test]
+    fn successful_replay_has_no_failure() {
+        for (label, (image, path)) in [
+            (
+                "gzip",
+                preflighted("replay-ok-gzip", &gzip_member(&payload_a())),
+            ),
+            (
+                "xz",
+                preflighted_xz(
+                    "replay-ok-xz",
+                    &xz_stream(&payload_a(), liblzma::stream::Check::Crc64),
+                ),
+            ),
+        ] {
+            let mut reader = image.replay().unwrap();
+            assert_eq!(reader.failure(), None, "{label}");
+            assert_eq!(reader.read(&mut []).unwrap(), 0, "{label}");
+            assert_eq!(reader.failure(), None, "{label}");
+
+            let run = replay_all(&mut reader, 4096);
+            assert_eq!(run.end, Ok(()), "{label}");
+            assert_eq!(run.delivered, payload_a(), "{label}");
+            assert_eq!(reader.failure(), None, "{label}");
+            assert_eq!(reader.read(&mut []).unwrap(), 0, "{label}");
+            assert_eq!(reader.read(&mut [0u8; 16]).unwrap(), 0, "{label}");
+            assert_eq!(reader.failure(), None, "{label}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // The first failure's error carries the category and the original error
+    // as its source; every later error carries the same category (the first
+    // one is kept, never replaced) and no source. Same for gzip and xz.
+    #[test]
+    fn first_replay_failure_is_typed_kept_and_carries_its_source() {
+        for (label, (image, path)) in [
+            (
+                "gzip",
+                preflighted("replay-first-gzip", &gzip_member(&payload_a())),
+            ),
+            (
+                "xz",
+                preflighted_xz(
+                    "replay-first-xz",
+                    &xz_stream(&payload_a(), liblzma::stream::Check::Crc64),
+                ),
+            ),
+        ] {
+            let len = std::fs::metadata(&path).unwrap().len();
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(len / 2).unwrap();
+
+            let mut reader = image.replay().unwrap();
+            let mut buf = vec![0u8; 4096];
+            let first = loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => panic!("{label}: the truncated image replayed to a clean end"),
+                    Ok(_) => continue,
+                    Err(error) => break error,
+                }
+            };
+
+            let failure = replay_failure(&first).expect("typed category");
+            assert!(
+                matches!(failure, ReplayFailure::Incomplete | ReplayFailure::Corrupt),
+                "{label}: {failure:?}"
+            );
+            assert!(
+                std::error::Error::source(first.get_ref().unwrap()).is_some(),
+                "{label}: the original error is kept as the source"
+            );
+            assert_eq!(reader.failure(), Some(failure), "{label}");
+
+            for size in [0usize, 1, 4096] {
+                let mut buf = vec![0u8; size];
+                let later = reader.read(&mut buf).unwrap_err();
+                assert_eq!(later.kind(), first.kind(), "{label}");
+                assert_eq!(replay_failure(&later), Some(failure), "{label}");
+                assert!(std::error::Error::source(later.get_ref().unwrap()).is_none());
+                assert_eq!(reader.failure(), Some(failure), "{label}");
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }

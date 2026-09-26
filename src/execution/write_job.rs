@@ -5454,4 +5454,244 @@ mod tests {
         let _ = std::fs::remove_file(&target_path);
         let _ = std::fs::remove_file(&path);
     }
+
+    // ---------------------------------------------------------------------
+    // Compressed replay failures, as the write pipeline and Full Verify
+    // report them: the failed replay's category travels with the source
+    // read error (`compressed::replay_failure`), for gzip and xz alike.
+    // ---------------------------------------------------------------------
+
+    // Delegates to `inner` but reports the source as unchanged whatever
+    // happens to the file, so a test can damage a validated compressed image
+    // and see what the replay itself reports. (In production the Source
+    // Identity checkpoints would stop the job before that.)
+    struct IdentityBlindSource(Box<dyn ImageSource>);
+
+    impl ImageSource for IdentityBlindSource {
+        fn logical_size(&self) -> u64 {
+            self.0.logical_size()
+        }
+
+        fn access(&self) -> ImageSourceAccess {
+            self.0.access()
+        }
+
+        fn open_reader(&self) -> io::Result<Box<dyn Read>> {
+            self.0.open_reader()
+        }
+
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+            self.0.read_at(offset, buf)
+        }
+
+        fn revalidate_identity(&self) -> Result<(), SourceChanged> {
+            Ok(())
+        }
+    }
+
+    // A validated gzip and a validated xz image of `payload`, by label.
+    fn compressed_images_of(tag: &str, payload: &[u8]) -> [(&'static str, std::path::PathBuf); 2] {
+        [
+            ("gzip", temp_gzip_image(&format!("{tag}-gzip"), payload)),
+            (
+                "xz",
+                temp_xz_image(
+                    &format!("{tag}-xz"),
+                    &xz_bytes(payload, liblzma::stream::Check::Crc64),
+                ),
+            ),
+        ]
+    }
+
+    fn identity_blind_image(
+        path: &std::path::Path,
+        verify_mode: VerifyMode,
+        target_capacity: u64,
+    ) -> SelectedImage {
+        let source = crate::prepare_compressed_image(
+            open_gzip_image(path),
+            verify_mode,
+            target_capacity,
+            || false,
+            |_| {},
+        )
+        .unwrap_or_else(|rejection| panic!("preparation failed: {rejection:?}"));
+        SelectedImage::new(Box::new(IdentityBlindSource(Box::new(source))))
+    }
+
+    fn cut_file_in_half(path: &std::path::Path) {
+        let len = std::fs::metadata(path).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_len(len / 2).unwrap();
+    }
+
+    // What a fresh replay of `image`, read to its end, fails with.
+    fn fresh_replay_failure(
+        image: &SelectedImage,
+    ) -> crate::image_source::compressed::ReplayFailure {
+        use crate::image_source::compressed::replay_failure;
+
+        let mut reader = image.open_reader().unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let error = loop {
+            match reader.read(&mut buf) {
+                Ok(0) => panic!("the damaged image replayed to a clean end"),
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        replay_failure(&error).expect("a replay error carries its category")
+    }
+
+    // Write path: the image is damaged after preparation; the write fails
+    // with a source read error that still says which replay failure it was.
+    #[test]
+    fn compressed_replay_failure_during_write_is_kept_in_the_write_error() {
+        use crate::image_source::compressed::replay_failure;
+
+        let payload = patterned_data(writer::DEFAULT_CHUNK_SIZE * 2 + 777);
+
+        for (label, path) in compressed_images_of("replay-write", &payload) {
+            let image = identity_blind_image(&path, VerifyMode::None, payload.len() as u64);
+            cut_file_in_half(&path);
+            let expected = fresh_replay_failure(&image);
+
+            let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution_for_image(
+                &format!("replay-write-{label}"),
+                image,
+                payload.len() as u64,
+                VerifyMode::None,
+                CancelHandle::new(),
+            );
+            let (_image, outcome) = writing_execution.write(|_| {});
+
+            match outcome {
+                WriteAttemptOutcome::Failed(Failed {
+                    cause: WriteJobFailureCause::Write(WriteError::SourceRead(error)),
+                    stage: WriteStage::Writing,
+                    retry_requires_fresh_gate: true,
+                    ..
+                }) => assert_eq!(replay_failure(&error), Some(expected), "{label}"),
+                other => panic!("{label}: expected a source read failure, got {other:?}"),
+            }
+
+            let _ = std::fs::remove_file(&target_path);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // Full Verify: the write succeeds, then the image is damaged; the fresh
+    // Verify replay fails with a source read error that still says which
+    // replay failure it was.
+    #[test]
+    fn compressed_replay_failure_during_full_verify_is_kept_in_the_verify_error() {
+        use crate::image_source::compressed::replay_failure;
+
+        let payload = patterned_data(writer::DEFAULT_CHUNK_SIZE * 2 + 777);
+
+        for (label, path) in compressed_images_of("replay-verify", &payload) {
+            let image = identity_blind_image(&path, VerifyMode::Full, payload.len() as u64);
+            let (target_path, writing_execution, snapshot) = gate_pass_writing_execution_for_image(
+                &format!("replay-verify-{label}"),
+                image,
+                payload.len() as u64,
+                VerifyMode::Full,
+                CancelHandle::new(),
+            );
+            let (image, sync_succeeded) = write_and_sync(writing_execution, label);
+            assert_eq!(std::fs::read(&target_path).unwrap(), payload, "{label}");
+
+            cut_file_in_half(&path);
+            let expected = fresh_replay_failure(&image);
+
+            let verifying = verifying_from_sync_succeeded(
+                sync_succeeded,
+                image,
+                CancelHandle::new(),
+                &snapshot,
+                &target_path,
+            );
+            match verifying.run(|_| {}) {
+                (
+                    _,
+                    VerifyOutcome::Failed(VerifyFailed {
+                        reason: VerifyFailureReason::SourceReadError(error),
+                        ..
+                    }),
+                ) => assert_eq!(replay_failure(&error), Some(expected), "{label}"),
+                (_, other) => panic!("{label}: expected a source read failure, got {other:?}"),
+            }
+
+            let _ = std::fs::remove_file(&target_path);
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // Raw images are unaffected: a raw image that became shorter still ends
+    // the write as SourceTooShort and Full Verify as SourceUnexpectedEof,
+    // exactly as before -- there is no replay, so no replay category.
+    #[test]
+    fn raw_image_read_failures_are_unchanged() {
+        let payload = patterned_data(writer::DEFAULT_CHUNK_SIZE * 2 + 777);
+
+        let path = write_temp_image_file("raw-short-write", &payload);
+        let image = SelectedImage::new(Box::new(IdentityBlindSource(Box::new(
+            FileImageSource::new(&path).unwrap(),
+        ))));
+        cut_file_in_half(&path);
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution_for_image(
+            "raw-short-write",
+            image,
+            payload.len() as u64,
+            VerifyMode::None,
+            CancelHandle::new(),
+        );
+        let (_image, outcome) = writing_execution.write(|_| {});
+        assert!(
+            matches!(
+                outcome,
+                WriteAttemptOutcome::Failed(Failed {
+                    cause: WriteJobFailureCause::Write(WriteError::SourceTooShort { .. }),
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+
+        let path = write_temp_image_file("raw-short-verify", &payload);
+        let image = SelectedImage::new(Box::new(IdentityBlindSource(Box::new(
+            FileImageSource::new(&path).unwrap(),
+        ))));
+        let (target_path, writing_execution, snapshot) = gate_pass_writing_execution_for_image(
+            "raw-short-verify",
+            image,
+            payload.len() as u64,
+            VerifyMode::Full,
+            CancelHandle::new(),
+        );
+        let (image, sync_succeeded) = write_and_sync(writing_execution, "raw");
+        cut_file_in_half(&path);
+        let verifying = verifying_from_sync_succeeded(
+            sync_succeeded,
+            image,
+            CancelHandle::new(),
+            &snapshot,
+            &target_path,
+        );
+        let (_image, outcome) = verifying.run(|_| {});
+        assert!(
+            matches!(
+                outcome,
+                VerifyOutcome::Failed(VerifyFailed {
+                    reason: VerifyFailureReason::SourceUnexpectedEof,
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+        let _ = std::fs::remove_file(&target_path);
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -79,6 +79,8 @@ mod detect;
 #[cfg(test)]
 mod gzip_behavior;
 pub mod source_identity;
+#[cfg(test)]
+mod xz_behavior;
 
 // Why `FileImageSource::new` refused to construct a source. Deliberately
 // small and specific to construction-time failures -- `open_reader()`

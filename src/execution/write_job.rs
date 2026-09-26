@@ -52,7 +52,7 @@
 //       |   via core::check_identity_instance_for_verify -- Step 3)
 //       v
 //   VerifyReadyToOpen
-//       |  (caller calls linux_access::open_device(block_path, "r"), outside
+//       |  (caller calls linux_access::open_device(block_path, OpenAccess::ReadOnly), outside
 //       |   this module; finalize(self, opened_handle, fd_metadata): FD
 //       |   binding check, via core::check_fd_binding -- the same anti-TOCTOU
 //       |   final check the write path already uses)
@@ -80,7 +80,7 @@
 // write/sync capability (`core::ActiveWrite`/`ActiveWriteTarget`/
 // `SyncTarget`), even to merely hold it open. `VerifyMode::Quick`/`Full`
 // instead open a brand-new, independent, read-only FD via
-// `linux_access::open_device(block_path, "r")`, re-validated from scratch
+// `linux_access::open_device(block_path, OpenAccess::ReadOnly)`, re-validated from scratch
 // (fresh `DeviceSnapshot`, Identity, Instance, hazard, FD binding) exactly
 // like the original write-mode open was -- this is "Approach B" from the
 // Built-in Verify design phase (reports/latest.md), chosen over reusing the
@@ -117,7 +117,7 @@
 //     as caller-supplied parameters, so a future `main.rs` Controller (not
 //     this step) is the one that actually performs those two D-Bus calls,
 //     the same way it already does for the write path's own
-//     `collect_device_snapshot`/`open_device("rw")` calls today.
+//     `collect_device_snapshot`/`open_device(OpenAccess::WriteExclusive)` calls today.
 //
 // This whole module is therefore unreachable from any production code path
 // today (`main.rs` never names anything in it), which is why every public
@@ -1166,7 +1166,7 @@ impl PendingVerify {
 
 // The second, and final, pre-flight phase: Identity/Instance/hazard already
 // passed against `current`; the caller must now call
-// `linux_access::open_device(block_path(), "r")` (outside this module -- see
+// `linux_access::open_device(block_path(), OpenAccess::ReadOnly)` (outside this module -- see
 // the module-level doc comment) and pass the result to `finalize()`. Mirrors
 // `core::ReadyToOpen` exactly, one step later in the chain and for a
 // read-only open instead of a write-mode one.
@@ -1198,7 +1198,7 @@ impl VerifyReadyToOpen {
     // Read-only access to the diagnostics that already decided this pass
     // was clean -- `main.rs` (Verify Pre-flight Diagnostics implementation
     // step 5+6) reads this to display a diagnostic summary before calling
-    // `open_device(block_path(), "r")`. Returns a borrow, not a clone: the
+    // `open_device(block_path(), OpenAccess::ReadOnly)`. Returns a borrow, not a clone: the
     // caller only needs to read the value to format it, never to own or
     // outlive `self`. `pub(crate)`, matching `VerifyTargetDiagnostics`'s own
     // visibility -- no setter or alternate constructor exists anywhere, so
@@ -1211,7 +1211,7 @@ impl VerifyReadyToOpen {
     // final check the write path already uses) against the just-opened
     // read-only FD's own kernel-reported metadata -- independent of D-Bus,
     // exactly like the write path's own final check. `opened_handle: None`
-    // means the caller's `open_device(..., "r")` call itself failed (there
+    // means the caller's `open_device(..., OpenAccess::ReadOnly)` call itself failed (there
     // is no handle to check); `fd_metadata` must already have been read (by
     // the caller, via `OpenedDeviceHandle::metadata()`) from that same
     // handle before calling this, exactly mirroring
@@ -3006,7 +3006,7 @@ mod tests {
     // the Gate's own baseline for every test that isn't specifically
     // exercising Identity/Instance/hazard rejection) and reopening
     // `target_path` read-only as the "just-opened read-only FD"
-    // `linux_access::open_device(block_path, "r")` would have produced in
+    // `linux_access::open_device(block_path, OpenAccess::ReadOnly)` would have produced in
     // production. Panics loudly (with the actual error) if either
     // pre-flight phase unexpectedly rejects -- exactly what a test setup
     // helper should do, since an unexpected rejection here means the test

@@ -155,18 +155,66 @@ pub struct FdMetadata {
     pub proc_fd_target: Option<String>,
 }
 
-// Calls org.freedesktop.UDisks2.Block.OpenDevice(mode, options) and returns
-// the resulting file descriptor, wrapped so it can only be inspected
-// read-only and closed — this type exposes no write/seek API at all.
+// What a device FD is opened for. Each variant fixes both the access mode
+// and the open flags, so a caller can never pair a writable mode with the
+// wrong flags (see `open_device_arguments`).
 //
-// `mode` is UDisks2's own vocabulary: "r" (read-only), "w" (write-only), or
-// "rw" (read-write). This is a genuine, unprivileged D-Bus method call — any
-// privilege escalation happens inside UDisks2/polkit using the caller's own
-// session, not via sudo or any bypass initiated by this program. If polkit
-// requires interactive authentication, this call simply blocks until the
-// user's own polkit agent (e.g. a graphical prompt) is answered or the
-// request times out/is denied.
-pub fn open_device(block_path: &str, mode: &str) -> Result<OpenedDeviceHandle, OpenDeviceError> {
+//   - `WriteExclusive`: read-write, with `O_EXCL`. For a block device this
+//     makes the kernel *claim* the device for this open file: the open
+//     fails with EBUSY if the device -- or any of its partitions, for a
+//     whole disk -- is already claimed (mounted, active swap, used by
+//     device-mapper / md, or opened exclusively by someone else), and while
+//     the FD stays open nothing else can claim it (e.g. an automount of one
+//     of its partitions). A second, kernel-enforced layer on top of the
+//     Safety Engine and the fresh Write Gate, never a replacement for them:
+//     plain (non-exclusive) opens by other processes are not affected, and
+//     states the kernel does not treat as claims are not caught.
+//   - `ReadOnly`: read-only, without `O_EXCL`. For Verify, which must still
+//     work when the desktop auto-mounts a freshly written partition (see
+//     `core::check_identity_instance_for_verify`) -- an exclusive open would
+//     then fail although the write succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenAccess {
+    WriteExclusive,
+    ReadOnly,
+}
+
+// The `mode` and `options` arguments of UDisks2's Block.OpenDevice for
+// `access`. `mode` is UDisks2's own vocabulary ("r" / "rw"); UDisks2 derives
+// the access mode from it and ORs `options["flags"]` (D-Bus type `i`) into
+// the open(2) flags, rejecting O_RDONLY/O_WRONLY/O_RDWR there -- so the
+// access mode is never put into `flags`.
+fn open_device_arguments(access: OpenAccess) -> (&'static str, HashMap<String, OwnedValue>) {
+    let mut options: HashMap<String, OwnedValue> = HashMap::new();
+
+    let mode = match access {
+        OpenAccess::WriteExclusive => {
+            options.insert("flags".to_string(), OwnedValue::from(libc::O_EXCL));
+            "rw"
+        }
+        OpenAccess::ReadOnly => "r",
+    };
+
+    (mode, options)
+}
+
+// Calls org.freedesktop.UDisks2.Block.OpenDevice for `access` (see
+// `OpenAccess`) and returns the resulting file descriptor, wrapped so it can
+// only be inspected read-only and closed — this type exposes no write/seek
+// API at all.
+//
+// This is a genuine, unprivileged D-Bus method call — any privilege
+// escalation happens inside UDisks2/polkit using the caller's own session,
+// not via sudo or any bypass initiated by this program. If polkit requires
+// interactive authentication, this call simply blocks until the user's own
+// polkit agent (e.g. a graphical prompt) is answered or the request times
+// out/is denied. An exclusive open refused because the device is in use
+// fails here like any other open failure (`CallFailed`), before any FD
+// exists.
+pub fn open_device(
+    block_path: &str,
+    access: OpenAccess,
+) -> Result<OpenedDeviceHandle, OpenDeviceError> {
     let connection = Connection::system()
         .map_err(|error| OpenDeviceError::ConnectionFailed(error.to_string()))?;
 
@@ -178,7 +226,7 @@ pub fn open_device(block_path: &str, mode: &str) -> Result<OpenedDeviceHandle, O
     )
     .map_err(|error| OpenDeviceError::CallFailed(error.to_string()))?;
 
-    let options: HashMap<String, OwnedValue> = HashMap::new();
+    let (mode, options) = open_device_arguments(access);
 
     let fd: zbus::zvariant::OwnedFd = block
         .call("OpenDevice", &(mode, options))
@@ -358,6 +406,37 @@ pub(crate) fn assert_fd_closed_for_test(raw_fd: RawFd, target_before_drop: Optio
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    // OpenDevice arguments. The write FD is a read-write, exclusive open:
+    // mode "rw" plus `flags` = O_EXCL as a D-Bus `i` (i32) -- and nothing
+    // else in `flags` (in particular no access-mode bits, which UDisks2
+    // rejects there). If O_EXCL ever disappears from the write FD, this
+    // fails.
+    #[test]
+    fn write_access_is_read_write_and_exclusive() {
+        let (mode, options) = open_device_arguments(OpenAccess::WriteExclusive);
+
+        assert_eq!(mode, "rw");
+        assert_eq!(options.len(), 1);
+        let flags = options.get("flags").expect("flags option present");
+        assert_eq!(flags.value_signature().to_string(), "i");
+        assert!(matches!(&**flags, zbus::zvariant::Value::I32(_)));
+        let flags = i32::try_from(flags).unwrap();
+        assert_eq!(flags, libc::O_EXCL);
+        assert_eq!(flags & libc::O_ACCMODE, 0);
+        if cfg!(target_arch = "x86_64") {
+            assert_eq!(libc::O_EXCL, 0o200);
+        }
+    }
+
+    // The Verify FD is read-only and not exclusive: mode "r", no flags.
+    #[test]
+    fn read_only_access_is_not_exclusive() {
+        let (mode, options) = open_device_arguments(OpenAccess::ReadOnly);
+
+        assert_eq!(mode, "r");
+        assert!(options.is_empty(), "no flags, so no O_EXCL: {options:?}");
+    }
 
     // Collision-avoidance identical in spirit to the temp-file helpers in
     // `core.rs`'s/`write_job.rs`'s/`image_source.rs`'s own test modules: PID

@@ -375,7 +375,10 @@ fn run_open_test(block_path: String) -> zbus::Result<()> {
          this program will not use sudo or any other privilege bypass."
     );
 
-    let handle = match linux_access::open_device(&baseline.block_path, "rw") {
+    let handle = match linux_access::open_device(
+        &baseline.block_path,
+        linux_access::OpenAccess::WriteExclusive,
+    ) {
         Ok(handle) => handle,
         Err(error) => {
             println!("OpenDevice: failed ({error:?})");
@@ -514,7 +517,10 @@ fn run_prepare_test(block_path: String) -> zbus::Result<()> {
          this program will not use sudo or any other privilege bypass."
     );
 
-    let open_result = linux_access::open_device(&ready.current().block_path, "rw");
+    let open_result = linux_access::open_device(
+        &ready.current().block_path,
+        linux_access::OpenAccess::WriteExclusive,
+    );
 
     // Metadata must be read from the handle (a genuine, if tiny, bit of
     // Linux I/O -- fstat/ioctl) *before* the handle's ownership moves into
@@ -1212,7 +1218,10 @@ fn run_write_test(
          this program will not use sudo or any other privilege bypass."
     );
 
-    let open_result = linux_access::open_device(&ready.current().block_path, "rw");
+    let open_result = linux_access::open_device(
+        &ready.current().block_path,
+        linux_access::OpenAccess::WriteExclusive,
+    );
 
     // Metadata must be read from the handle *before* the handle's ownership
     // moves into `finalize_prepared_write`, exactly like `run_prepare_test`
@@ -1535,7 +1544,10 @@ fn run_write_test(
                                  this program will not use sudo or any other privilege bypass."
                             );
 
-                            let open_result = linux_access::open_device(ready.block_path(), "r");
+                            let open_result = linux_access::open_device(
+                                ready.block_path(),
+                                linux_access::OpenAccess::ReadOnly,
+                            );
 
                             let (handle_opt, metadata) = match open_result {
                                 Ok(handle) => {
@@ -2352,6 +2364,68 @@ mod tests {
     use std::cell::Cell;
     use std::sync::mpsc;
     use std::time::Duration;
+
+    // ---------------------------------------------------------------------
+    // Which `OpenAccess` each OpenDevice call site uses. The call sites are
+    // D-Bus calls that cannot run in a test, so their source text is checked
+    // instead: every read-write FD (open-test, prepare-test, the write in
+    // write-test) is `WriteExclusive` (O_EXCL), and the Verify FD is
+    // `ReadOnly` (never exclusive).
+    // ---------------------------------------------------------------------
+
+    // This file's code above its test module.
+    fn production_source() -> &'static str {
+        let source = include_str!("main.rs");
+        let end = source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("test module marker");
+        &source[..end]
+    }
+
+    // The source of the top-level `fn name(...)`, up to its closing brace.
+    fn production_fn_source(name: &str) -> &'static str {
+        let production = production_source();
+        let start = production
+            .find(&format!("\nfn {name}("))
+            .unwrap_or_else(|| panic!("fn {name} not found"))
+            + 1;
+        let length = production[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("end of fn {name} not found"));
+        &production[start..start + length]
+    }
+
+    #[test]
+    fn every_open_device_call_uses_the_intended_access() {
+        let production = production_source();
+        assert_eq!(
+            production.matches("linux_access::open_device(").count(),
+            4,
+            "a new OpenDevice call site must be added to this test"
+        );
+
+        for name in ["run_open_test", "run_prepare_test"] {
+            let source = production_fn_source(name);
+            assert_eq!(
+                source.matches("OpenAccess::WriteExclusive").count(),
+                1,
+                "{name}"
+            );
+            assert_eq!(source.matches("OpenAccess::ReadOnly").count(), 0, "{name}");
+        }
+
+        // write-test: the write FD is exclusive, and the Verify FD opened
+        // after it is read-only.
+        let write_test = production_fn_source("run_write_test");
+        assert_eq!(write_test.matches("OpenAccess::WriteExclusive").count(), 1);
+        assert_eq!(write_test.matches("OpenAccess::ReadOnly").count(), 1);
+        let write = write_test.find("OpenAccess::WriteExclusive").unwrap();
+        let verify = write_test.find("OpenAccess::ReadOnly").unwrap();
+        assert!(
+            write < verify,
+            "the write FD is opened before the Verify FD"
+        );
+    }
 
     // A. Exact match -> true.
     #[test]

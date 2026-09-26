@@ -863,11 +863,11 @@ fn install_cancel_handler(cancel: write_job::CancelHandle) -> Result<(), ctrlc::
 // reports/latest.md's Mount-Allowance Real-device Test design). This is not
 // a Safety bypass of any kind: every existing check (fresh snapshot fetch,
 // `check_target()`'s Identity/Instance/hazard re-verification,
-// `OpenDevice(mode="r")`, FD binding) still runs in full afterward, unchanged
-// -- this function only delays when that sequence starts. It never touches
-// the target device itself (no `udisksctl`, `mount`, or any other command is
-// spawned here) -- mounting is entirely the user's own action in their own
-// terminal.
+// `OpenDevice(mode="r", O_DIRECT)`, FD binding) still runs in full
+// afterward, unchanged -- this function only delays when that sequence
+// starts. It never touches the target device itself (no `udisksctl`,
+// `mount`, or any other command is spawned here) -- mounting is entirely
+// the user's own action in their own terminal.
 //
 // Blocks on `stdin`. Returns `true` only if a line was actually read (the
 // user pressed Enter); `false` on EOF or an I/O error, mirroring the
@@ -1435,7 +1435,7 @@ fn run_write_test(
                             // `mount_points`. Everything below this block --
                             // `collect_device_snapshot`, `check_target`,
                             // Identity/Instance/hazard checks,
-                            // `OpenDevice(mode="r")`, FD binding -- is
+                            // `OpenDevice(mode="r", O_DIRECT)`, FD binding -- is
                             // unchanged and still runs in full; this flag
                             // only delays when it starts. Safe to hold
                             // `pending` here indefinitely: `begin_verify()`
@@ -2243,7 +2243,7 @@ fn format_verify_cancelled(
 
 // Shown when `cancel.is_requested()` is already `true` by the time
 // `VerifyStart::Pending` is reached -- before `collect_device_snapshot()`,
-// `check_target()`, or `OpenDevice(mode="r")` are ever called (see the early
+// `check_target()`, or `OpenDevice(mode="r", O_DIRECT)` are ever called (see the early
 // cancel check in `run_write_test`). Deliberately does not claim any FD/D-Bus
 // state was opened-then-closed: none of it was ever opened at all.
 fn format_verify_cancelled_before_start() -> Vec<String> {
@@ -2374,7 +2374,7 @@ mod tests {
     // D-Bus calls that cannot run in a test, so their source text is checked
     // instead: every read-write FD (open-test, prepare-test, the write in
     // write-test) is `WriteExclusive` (O_EXCL), and the Verify FD is
-    // `ReadOnly` (never exclusive).
+    // `ReadOnlyDirect` (O_DIRECT, never exclusive).
     // ---------------------------------------------------------------------
 
     // This file's code above its test module.

@@ -844,14 +844,14 @@ impl ImageSelection {
 // entire Job -- never branched on inside `Writing`'s or `Syncing`'s hot
 // loops (see `write_job.rs`). `None` still means write + flush + sync
 // happen as normal; it only means no read-back verification stage runs
-// afterward. `Quick`/`Full` name a policy for a future `Verifying` stage
-// that this revision does not implement -- see `write_job.rs`'s
-// module-level doc comment.
-// `#[allow(dead_code)]`: `Quick`/`Full` are not yet constructed by any
-// production call site (`main.rs`'s PoC only ever passes `None` -- Verify
-// itself is not implemented this revision, see the module-level doc
-// comment on `write_job.rs`), mirroring `WriteGateError`'s existing
-// `#[allow(dead_code)]` for the same reason.
+// afterward. `Quick`/`Full` select the read-back that
+// `write_job::Verifying::run()` performs after a successful sync (Quick:
+// sampled windows, raw images only; Full: the whole image) -- see
+// `write_job.rs`'s module-level doc comment.
+// `#[allow(dead_code)]`: added when `Quick`/`Full` had no production
+// constructor. `main.rs`'s `write-test` now constructs all three
+// (`parse_verify_mode`), so the attribute no longer suppresses anything; it
+// is left in place only because this change is limited to comments.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyMode {
@@ -1279,19 +1279,17 @@ pub fn finalize_prepared_write(
 // exposes no *public* way to reach one either. This struct itself still does
 // not implement `Write` — the capability lives entirely in the short-lived
 // `ActiveWriteTarget` borrow `writer_target()` hands out, never in
-// `ActiveWrite` directly. Connecting that capability to an actual call to
-// `writer::write()`, and the WrittenTarget/Failed/Cancelled outcomes a real
-// write attempt would produce, remain distinct, later steps this module does
-// not implement.
+// `ActiveWrite` directly. Connecting that capability to `writer::write()`,
+// and turning the result into Succeeded/Failed/Cancelled outcomes, is done
+// outside this module, by `write_job::Writing::write()`.
 // `#[allow(dead_code)]`: these three `pub` fields are read by this module's
 // own tests and exist for a future GUI/Controller's diagnostics, but no
 // production code path reads them today -- `AuthorizedWrite` (what
 // `PreparedWrite::begin()` now returns) does not expose `ActiveWrite`'s
 // fields directly, and `main.rs`'s prepare-test PoC captures the same
-// information from `PreparedWrite` before `begin()` consumes it. Mirrors
-// `write_job.rs`'s own module-level `#![allow(dead_code)]`: nothing here is
-// wired into a real write path yet (`Real-device execution path: NOT
-// CONNECTED`).
+// information from `PreparedWrite` before `begin()` consumes it. (The write
+// path itself is connected: `main.rs`'s `write-test` drives `ActiveWrite`
+// through `write_job`; only these three fields go unread.)
 #[allow(dead_code)]
 pub struct ActiveWrite {
     pub target_block_path: String,
@@ -1411,11 +1409,11 @@ impl ActiveWrite {
     // `pub(in crate::execution)` rather than `pub(crate)`: reachable only
     // from within the `execution` module tree, compiler-enforced (see
     // `execution/mod.rs`) -- not from `main.rs` or any other sibling module.
-    // Wiring an `ActiveWriteTarget` obtained here into an actual
-    // `writer::write()` call is a distinct, later step; this method only
-    // proves the capability can be obtained, not that it is ever used to
-    // write anything.
-    #[allow(dead_code)] // exercised by this module's own tests today; not yet called from main.rs.
+    // The one caller is `write_job::Writing::write()`, which hands the
+    // returned target to `writer::write()`; `main.rs`'s `write-test` drives
+    // that path. The `allow` below no longer suppresses anything and is left in
+    // place only because the change that noted this was limited to comments.
+    #[allow(dead_code)]
     pub(in crate::execution) fn writer_target(&mut self) -> ActiveWriteTarget<'_> {
         self.handle.writer_target()
     }
@@ -1433,7 +1431,10 @@ impl ActiveWrite {
     //
     // `pub(in crate::execution)` rather than `pub(crate)`, for the same
     // reason as `writer_target()` above.
-    #[allow(dead_code)] // exercised by this module's/write_job.rs's tests today; not yet called from main.rs.
+    // Called by `write_job::Syncing::sync()`, which `main.rs`'s `write-test`
+    // drives; the `allow` below no longer suppresses anything and is left in
+    // place only because the change that noted this was limited to comments.
+    #[allow(dead_code)]
     pub(in crate::execution) fn sync_target(&self) -> SyncTarget<'_> {
         self.handle.sync_target()
     }

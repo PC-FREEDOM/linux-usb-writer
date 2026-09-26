@@ -52,10 +52,12 @@
 //       |   via core::check_identity_instance_for_verify -- Step 3)
 //       v
 //   VerifyReadyToOpen
-//       |  (caller calls linux_access::open_device(block_path, OpenAccess::ReadOnly), outside
-//       |   this module; finalize(self, opened_handle, fd_metadata): FD
-//       |   binding check, via core::check_fd_binding -- the same anti-TOCTOU
-//       |   final check the write path already uses)
+//       |  (caller calls linux_access::open_device(block_path,
+//       |   OpenAccess::ReadOnlyDirect) -- OpenDevice(mode="r", O_DIRECT) --
+//       |   outside this module; finalize(self, opened_handle, fd_metadata):
+//       |   FD binding check, via core::check_fd_binding -- the same
+//       |   anti-TOCTOU final check the write path already uses -- then the
+//       |   FD's direct-read geometry)
 //       v
 //   Verifying
 //       |  (run(self, on_progress): consumes Verifying, runs Quick or Full)
@@ -78,8 +80,8 @@
 // called, for every `VerifyMode` including `None` -- Verify never reuses the
 // write/sync capability (`core::ActiveWrite`/`ActiveWriteTarget`/
 // `SyncTarget`), even to merely hold it open. `VerifyMode::Quick`/`Full`
-// instead open a brand-new, independent, read-only FD via
-// `linux_access::open_device(block_path, OpenAccess::ReadOnly)`, re-validated from scratch
+// instead open a brand-new, independent, read-only O_DIRECT FD via
+// `linux_access::open_device(block_path, OpenAccess::ReadOnlyDirect)`, re-validated from scratch
 // (fresh `DeviceSnapshot`, Identity, Instance, hazard, FD binding) exactly
 // like the original write-mode open was -- this is "Approach B" from the
 // Built-in Verify design phase (reports/latest.md), chosen over reusing the
@@ -106,27 +108,26 @@
 //   - dropping page-cache pages (POSIX_FADV_DONTNEED / BLKFLSBUF) before
 //     Verify -- O_DIRECT alone keeps Verify's reads off the page cache, see
 //     `Verifying::run()`'s doc comment
-//   - any connection from `main.rs` or any other production call site to
-//     this module -- everything here is exercised only by this module's own
-//     `#[cfg(test)]` tests, against plain regular temp files, never a real
-//     block device. In particular, nothing in this module ever calls
-//     `linux_backend::collect_device_snapshot()` or
-//     `linux_access::open_device()` itself -- exactly like the existing
-//     write path, `check_target()`/`finalize()` (above) take their results
-//     as caller-supplied parameters, so a future `main.rs` Controller (not
-//     this step) is the one that actually performs those two D-Bus calls,
-//     the same way it already does for the write path's own
-//     `collect_device_snapshot`/`open_device(OpenAccess::WriteExclusive)` calls today.
 //
-// This whole module is therefore unreachable from any production code path
-// today (`main.rs` never names anything in it), which is why every public
-// item below would otherwise trigger rustc's `dead_code` lint under a plain
-// `cargo check`. A single module-level allow says so once, honestly, instead
-// of scattering per-item annotations that would all say the same thing. This
-// is a temporary measure: once a real Controller/UI actually connects to
-// `write_job`, this module-wide allow should be removed (individual items
-// that remain genuinely unused at that point can be annotated on their own,
-// or deleted).
+// Production caller: `main.rs`'s `run_write_test` (`write-test`) drives this
+// whole state machine end to end, from `AuthorizedExecution::bind()` through
+// `Verifying::run()`. Nothing in this module ever calls
+// `linux_backend::collect_device_snapshot()` or `linux_access::open_device()`
+// itself: exactly like the write path, `check_target()`/`finalize()` (above)
+// take their results as caller-supplied parameters, and `main.rs` performs
+// those calls -- `open_device(OpenAccess::WriteExclusive)` for the write,
+// `open_device(OpenAccess::ReadOnlyDirect)` for Verify.
+//
+// The module-level `allow(dead_code)` below predates that wiring. What it
+// still covers today is a handful of fields that production code only ever
+// reads through their `Debug` output (`main.rs` prints e.g. `Failed`,
+// `VerifyStartError` with `{:?}`) or that only tests read -- e.g. the
+// payloads of `WriteJobFailureCause`, most fields of `Failed`,
+// `Cancelled::reason`, `VerifyStartError::DirectReadUnavailable`'s payload,
+// `VerifyProgress::mode`; rustc's `dead_code` lint does not count a
+// derived `Debug` as a read. It is kept as is for now; narrowing it to those
+// items (or removing it once a structured caller reads them) is left to the
+// Production Orchestration API work.
 #![allow(dead_code)]
 
 use std::io::{self, Read};
@@ -1172,10 +1173,11 @@ impl PendingVerify {
 
 // The second, and final, pre-flight phase: Identity/Instance/hazard already
 // passed against `current`; the caller must now call
-// `linux_access::open_device(block_path(), OpenAccess::ReadOnly)` (outside this module -- see
-// the module-level doc comment) and pass the result to `finalize()`. Mirrors
+// `linux_access::open_device(block_path(), OpenAccess::ReadOnlyDirect)` --
+// OpenDevice(mode="r", O_DIRECT) -- (outside this module -- see the
+// module-level doc comment) and pass the result to `finalize()`. Mirrors
 // `core::ReadyToOpen` exactly, one step later in the chain and for a
-// read-only open instead of a write-mode one.
+// read-only O_DIRECT open instead of a write-mode one.
 //
 // `diagnostics` (Verify Pre-flight Diagnostics, implementation step 3+4):
 // the exact `VerifyTargetDiagnostics` `check_target()` computed to decide
@@ -1204,7 +1206,7 @@ impl VerifyReadyToOpen {
     // Read-only access to the diagnostics that already decided this pass
     // was clean -- `main.rs` (Verify Pre-flight Diagnostics implementation
     // step 5+6) reads this to display a diagnostic summary before calling
-    // `open_device(block_path(), OpenAccess::ReadOnly)`. Returns a borrow, not a clone: the
+    // `open_device(block_path(), OpenAccess::ReadOnlyDirect)`. Returns a borrow, not a clone: the
     // caller only needs to read the value to format it, never to own or
     // outlive `self`. `pub(crate)`, matching `VerifyTargetDiagnostics`'s own
     // visibility -- no setter or alternate constructor exists anywhere, so
@@ -1217,11 +1219,13 @@ impl VerifyReadyToOpen {
     // final check the write path already uses) against the just-opened
     // read-only FD's own kernel-reported metadata -- independent of D-Bus,
     // exactly like the write path's own final check. `opened_handle: None`
-    // means the caller's `open_device(..., OpenAccess::ReadOnly)` call itself failed (there
+    // means the caller's `open_device(..., OpenAccess::ReadOnlyDirect)` call itself failed (there
     // is no handle to check); `fd_metadata` must already have been read (by
     // the caller, via `OpenedDeviceHandle::metadata()`) from that same
     // handle before calling this, exactly mirroring
-    // `core::finalize_prepared_write`'s own contract. On any rejection, the
+    // `core::finalize_prepared_write`'s own contract. After a `Match`, the
+    // FD's direct-read geometry is read (`DirectReadUnavailable` if it
+    // cannot be; there is no buffered fallback). On any rejection, the
     // handle (if any) is simply dropped at the end of this function's scope
     // -- ordinary RAII closes the fd -- and `self.image` is returned
     // alongside the error, never silently dropped.

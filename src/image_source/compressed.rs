@@ -251,10 +251,18 @@ impl PreflightedCompressedImage {
     // its own independent position -- so this can be called any number of
     // times (e.g. once to write, once more to verify), and no replay affects
     // another. The reader enforces everything Preflight established; see
-    // `StrictReplayReader`. Infallible: nothing is read until the first
-    // `read()` (any error surfaces there).
-    pub fn replay(&self) -> StrictReplayReader {
-        StrictReplayReader::new(&self.file, self.compressed_size, self.logical_size)
+    // `StrictReplayReader`. It decodes with the format Preflight validated
+    // (`self.format`, never re-detected). Nothing is read here: the only
+    // error is the decoder failing to set up (xz only, e.g. out of memory),
+    // reported as a `ReplayFailure::DecoderFailure` whose source is
+    // liblzma's own error; every other error surfaces from `read()`.
+    pub fn replay(&self) -> io::Result<StrictReplayReader> {
+        StrictReplayReader::new(
+            &self.file,
+            self.format,
+            self.compressed_size,
+            self.logical_size,
+        )
     }
 }
 
@@ -267,8 +275,8 @@ impl PreflightedCompressedImage {
 //   - `open_reader()` is a fresh `replay()` (a `StrictReplayReader` from
 //     logical byte 0, over the same open file, with its own position), so
 //     the write and a later Full Verify each decode independently;
-//   - `access()` is `SequentialReplay`: a gzip stream cannot be read at an
-//     arbitrary offset without decoding everything before it, so `read_at`
+//   - `access()` is `SequentialReplay`: a gzip or xz stream cannot be read
+//     at an arbitrary offset without decoding everything before it, so `read_at`
 //     keeps the trait's `Unsupported` default and Quick Verify refuses this
 //     source;
 //   - `revalidate_identity()` checks against the snapshot `open_image` took,
@@ -303,7 +311,7 @@ impl ImageSource for CompressedImageSource {
     // Replay errors keep their typed payloads inside the `io::Error` (see
     // `StrictReplayReader`); nothing here re-wraps them.
     fn open_reader(&self) -> io::Result<Box<dyn Read>> {
-        Ok(Box::new(self.preflighted.replay()))
+        Ok(Box::new(self.preflighted.replay()?))
     }
 
     fn revalidate_identity(&self) -> Result<(), SourceChanged> {
@@ -798,6 +806,15 @@ enum ReplayFailure {
     Corrupt,
     // The decoder reported that the compressed data ended too soon.
     Incomplete,
+    // xz: a stream carries no integrity check (Check=None).
+    IntegrityCheckMissing,
+    // xz: a stream's integrity check type cannot be verified.
+    UnsupportedIntegrityCheck,
+    // xz: a Block needs more decoder memory than `limit`.
+    DecoderMemoryLimitExceeded { limit: u64 },
+    // The decoder could not be set up or could not continue, not attributed
+    // to the data (the first error returned keeps the decoder's own error).
+    DecoderFailure,
 }
 
 impl ReplayFailure {
@@ -813,6 +830,22 @@ impl ReplayFailure {
             }
             if inner.is::<SourceReadError>() {
                 return ReplayFailure::SourceIo;
+            }
+            if inner.is::<DecoderSetupFailed>() {
+                return ReplayFailure::DecoderFailure;
+            }
+            // liblzma's own errors (xz only), classified as in Preflight.
+            if let Some(lzma) = inner.downcast_ref::<liblzma::stream::Error>() {
+                use liblzma::stream::Error as Lzma;
+                return match lzma {
+                    Lzma::NoCheck => ReplayFailure::IntegrityCheckMissing,
+                    Lzma::UnsupportedCheck => ReplayFailure::UnsupportedIntegrityCheck,
+                    Lzma::MemLimit => ReplayFailure::DecoderMemoryLimitExceeded {
+                        limit: XZ_DECODER_MEMLIMIT,
+                    },
+                    Lzma::Mem | Lzma::Program => ReplayFailure::DecoderFailure,
+                    Lzma::Data | Lzma::Format | Lzma::Options => ReplayFailure::Corrupt,
+                };
             }
         }
         match error.kind() {
@@ -834,6 +867,23 @@ impl fmt::Display for ReplayFailed {
 }
 
 impl std::error::Error for ReplayFailed {}
+
+// Payload of the error `replay()` returns when the decoder cannot be set up;
+// keeps the decoder's own error as its source.
+#[derive(Debug)]
+struct DecoderSetupFailed(io::Error);
+
+impl fmt::Display for DecoderSetupFailed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "the decompressor could not be set up: {}", self.0)
+    }
+}
+
+impl std::error::Error for DecoderSetupFailed {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 fn replay_failed(failure: ReplayFailure) -> io::Error {
     let kind = match failure {
@@ -885,7 +935,15 @@ pub struct StrictReplayReader {
 }
 
 impl StrictReplayReader {
-    fn new(file: &Arc<File>, compressed_size: u64, logical_size: u64) -> Self {
+    // A reader over `file` (the one Preflight validated, shared -- never
+    // re-opened) decoding `format`. Only the decoder's construction depends
+    // on the format; the state machine below is the same for every format.
+    fn new(
+        file: &Arc<File>,
+        format: CompressionFormat,
+        compressed_size: u64,
+        logical_size: u64,
+    ) -> io::Result<Self> {
         let credited = Arc::new(AtomicU64::new(0));
         let mut budget = InputBudgetMeter::new();
         let hook_credited = Arc::clone(&credited);
@@ -895,9 +953,14 @@ impl StrictReplayReader {
 
         let input =
             BufReader::with_capacity(INPUT_BUFFER_LEN, source_cursor(file, compressed_size));
-        let decoder = Box::new(FormatDecoder::gzip(CountingBufRead::new(input, hook)));
+        let counted = CountingBufRead::new(input, hook);
+        let decoder = Box::new(match format {
+            CompressionFormat::Gzip => FormatDecoder::gzip(counted),
+            CompressionFormat::Xz => FormatDecoder::xz(counted)
+                .map_err(|error| io::Error::other(DecoderSetupFailed(error)))?,
+        });
 
-        StrictReplayReader {
+        Ok(StrictReplayReader {
             logical_size,
             compressed_size,
             state: ReplayState::Active {
@@ -905,7 +968,7 @@ impl StrictReplayReader {
                 produced: 0,
                 credited,
             },
-        }
+        })
     }
 
     // Records `error` as this reader's terminal failure and returns it.
@@ -2718,7 +2781,7 @@ mod tests {
         let (image, path) = preflighted("replay-single", &gzip_member(&a));
 
         for size in REPLAY_BUFFER_SIZES {
-            let run = replay_all(&mut image.replay(), size);
+            let run = replay_all(&mut image.replay().unwrap(), size);
             assert_eq!(run.end, Ok(()), "buffer {size}");
             assert_eq!(run.delivered, a, "buffer {size}");
         }
@@ -2732,7 +2795,7 @@ mod tests {
         let (image, path) = preflighted("replay-multi", &contents);
 
         for size in REPLAY_BUFFER_SIZES {
-            let run = replay_all(&mut image.replay(), size);
+            let run = replay_all(&mut image.replay().unwrap(), size);
             assert_eq!(run.end, Ok(()));
             assert_eq!(
                 run.delivered,
@@ -2751,15 +2814,15 @@ mod tests {
         let a = payload_a();
         let (image, path) = preflighted("replay-repeat", &gzip_member(&a));
 
-        let mut first = image.replay();
-        let mut second = image.replay();
+        let mut first = image.replay().unwrap();
+        let mut second = image.replay().unwrap();
         let mut buf = vec![0u8; 1000];
         let n = first.read(&mut buf).unwrap();
         assert_eq!(&buf[..n], &a[..n]);
 
         let second_run = replay_all(&mut second, 4096);
         let rest_of_first = replay_all(&mut first, 4096);
-        let third_run = replay_all(&mut image.replay(), 64 * 1024);
+        let third_run = replay_all(&mut image.replay().unwrap(), 64 * 1024);
 
         assert_eq!(second_run.delivered, a);
         assert_eq!([&a[..n], &rest_of_first.delivered[..]].concat(), a);
@@ -2778,7 +2841,7 @@ mod tests {
         std::fs::remove_file(&moved).unwrap();
         std::fs::remove_file(&path).unwrap();
 
-        let run = replay_all(&mut image.replay(), 4096);
+        let run = replay_all(&mut image.replay().unwrap(), 4096);
         assert_eq!(run.end, Ok(()));
         assert_eq!(run.delivered, a);
     }
@@ -2788,7 +2851,7 @@ mod tests {
     fn replay_zero_length_reads_and_success_are_stable() {
         let a = payload_a();
         let (image, path) = preflighted("replay-empty-reads", &gzip_member(&a));
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
 
         for _ in 0..3 {
             assert_eq!(reader.read(&mut []).unwrap(), 0);
@@ -2814,7 +2877,7 @@ mod tests {
         let (image, path) = preflighted("replay-zero", &gzip_member(&[]));
         assert_eq!(image.logical_size(), 0);
 
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         assert_eq!(reader.read(&mut []).unwrap(), 0);
         assert!(
             reader.compressed_consumed().is_some(),
@@ -2829,7 +2892,7 @@ mod tests {
         let len = gzip_member(b"z").len() + 40;
         let (image, path2) = preflighted("replay-zero-mut", &padded_to(gzip_member(&[]), len));
         rewrite_in_place(&path2, &padded_to(gzip_member(b"z"), len));
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let run = replay_all(&mut reader, 64);
         assert!(run.delivered.is_empty());
         assert_eq!(
@@ -2857,7 +2920,7 @@ mod tests {
     fn replay_reads_are_limited_to_the_decode_quantum() {
         let random = pseudo_random(3 << 20, 5);
         let (image, path) = preflighted("replay-quantum", &gzip_at(&random, 0));
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let mut buf = vec![0u8; 1 << 20];
         let mut total = 0usize;
         loop {
@@ -2887,7 +2950,7 @@ mod tests {
                     preflighted(&format!("replay-{label}-{size}"), &gzip_member(&a));
                 flip_byte_in_place(&path, offset_from_end);
 
-                let mut reader = image.replay();
+                let mut reader = image.replay().unwrap();
                 let run = replay_all(&mut reader, size);
                 let piece = size.min(DECODE_QUANTUM);
 
@@ -2920,7 +2983,7 @@ mod tests {
         let (image, path) = preflighted("replay-body", &member);
         flip_byte_in_place(&path, (member.len() / 2) as u64);
 
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let run = replay_all(&mut reader, 4096);
         let (kind, failure) = run.end.unwrap_err();
         assert!(matches!(
@@ -2944,7 +3007,7 @@ mod tests {
             let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             file.set_len((member.len() - cut) as u64).unwrap();
 
-            let mut reader = image.replay();
+            let mut reader = image.replay().unwrap();
             let run = replay_all(&mut reader, 4096);
             assert!(run.delivered.len() < a.len());
             assert_eq!(
@@ -2967,7 +3030,7 @@ mod tests {
 
         let (image, path) = preflighted("replay-second-crc", &contents);
         flip_byte_in_place(&path, 8);
-        let run = replay_all(&mut image.replay(), 4096);
+        let run = replay_all(&mut image.replay().unwrap(), 4096);
         assert!(run.delivered.len() < a.len() + b.len());
         assert_eq!(
             run.end,
@@ -2979,7 +3042,7 @@ mod tests {
         let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
         file.set_len((contents.len() - member_b.len() / 2) as u64)
             .unwrap();
-        let run = replay_all(&mut image.replay(), 4096);
+        let run = replay_all(&mut image.replay().unwrap(), 4096);
         assert!(run.delivered.len() < a.len() + b.len());
         assert_eq!(
             run.end,
@@ -2999,7 +3062,7 @@ mod tests {
         let (image, path) = preflighted("replay-early", &padded_to(long, len));
         rewrite_in_place(&path, &padded_to(short, len));
 
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let run = replay_all(&mut reader, 64 * 1024);
         assert_eq!(run.delivered.len(), 1 << 20);
         assert_eq!(
@@ -3025,7 +3088,7 @@ mod tests {
         let (image, path) = preflighted("replay-longer", &padded_to(short, len));
         rewrite_in_place(&path, &padded_to(long, len));
 
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let run = replay_all(&mut reader, 64 * 1024);
         assert!(run.delivered.len() < 1 << 20, "final bytes withheld");
         assert_eq!(
@@ -3057,7 +3120,7 @@ mod tests {
             .unwrap();
         file.write_all(&[0xDE; 4096]).unwrap();
 
-        let run = replay_all(&mut image.replay(), 4096);
+        let run = replay_all(&mut image.replay().unwrap(), 4096);
         assert_eq!(run.end, Ok(()));
         assert_eq!(run.delivered, a);
         let _ = std::fs::remove_file(&path);
@@ -3074,7 +3137,7 @@ mod tests {
         let (image, path) = preflighted("replay-budget", &original);
         rewrite_in_place(&path, &padded_to(gzip_at(b"x", 6), len));
 
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let mut buf = vec![0u8; 64 * 1024];
         let first_error = loop {
             match reader.read(&mut buf) {
@@ -3110,7 +3173,7 @@ mod tests {
         let (image, path) = preflighted("replay-bank", &original);
         rewrite_in_place(&path, &padded_to(bank.clone(), len));
 
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let mut buf = vec![0u8; 64 * 1024];
         let mut delivered = 0usize;
         let error = loop {
@@ -3147,7 +3210,7 @@ mod tests {
 
         let chunk = 1usize << 20;
         let bound = INPUT_BUDGET_CAP + (1 << 20) + (1 << 20) / 64 + INPUT_BUFFER_LEN as u64;
-        let mut reader = image.replay();
+        let mut reader = image.replay().unwrap();
         let mut buf = vec![0u8; chunk];
         let mut delivered = 0usize;
         let mut chunk_start = 0u64;
@@ -3201,6 +3264,573 @@ mod tests {
         struct IsClone;
         impl<T: ?Sized + Clone> AmbiguousIfClone<IsClone> for T {}
         <StrictReplayReader as AmbiguousIfClone<_>>::check();
+    }
+
+    // ---------------------------------------------------------------------
+    // Replay (xz): the same `StrictReplayReader`, with liblzma's decoder.
+    // Damage is introduced after Preflight, in the same inode, the way a
+    // change between Preflight and the write would appear.
+    // ---------------------------------------------------------------------
+
+    // `preflighted` for `.xz` files.
+    fn preflighted_xz(tag: &str, contents: &[u8]) -> (PreflightedCompressedImage, PathBuf) {
+        let path = write_xz_file(tag, contents);
+        let image = open_compressed(&path)
+            .preflight(NO_LIMIT, || false, |_| {})
+            .unwrap_or_else(|error| panic!("{tag}: preflight failed: {error:?}"));
+        assert_eq!(image.format(), CompressionFormat::Xz);
+        (image, path)
+    }
+
+    // Preflights `contents`, lets `damage` change the file in place, then
+    // replays it once with `buf_size` reads; checks the failure is sticky.
+    fn xz_replay_after(
+        tag: &str,
+        contents: &[u8],
+        damage: impl FnOnce(&Path),
+        buf_size: usize,
+    ) -> ReplayRun {
+        let (image, path) = preflighted_xz(tag, contents);
+        damage(&path);
+        let mut reader = image.replay().unwrap();
+        let run = replay_all(&mut reader, buf_size);
+        if let Err(expected) = run.end {
+            assert_stays_failed(&mut reader, expected);
+        }
+        let _ = std::fs::remove_file(&path);
+        run
+    }
+
+    // R1-R3, R27: every supported check replays the exact payload for every
+    // buffer size; after success every read (empty or not) is `Ok(0)`.
+    #[test]
+    fn xz_replay_delivers_the_exact_content_for_every_check_and_buffer_size() {
+        use liblzma::stream::Check;
+        let a = payload_a();
+
+        for check in [Check::Crc32, Check::Crc64, Check::Sha256] {
+            let (image, path) = preflighted_xz("xz-replay-check", &xz_stream(&a, check));
+            for size in REPLAY_BUFFER_SIZES {
+                let mut reader = image.replay().unwrap();
+                let run = replay_all(&mut reader, size);
+                assert_eq!(run.end, Ok(()), "{check:?}/{size}");
+                assert!(run.delivered == a, "{check:?}/{size}");
+                for len in [0usize, 1, 4096] {
+                    assert_eq!(reader.read(&mut vec![0u8; len]).unwrap(), 0);
+                }
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // R4-R7: concatenated streams and Stream Padding replay as one image,
+    // to the very end.
+    #[test]
+    fn xz_replay_reads_every_concatenated_stream_and_padding() {
+        use liblzma::stream::Check;
+        let (a, b) = (payload_a(), payload_b());
+        let c = b"xyz".to_vec();
+        let sa = xz_stream(&a, Check::Crc32);
+        let sb = xz_stream(&b, Check::Crc64);
+        let sc = xz_stream(&c, Check::Sha256);
+        let pad = |len: usize| vec![0u8; len];
+
+        for (name, contents, expected) in [
+            (
+                "2",
+                [sa.clone(), sb.clone()].concat(),
+                [&a[..], &b].concat(),
+            ),
+            (
+                "3",
+                [sa.clone(), sb.clone(), sc.clone()].concat(),
+                [&a[..], &b, &c].concat(),
+            ),
+            (
+                "pad-between",
+                [sa.clone(), pad(8), sb.clone()].concat(),
+                [&a[..], &b].concat(),
+            ),
+            ("pad-final", [sa.clone(), pad(4)].concat(), a.clone()),
+        ] {
+            for size in [7, 64 * 1024, 1024 * 1024] {
+                let run = xz_replay_after(&format!("xz-replay-{name}"), &contents, |_| {}, size);
+                assert_eq!(run.end, Ok(()), "{name}/{size}");
+                assert!(run.delivered == expected, "{name}/{size}");
+            }
+        }
+    }
+
+    // R8-R9: a stream without an integrity check appearing after Preflight
+    // (first or later stream) is refused before any of its payload.
+    #[test]
+    fn xz_replay_refuses_a_missing_integrity_check_in_any_stream() {
+        use liblzma::stream::Check;
+        let (a, b) = (payload_a(), payload_b());
+        let (sa, sb) = (crc64_stream(&a), crc64_stream(&b));
+        let expected = (
+            io::ErrorKind::InvalidInput,
+            ReplayFailure::IntegrityCheckMissing,
+        );
+
+        let none = xz_stream(&b, Check::None);
+        let run = xz_replay_after("xz-replay-none", &sb, |p| rewrite_in_place(p, &none), 4096);
+        assert_eq!(run.end, Err(expected));
+        assert!(run.delivered.is_empty());
+
+        let later = [sa.clone(), none].concat();
+        let run = xz_replay_after(
+            "xz-replay-none-later",
+            &[sa, sb].concat(),
+            |p| rewrite_in_place(p, &later),
+            4096,
+        );
+        assert_eq!(run.end, Err(expected));
+        assert!(a.starts_with(&run.delivered));
+    }
+
+    // R10-R11: a reserved Check ID appearing after Preflight (first or later
+    // stream; same size, so only the ID differs) is refused.
+    #[test]
+    fn xz_replay_refuses_an_unsupported_integrity_check_in_any_stream() {
+        let (a, b) = (payload_a(), payload_b());
+        let (sa, sb) = (crc64_stream(&a), crc64_stream(&b));
+        let expected = (
+            io::ErrorKind::Other,
+            ReplayFailure::UnsupportedIntegrityCheck,
+        );
+
+        let reserved = with_check_id(&sb, 5);
+        let run = xz_replay_after(
+            "xz-replay-reserved",
+            &sb,
+            |p| rewrite_in_place(p, &reserved),
+            4096,
+        );
+        assert_eq!(run.end, Err(expected));
+        assert!(run.delivered.is_empty());
+
+        let later = [sa.clone(), reserved].concat();
+        let run = xz_replay_after(
+            "xz-replay-reserved-later",
+            &[sa, sb].concat(),
+            |p| rewrite_in_place(p, &later),
+            4096,
+        );
+        assert_eq!(run.end, Err(expected));
+        assert!(a.starts_with(&run.delivered));
+    }
+
+    // R12: a Block declaring a dictionary over the decoder memory limit
+    // (same size, only the dictionary byte differs) is refused, typed.
+    #[test]
+    fn xz_replay_refuses_a_block_over_the_decoder_memory_limit() {
+        let stream = crc64_stream(&payload_a());
+        let over = with_declared_dictionary(&stream, 40);
+        let run = xz_replay_after(
+            "xz-replay-memlimit",
+            &stream,
+            |p| rewrite_in_place(p, &over),
+            4096,
+        );
+        assert_eq!(
+            run.end,
+            Err((
+                io::ErrorKind::Other,
+                ReplayFailure::DecoderMemoryLimitExceeded {
+                    limit: XZ_DECODER_MEMLIMIT
+                }
+            ))
+        );
+        assert!(run.delivered.is_empty());
+    }
+
+    // R13-R14, R25: damage found after the payload (Block Check, Index,
+    // Stream Footer) fails the read that would deliver the final bytes --
+    // those bytes are never delivered, for every buffer size.
+    #[test]
+    fn xz_replay_withholds_the_final_bytes_when_the_end_is_damaged() {
+        let a = payload_a();
+        let stream = crc64_stream(&a);
+        let index = xz_index_start(&stream);
+        let footer = stream.len() - 12;
+        let expected = (io::ErrorKind::InvalidData, ReplayFailure::Corrupt);
+
+        for (name, position) in [
+            ("block-check", index - 1),
+            ("index-crc", footer - 1),
+            ("footer-crc", footer),
+            ("footer-magic", footer + 11),
+        ] {
+            for size in REPLAY_BUFFER_SIZES {
+                let run = xz_replay_after(
+                    &format!("xz-replay-{name}"),
+                    &stream,
+                    |p| flip_byte_in_place(p, (stream.len() - position) as u64),
+                    size,
+                );
+                let piece = size.min(DECODE_QUANTUM);
+                assert_eq!(run.end, Err(expected), "{name}/{size}");
+                assert!(
+                    run.delivered.len() < a.len(),
+                    "{name}/{size}: final bytes delivered"
+                );
+                assert!(
+                    run.delivered.len() >= a.len() - piece,
+                    "{name}/{size}: stopped early"
+                );
+                assert!(a.starts_with(&run.delivered));
+            }
+        }
+    }
+
+    // R25: the case the strict end exists for. The payload's stream ends in
+    // the first 256 KiB input buffer, and the damage (a later, empty
+    // stream's footer) lies in the next one -- so the decoder itself hands
+    // back every payload byte through `Ok(n)` before reporting it (checked
+    // directly below). The replay still withholds the final bytes.
+    #[test]
+    fn xz_replay_withholds_the_final_bytes_when_the_decoder_errs_only_after_them() {
+        let payload = pseudo_random(200 * 1024, 17);
+        let first = crc64_stream(&payload);
+        assert!(first.len() < INPUT_BUFFER_LEN);
+        let padding = vec![0u8; (INPUT_BUFFER_LEN - first.len()).next_multiple_of(4) + 64];
+        let contents = [first, padding, crc64_stream(&[])].concat();
+        let footer_crc_from_end = 12u64;
+
+        let mut damaged = contents.clone();
+        let at = damaged.len() - footer_crc_from_end as usize;
+        damaged[at] ^= 0xFF;
+        let mut decoder =
+            FormatDecoder::xz(BufReader::with_capacity(INPUT_BUFFER_LEN, &damaged[..])).unwrap();
+        let mut buf = vec![0u8; DECODE_QUANTUM];
+        let mut decoded = 0;
+        let error = loop {
+            match decoder.read(&mut buf) {
+                Ok(0) => panic!("damaged stream ended cleanly"),
+                Ok(n) => decoded += n,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(
+            decoded,
+            payload.len(),
+            "the decoder returned all bytes first"
+        );
+        assert_eq!(ReplayFailure::of(&error), ReplayFailure::Corrupt);
+
+        for size in [4096, 64 * 1024, 1024 * 1024] {
+            let run = xz_replay_after(
+                "xz-replay-late",
+                &contents,
+                |p| flip_byte_in_place(p, footer_crc_from_end),
+                size,
+            );
+            assert_eq!(
+                run.end,
+                Err((io::ErrorKind::InvalidData, ReplayFailure::Corrupt))
+            );
+            assert!(
+                run.delivered.len() < payload.len(),
+                "{size}: final bytes delivered"
+            );
+            assert!(payload.starts_with(&run.delivered));
+        }
+    }
+
+    // R15-R17: truncation, short trailing garbage and invalid Stream Padding
+    // appearing after Preflight are refused.
+    #[test]
+    fn xz_replay_refuses_truncation_trailing_garbage_and_bad_padding() {
+        let (a, b) = (payload_a(), payload_b());
+        let (sa, sb) = (crc64_stream(&a), crc64_stream(&b));
+        let incomplete = (io::ErrorKind::UnexpectedEof, ReplayFailure::Incomplete);
+        let corrupt = (io::ErrorKind::InvalidData, ReplayFailure::Corrupt);
+        let set_len = |len: usize| {
+            move |p: &Path| {
+                let file = std::fs::OpenOptions::new().write(true).open(p).unwrap();
+                file.set_len(len as u64).unwrap();
+            }
+        };
+
+        for cut in [3usize, 13, sa.len() / 2] {
+            let run = xz_replay_after("xz-replay-trunc", &sa, set_len(sa.len() - cut), 4096);
+            assert_eq!(run.end, Err(incomplete), "cut {cut}");
+            assert!(run.delivered.len() < a.len());
+        }
+
+        // Valid padding replaced by the same number of non-zero bytes.
+        let padded = [sa.clone(), vec![0u8; 4]].concat();
+        let garbage = [sa.clone(), vec![0xAA; 4]].concat();
+        let run = xz_replay_after(
+            "xz-replay-garbage",
+            &padded,
+            |p| rewrite_in_place(p, &garbage),
+            4096,
+        );
+        assert_eq!(run.end, Err(incomplete));
+
+        // Final padding cut to 3 bytes; padding between streams shifted to 3.
+        let run = xz_replay_after("xz-replay-pad3", &padded, set_len(sa.len() + 3), 4096);
+        assert_eq!(run.end, Err(corrupt));
+        let between = [sa.clone(), vec![0u8; 4], sb.clone()].concat();
+        let shifted = [sa.clone(), vec![0u8; 3], sb.clone(), vec![0u8; 1]].concat();
+        let run = xz_replay_after(
+            "xz-replay-pad-between",
+            &between,
+            |p| rewrite_in_place(p, &shifted),
+            4096,
+        );
+        assert_eq!(run.end, Err(corrupt));
+        assert!(a.starts_with(&run.delivered));
+    }
+
+    // R18-R20: exactly the measured size replays; a stream that now decodes
+    // to fewer bytes ends early, one that decodes to more is refused at the
+    // measured size (same compressed length in both cases).
+    #[test]
+    fn xz_replay_enforces_the_logical_size_exactly() {
+        let long = crc64_stream(&vec![7u8; 300 * 1024]);
+        let short = crc64_stream(&vec![7u8; 200 * 1024]);
+        let len = long.len().max(short.len()) + 64;
+        let pad_to = |stream: &[u8]| [stream, &vec![0u8; len - stream.len()]].concat();
+
+        let run = xz_replay_after("xz-replay-size-exact", &pad_to(&long), |_| {}, 64 * 1024);
+        assert_eq!(run.end, Ok(()));
+        assert_eq!(run.delivered.len(), 300 * 1024);
+
+        let shorter = pad_to(&short);
+        let run = xz_replay_after(
+            "xz-replay-size-short",
+            &pad_to(&long),
+            |p| rewrite_in_place(p, &shorter),
+            64 * 1024,
+        );
+        assert_eq!(
+            run.end,
+            Err((io::ErrorKind::UnexpectedEof, ReplayFailure::EndedEarly))
+        );
+        assert_eq!(run.delivered.len(), 200 * 1024);
+
+        let longer = pad_to(&long);
+        let run = xz_replay_after(
+            "xz-replay-size-long",
+            &pad_to(&short),
+            |p| rewrite_in_place(p, &longer),
+            64 * 1024,
+        );
+        assert_eq!(
+            run.end,
+            Err((
+                io::ErrorKind::InvalidData,
+                ReplayFailure::LogicalSizeExceeded
+            ))
+        );
+        assert!(run.delivered.len() < 200 * 1024);
+    }
+
+    // R22: the Compressed Input Budget applies to xz replays unchanged: a
+    // file rewritten (same length) into a tiny stream followed by megabytes
+    // of valid Stream Padding is refused within the cap plus one buffer.
+    #[test]
+    fn xz_replay_enforces_the_input_budget() {
+        let original = crc64_stream(&pseudo_random(2 << 20, 21));
+        let tiny = crc64_stream(b"x");
+        let rewritten = [tiny.clone(), vec![0u8; original.len() - tiny.len()]].concat();
+        let (image, path) = preflighted_xz("xz-replay-budget", &original);
+        rewrite_in_place(&path, &rewritten);
+
+        let mut reader = image.replay().unwrap();
+        let mut buf = vec![0u8; 64 * 1024];
+        let error = loop {
+            match reader.read(&mut buf) {
+                Ok(0) => panic!("unexpected end"),
+                Ok(_) => continue,
+                Err(error) => break error,
+            }
+        };
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        let exceeded = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<InputBudgetExceeded>())
+            .expect("typed budget payload");
+        assert!(exceeded.compressed_consumed <= INPUT_BUDGET_CAP + INPUT_BUFFER_LEN as u64 + 64);
+        assert_stays_failed(
+            &mut reader,
+            (
+                io::ErrorKind::InvalidData,
+                ReplayFailure::InputBudgetExceeded,
+            ),
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // R21: a replay has no cancellation hook of its own; the caller (writer
+    // / Verify) checks between reads. What makes that responsive is that
+    // every read is bounded: at most `DECODE_QUANTUM` of output
+    // (`replay_all` asserts it) and, per 1 MiB chunk, at most the documented
+    // compressed-input bound. A reader abandoned mid-stream (a cancelled
+    // write) does not affect a fresh replay of the same image.
+    #[test]
+    fn xz_replay_reads_are_bounded_and_an_abandoned_reader_is_harmless() {
+        let payload = pseudo_random(3 << 20, 9);
+        let (image, path) = preflighted_xz("xz-replay-bounded", &crc64_stream(&payload));
+
+        let chunk = 1usize << 20;
+        let bound = INPUT_BUDGET_CAP + (1 << 20) + (1 << 20) / 64 + INPUT_BUFFER_LEN as u64;
+        let mut reader = image.replay().unwrap();
+        let mut buf = vec![0u8; chunk];
+        let mut chunk_start = 0u64;
+        let mut filled = 0;
+        while filled < chunk {
+            let n = reader.read(&mut buf[filled..]).unwrap();
+            assert!(n > 0 && n <= DECODE_QUANTUM);
+            filled += n;
+        }
+        let consumed = reader.compressed_consumed().unwrap();
+        assert!(consumed - chunk_start <= bound);
+        chunk_start = consumed;
+        assert!(chunk_start > 0);
+        drop(reader);
+
+        let run = replay_all(&mut image.replay().unwrap(), 64 * 1024);
+        assert_eq!(run.end, Ok(()));
+        assert!(run.delivered == payload);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // R24: a clean end is only success with the whole compressed size
+    // consumed: a reader told the file is 4 bytes longer than it is (so its
+    // input ends early, after a complete stream) fails, never succeeds.
+    #[test]
+    fn xz_replay_requires_exact_input_consumption() {
+        let a = payload_a();
+        let (image, path) = preflighted_xz("xz-replay-consumed", &crc64_stream(&a));
+
+        let mut reader = StrictReplayReader::new(
+            &image.file,
+            CompressionFormat::Xz,
+            image.compressed_size() + 4,
+            image.logical_size(),
+        )
+        .unwrap();
+        let run = replay_all(&mut reader, 4096);
+        assert_eq!(
+            run.end,
+            Err((
+                io::ErrorKind::InvalidData,
+                ReplayFailure::InputNotFullyConsumed
+            ))
+        );
+        assert!(run.delivered.len() < a.len());
+        assert_stays_failed(
+            &mut reader,
+            (
+                io::ErrorKind::InvalidData,
+                ReplayFailure::InputNotFullyConsumed,
+            ),
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // R26, R28: zero-length reads change nothing (before any data and
+    // mid-stream), and success and failure are both sticky.
+    #[test]
+    fn xz_replay_zero_length_reads_and_terminal_states_are_stable() {
+        let a = payload_a();
+        let (image, path) = preflighted_xz("xz-replay-empty-reads", &crc64_stream(&a));
+        let mut reader = image.replay().unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(reader.read(&mut []).unwrap(), 0);
+        }
+        assert_eq!(reader.compressed_consumed(), Some(0), "nothing read yet");
+
+        let mut buf = vec![0u8; 4096];
+        assert_eq!(reader.read(&mut buf).unwrap(), 4096);
+        let consumed = reader.compressed_consumed();
+        assert_eq!(reader.read(&mut []).unwrap(), 0);
+        assert_eq!(reader.compressed_consumed(), consumed);
+
+        let run = replay_all(&mut reader, 4096);
+        assert_eq!(run.end, Ok(()));
+        assert!(run.delivered == a[4096..]);
+        assert!(reader.compressed_consumed().is_none(), "decoder released");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // R29: the replay reads the file Preflight read -- renaming, replacing
+    // and deleting the path change nothing -- and `CompressedImageSource`
+    // hands out independent xz replays with sequential access only.
+    #[test]
+    fn xz_replay_reads_the_opened_file_and_serves_independent_readers() {
+        let a = payload_a();
+        let (image, path) = preflighted_xz("xz-replay-swap", &crc64_stream(&a));
+        let moved = path.with_extension("moved");
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, crc64_stream(b"a different image")).unwrap();
+        std::fs::remove_file(&moved).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let source = CompressedImageSource::new(image);
+        assert_eq!(source.access(), ImageSourceAccess::SequentialReplay);
+        assert_eq!(source.logical_size(), a.len() as u64);
+        let mut first = source.open_reader().unwrap();
+        let mut second = source.open_reader().unwrap();
+        let (from_second, end) = read_boxed(&mut *second);
+        assert_eq!(end, Ok(()));
+        assert!(from_second == a);
+        let (from_first, end) = read_boxed(&mut *first);
+        assert_eq!(end, Ok(()));
+        assert!(from_first == a);
+        assert_eq!(
+            source.read_at(0, &mut [0u8; 16]).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+    }
+
+    // Replay classification: liblzma's errors map exactly as in Preflight,
+    // and a decoder that could not be set up is `DecoderFailure` (never
+    // `Corrupt`, whatever liblzma reported), keeping liblzma's error as its
+    // source. (Setup and Mem / Program failures cannot be provoked from
+    // data, so the mapping itself is checked.)
+    #[test]
+    fn replay_failures_from_liblzma_are_classified_by_type() {
+        use liblzma::stream::Error as Lzma;
+        let of = |lzma: Lzma| ReplayFailure::of(&io::Error::from(lzma));
+
+        assert_eq!(of(Lzma::NoCheck), ReplayFailure::IntegrityCheckMissing);
+        assert_eq!(
+            of(Lzma::UnsupportedCheck),
+            ReplayFailure::UnsupportedIntegrityCheck
+        );
+        assert_eq!(
+            of(Lzma::MemLimit),
+            ReplayFailure::DecoderMemoryLimitExceeded {
+                limit: XZ_DECODER_MEMLIMIT
+            }
+        );
+        for lzma in [Lzma::Mem, Lzma::Program] {
+            assert_eq!(of(lzma), ReplayFailure::DecoderFailure, "{lzma:?}");
+        }
+        for lzma in [Lzma::Data, Lzma::Format, Lzma::Options] {
+            assert_eq!(of(lzma), ReplayFailure::Corrupt, "{lzma:?}");
+        }
+
+        for lzma in [Lzma::Mem, Lzma::Options, Lzma::Program] {
+            let setup = io::Error::other(DecoderSetupFailed(io::Error::from(lzma)));
+            assert_eq!(ReplayFailure::of(&setup), ReplayFailure::DecoderFailure);
+            let source = std::error::Error::source(setup.get_ref().unwrap()).unwrap();
+            assert_eq!(
+                source.downcast_ref::<io::Error>().unwrap().kind(),
+                io::Error::from(lzma).kind()
+            );
+        }
+
+        let source_io = io::Error::other(SourceReadError(io::Error::other("disk")));
+        assert_eq!(ReplayFailure::of(&source_io), ReplayFailure::SourceIo);
+        let premature = io::Error::new(io::ErrorKind::UnexpectedEof, "premature eof");
+        assert_eq!(ReplayFailure::of(&premature), ReplayFailure::Incomplete);
     }
 
     // ---------------------------------------------------------------------
@@ -3293,7 +3923,7 @@ mod tests {
             let_the_clock_tick();
             operate(&path);
 
-            let run = replay_all(&mut image.replay(), 64 * 1024);
+            let run = replay_all(&mut image.replay().unwrap(), 64 * 1024);
             assert_eq!(run.end, Ok(()), "{name}");
             assert_eq!(run.delivered, a, "{name}: still the opened file");
             assert!(source_changed(image.revalidate_identity()), "{name}");

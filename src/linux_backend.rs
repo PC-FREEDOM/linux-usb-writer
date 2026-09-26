@@ -61,29 +61,45 @@ fn get_partition_paths(
         .unwrap_or_default()
 }
 
+// Every mount point of the disk: its own filesystem's (a disk with no
+// partition table can carry a filesystem directly, e.g. a superfloppy or
+// some written ISO images) and each of its partitions'.
 fn collect_mount_points(
     connection: &Connection,
+    disk_path: &OwnedObjectPath,
     partition_paths: &[OwnedObjectPath],
 ) -> Vec<String> {
+    merge_mount_points(
+        std::iter::once(disk_path)
+            .chain(partition_paths)
+            .map(|path| filesystem_mount_points(connection, path)),
+    )
+}
+
+// The raw Filesystem.MountPoints of one Block object. An object without a
+// Filesystem interface (no filesystem on it) has none; that, like a failed
+// property read, is not an error here.
+fn filesystem_mount_points(connection: &Connection, object_path: &OwnedObjectPath) -> Vec<Vec<u8>> {
+    let filesystem = match Proxy::new(
+        connection,
+        "org.freedesktop.UDisks2",
+        object_path.as_str(),
+        "org.freedesktop.UDisks2.Filesystem",
+    ) {
+        Ok(proxy) => proxy,
+        Err(_) => return Vec::new(),
+    };
+
+    filesystem.get_property("MountPoints").unwrap_or_default()
+}
+
+// Decodes and merges raw MountPoints lists into one sorted list without
+// empty entries or duplicates (the same path can be reported more than
+// once, e.g. by filesystems stacked on one mount point).
+fn merge_mount_points(lists: impl IntoIterator<Item = Vec<Vec<u8>>>) -> Vec<String> {
     let mut mount_points = Vec::new();
 
-    for partition_path in partition_paths {
-        let filesystem = match Proxy::new(
-            connection,
-            "org.freedesktop.UDisks2",
-            partition_path.as_str(),
-            "org.freedesktop.UDisks2.Filesystem",
-        ) {
-            Ok(proxy) => proxy,
-            Err(_) => continue,
-        };
-
-        let points: Vec<Vec<u8>> =
-            match filesystem.get_property("MountPoints") {
-                Ok(points) => points,
-                Err(_) => continue,
-            };
-
+    for points in lists {
         for point in points {
             let point = bytes_to_string(&point);
 
@@ -311,7 +327,7 @@ fn build_snapshot_for_path(
         get_partition_paths(connection, device_path);
 
     let mount_points =
-        collect_mount_points(connection, &partition_paths);
+        collect_mount_points(connection, device_path, &partition_paths);
 
     let swap_devices = collect_swap_devices(
         connection,
@@ -430,5 +446,127 @@ pub fn collect_device_snapshot(block_path: &str) -> SnapshotFetchOutcome {
             SnapshotFetchOutcome::NotFound
         }
         Err(error) => SnapshotFetchOutcome::Error(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::safety::{RiskLevel, RiskReason, assess_device};
+
+    // Filesystem.MountPoints entries as UDisks2 reports them: NUL-terminated
+    // byte strings.
+    fn points(paths: &[&str]) -> Vec<Vec<u8>> {
+        paths
+            .iter()
+            .map(|path| {
+                let mut bytes = path.as_bytes().to_vec();
+                bytes.push(0);
+                bytes
+            })
+            .collect()
+    }
+
+    // A removable USB disk the Safety Engine would allow writing to, apart
+    // from the mount points under test.
+    fn usb_disk_with_mounts(mount_points: Vec<String>) -> DeviceSnapshot {
+        DeviceSnapshot {
+            device: "/dev/sdx".to_string(),
+            block_path: "/org/freedesktop/UDisks2/block_devices/sdx".to_string(),
+            drive_path: "/org/freedesktop/UDisks2/drives/Test_Model_TEST-SERIAL-0001".to_string(),
+            major: 8,
+            minor: 0,
+            diskseq: Some(12),
+            size: 8_000_000_000,
+            read_only: false,
+            media_available: true,
+            model: "Test Model".to_string(),
+            vendor: "Test Vendor".to_string(),
+            serial: "TEST-SERIAL-0001".to_string(),
+            connection_bus: "usb".to_string(),
+            removable: true,
+            hint_system: false,
+            hint_ignore: false,
+            hint_partitionable: true,
+            mount_points,
+            active_swap: false,
+            swap_devices: Vec::new(),
+            complex_storage: false,
+            complex_storage_details: Vec::new(),
+        }
+    }
+
+    fn refused_as_mounted(mount_points: Vec<String>) -> bool {
+        let assessment = assess_device(&usb_disk_with_mounts(mount_points));
+        !assessment.writable
+            && matches!(assessment.risk_level, RiskLevel::Caution)
+            && assessment
+                .reasons
+                .iter()
+                .any(|reason| matches!(reason, RiskReason::MountedFilesystem))
+    }
+
+    // The lists `collect_mount_points` merges, in its order: the disk's own
+    // first, then each partition's.
+    fn merged(disk: Vec<Vec<u8>>, partitions: Vec<Vec<Vec<u8>>>) -> Vec<String> {
+        merge_mount_points(std::iter::once(disk).chain(partitions))
+    }
+
+    // 1. A filesystem on the disk itself, no partitions: its mount is
+    // collected, and the Safety Engine refuses the disk as mounted.
+    #[test]
+    fn a_mount_of_the_disk_itself_is_collected() {
+        let mount_points = merged(points(&["/media/test"]), Vec::new());
+
+        assert_eq!(mount_points, ["/media/test"]);
+        assert!(refused_as_mounted(mount_points));
+    }
+
+    // 2. A mounted partition, the disk itself unmounted: collected as before.
+    #[test]
+    fn a_mount_of_a_partition_is_collected() {
+        let mount_points = merged(Vec::new(), vec![points(&["/media/partition"]), Vec::new()]);
+
+        assert_eq!(mount_points, ["/media/partition"]);
+        assert!(refused_as_mounted(mount_points));
+    }
+
+    // 3. Both the disk and a partition mounted: both are collected.
+    #[test]
+    fn mounts_of_the_disk_and_its_partitions_are_all_collected() {
+        let mount_points = merged(
+            points(&["/media/disk"]),
+            vec![points(&["/media/partition", "/mnt/second"])],
+        );
+
+        assert_eq!(
+            mount_points,
+            ["/media/disk", "/media/partition", "/mnt/second"]
+        );
+        assert!(refused_as_mounted(mount_points));
+    }
+
+    // 4. No filesystem anywhere (no Filesystem interface on the disk, no
+    // partitions): no mount points, and nothing is refused for being mounted.
+    #[test]
+    fn no_filesystem_means_no_mount_points() {
+        let mount_points = merged(Vec::new(), Vec::new());
+
+        assert!(mount_points.is_empty());
+        assert!(!refused_as_mounted(mount_points.clone()));
+        assert!(assess_device(&usb_disk_with_mounts(mount_points)).writable);
+    }
+
+    // 5. The same path reported more than once (by the disk and a partition,
+    // or twice by one object) appears once; empty entries are dropped; the
+    // result is sorted.
+    #[test]
+    fn duplicate_and_empty_mount_points_are_merged_away() {
+        let mount_points = merged(
+            points(&["/media/same", ""]),
+            vec![points(&["/media/same", "/media/other", "/media/other"])],
+        );
+
+        assert_eq!(mount_points, ["/media/other", "/media/same"]);
     }
 }

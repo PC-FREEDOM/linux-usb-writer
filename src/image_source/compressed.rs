@@ -17,7 +17,8 @@
 //                    Compressed Input Budget below), and tags any error from
 //                    below as a source I/O error
 //   MultiGzDecoder   every member, CRC32 + ISIZE per member, and any trailing
-//                    bytes rejected (behavior pinned by `gzip_behavior` tests)
+//                    bytes rejected (behavior pinned by `gzip_behavior` tests);
+//                    held in `FormatDecoder`, which the decode loops use
 //
 // Errors are classified by type, never by message text: cancellation, budget
 // exhaustion and source I/O failures travel through the decoder as typed
@@ -351,9 +352,9 @@ fn preflight_gzip(
             Ok(())
         };
 
-        let mut decoder = MultiGzDecoder::new(CountingBufRead::new(input, hook));
+        let mut decoder = FormatDecoder::gzip(CountingBufRead::new(input, hook));
         let decoded = decode_to_end(&mut decoder, options, &logical_produced);
-        (decoded, decoder.get_ref().consumed())
+        (decoded, decoder.input().consumed())
     };
 
     let logical_size = decoded?;
@@ -642,6 +643,44 @@ impl std::error::Error for SourceReadError {
 }
 
 // ---------------------------------------------------------------------
+// Format decoders.
+// ---------------------------------------------------------------------
+
+// The decoder for one compression format, reading compressed bytes from
+// `R` (the counted input below it). Everything above -- Preflight's decode
+// loop and `StrictReplayReader`'s strict end-of-stream state machine -- is
+// written once against this type; only the construction and the per-format
+// decoder differ. A plain enum: `read()` delegates straight to the wrapped
+// decoder (no extra buffering or copying), and `input()` reaches the
+// counted input for the exact-consumption checks.
+enum FormatDecoder<R: BufRead> {
+    Gzip(MultiGzDecoder<R>),
+}
+
+impl<R: BufRead> FormatDecoder<R> {
+    // Every member, CRC32 + ISIZE per member, trailing bytes rejected (see
+    // the module comment and `gzip_behavior`).
+    fn gzip(input: R) -> Self {
+        FormatDecoder::Gzip(MultiGzDecoder::new(input))
+    }
+
+    // The input the decoder reads from, never the decoder's own buffering.
+    fn input(&self) -> &R {
+        match self {
+            FormatDecoder::Gzip(decoder) => decoder.get_ref(),
+        }
+    }
+}
+
+impl<R: BufRead> Read for FormatDecoder<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            FormatDecoder::Gzip(decoder) => decoder.read(buf),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------
 // Replay: decoding a validated stream again, strictly.
 // ---------------------------------------------------------------------
 
@@ -649,7 +688,7 @@ impl std::error::Error for SourceReadError {
 // Input Budget only (a replay has no cancellation hook of its own; the
 // budget keeps each `read()` short enough for the caller's own checks).
 type ReplayHook = Box<dyn FnMut(u64) -> io::Result<()> + Send>;
-type ReplayDecoder = MultiGzDecoder<CountingBufRead<BufReader<FileImageReader>, ReplayHook>>;
+type ReplayDecoder = FormatDecoder<CountingBufRead<BufReader<FileImageReader>, ReplayHook>>;
 
 // Why a replay failed, as a category that survives the first error (an
 // `io::Error` cannot be cloned). Determined by type, never by message text.
@@ -767,7 +806,7 @@ impl StrictReplayReader {
 
         let input =
             BufReader::with_capacity(INPUT_BUFFER_LEN, source_cursor(file, compressed_size));
-        let decoder = Box::new(MultiGzDecoder::new(CountingBufRead::new(input, hook)));
+        let decoder = Box::new(FormatDecoder::gzip(CountingBufRead::new(input, hook)));
 
         StrictReplayReader {
             logical_size,
@@ -801,7 +840,7 @@ impl StrictReplayReader {
     #[cfg(test)]
     fn compressed_consumed(&self) -> Option<u64> {
         match &self.state {
-            ReplayState::Active { decoder, .. } => Some(decoder.get_ref().consumed()),
+            ReplayState::Active { decoder, .. } => Some(decoder.input().consumed()),
             _ => None,
         }
     }
@@ -828,7 +867,7 @@ fn verify_end_of_stream(decoder: &mut ReplayDecoder, compressed_size: u64) -> io
     if read_decoder(decoder, &mut probe)? != 0 {
         return Err(replay_failed(ReplayFailure::LogicalSizeExceeded));
     }
-    if decoder.get_ref().consumed() != compressed_size {
+    if decoder.input().consumed() != compressed_size {
         return Err(replay_failed(ReplayFailure::InputNotFullyConsumed));
     }
 
@@ -2503,6 +2542,32 @@ mod tests {
         }
         assert_eq!(delivered as u64, image.logical_size());
         let _ = std::fs::remove_file(&path);
+    }
+
+    // The replay reader can move to the thread that writes (`Send`), but is
+    // neither shared (`!Sync`) nor duplicated (`!Clone`) -- whatever decoder
+    // `FormatDecoder` holds. Checked at compile time: a type implementing
+    // `Sync` (or `Clone`) would make the trait selection below ambiguous.
+    #[test]
+    fn replay_reader_is_send_but_neither_sync_nor_clone() {
+        fn assert_send<T: Send>() {}
+        assert_send::<StrictReplayReader>();
+
+        trait AmbiguousIfSync<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+        struct IsSync;
+        impl<T: ?Sized + Sync> AmbiguousIfSync<IsSync> for T {}
+        <StrictReplayReader as AmbiguousIfSync<_>>::check();
+
+        trait AmbiguousIfClone<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfClone<()> for T {}
+        struct IsClone;
+        impl<T: ?Sized + Clone> AmbiguousIfClone<IsClone> for T {}
+        <StrictReplayReader as AmbiguousIfClone<_>>::check();
     }
 
     // ---------------------------------------------------------------------

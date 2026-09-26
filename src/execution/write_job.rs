@@ -4066,6 +4066,38 @@ mod tests {
         assert!(diagnostics.is_none());
     }
 
+    // The same when the re-fetch could not read the target's information
+    // (the backend reports an Error, e.g. an unreadable /proc/swaps or a
+    // malformed UDisks2 object): Verify does not start.
+    #[test]
+    fn begin_verify_check_target_snapshot_error_does_not_start_verify() {
+        let image_size = 1000u64;
+        let data = vec![11u8; image_size as usize];
+        let (target_path, image, sync_succeeded, _snapshot) = gate_pass_sync_succeeded(
+            "verify-start-snapshot-error",
+            &data,
+            image_size,
+            VerifyMode::Full,
+        );
+
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(p) => p,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+
+        let result = pending.check_target(SnapshotFetchOutcome::Error(
+            "could not read /proc/swaps".to_string(),
+        ));
+        let _ = std::fs::remove_file(&target_path);
+
+        let (_returned_image, error, diagnostics) = match result {
+            Err(rejection) => rejection,
+            Ok(_) => panic!("expected snapshot-refresh-failed rejection"),
+        };
+        assert!(matches!(error, VerifyStartError::SnapshotRefreshFailed));
+        assert!(diagnostics.is_none());
+    }
+
     // V21f (the success-path counterpart to V18/V19/V21 above). An
     // identical baseline/current snapshot produces clean diagnostics
     // (Identity Same, Instance SameInstance, no hazards) alongside the

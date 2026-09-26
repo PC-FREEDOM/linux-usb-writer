@@ -13,12 +13,15 @@
 // judgements (when to allow a write at all) belong to `core.rs`.
 
 use std::{
+    alloc::{self, Layout},
     collections::HashMap,
     ffi::{c_int, c_ulong},
+    fmt,
     fs::File,
     io::{self, Write},
     os::fd::{AsRawFd, RawFd},
     os::unix::fs::{FileExt, MetadataExt},
+    ptr::NonNull,
 };
 
 use zbus::{
@@ -114,6 +117,11 @@ fn open_device_error(error: zbus::Error) -> OpenDeviceError {
 
 pub struct OpenedDeviceHandle {
     file: File,
+    // Test-only stand-in for `direct_read_geometry()`'s kernel queries,
+    // which a regular test file cannot answer: `Some(Some(g))` reports `g`,
+    // `Some(None)` reports a failure, `None` asks the kernel as in production.
+    #[cfg(test)]
+    test_direct_geometry: Option<Option<DirectReadGeometry>>,
 }
 
 // A narrow, single-purpose borrow of the underlying `File`: the only thing
@@ -248,14 +256,18 @@ pub struct FdMetadata {
 //     Safety Engine and the fresh Write Gate, never a replacement for them:
 //     plain (non-exclusive) opens by other processes are not affected, and
 //     states the kernel does not treat as claims are not caught.
-//   - `ReadOnly`: read-only, without `O_EXCL`. For Verify, which must still
+//   - `ReadOnlyDirect`: read-only, with `O_DIRECT`, without `O_EXCL`. For
+//     Verify. `O_DIRECT` makes the kernel read the device itself instead of
+//     answering from the page cache, which may still hold what was just
+//     written; there is deliberately no buffered read-only access, so
+//     Verify cannot fall back to one. No `O_EXCL`, because Verify must still
 //     work when the desktop auto-mounts a freshly written partition (see
 //     `core::check_identity_instance_for_verify`) -- an exclusive open would
 //     then fail although the write succeeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAccess {
     WriteExclusive,
-    ReadOnly,
+    ReadOnlyDirect,
 }
 
 // The `mode` and `options` arguments of UDisks2's Block.OpenDevice for
@@ -271,7 +283,10 @@ fn open_device_arguments(access: OpenAccess) -> (&'static str, HashMap<String, O
             options.insert("flags".to_string(), OwnedValue::from(libc::O_EXCL));
             "rw"
         }
-        OpenAccess::ReadOnly => "r",
+        OpenAccess::ReadOnlyDirect => {
+            options.insert("flags".to_string(), OwnedValue::from(libc::O_DIRECT));
+            "r"
+        }
     };
 
     (mode, options)
@@ -316,6 +331,8 @@ pub fn open_device(
 
     Ok(OpenedDeviceHandle {
         file: File::from(std_fd),
+        #[cfg(test)]
+        test_direct_geometry: None,
     })
 }
 
@@ -380,9 +397,25 @@ impl OpenedDeviceHandle {
     // so no non-test code anywhere in the crate can reach it: the only way to
     // obtain an `OpenedDeviceHandle` in a real build remains `open_device`,
     // which is the sole path that ever calls UDisks2's Block.OpenDevice.
+    //
+    // Its direct-read geometry is a lenient one (every offset aligned, no
+    // capacity limit) so the Verify tests that predate O_DIRECT read the
+    // file as before; tests of the direct-read rules set their own with
+    // `set_direct_geometry_for_test`.
     #[cfg(test)]
     pub(crate) fn from_file_for_test(file: File) -> Self {
-        OpenedDeviceHandle { file }
+        OpenedDeviceHandle {
+            file,
+            test_direct_geometry: Some(Some(DirectReadGeometry::for_test(1, 1, u64::MAX))),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::execution) fn set_direct_geometry_for_test(
+        &mut self,
+        geometry: Option<DirectReadGeometry>,
+    ) {
+        self.test_direct_geometry = Some(geometry);
     }
 
     // Test-only: exposes the raw fd number itself (never the `File`, never a
@@ -461,6 +494,391 @@ impl OpenedDeviceHandle {
             proc_fd_target,
         })
     }
+}
+
+impl OpenedDeviceHandle {
+    // The alignment rules for reading this FD with O_DIRECT, asked from the
+    // kernel for this very FD -- never assumed. See `DirectReadGeometry`.
+    pub(in crate::execution) fn direct_read_geometry(
+        &self,
+    ) -> Result<DirectReadGeometry, DirectReadSetupError> {
+        #[cfg(test)]
+        if let Some(geometry) = self.test_direct_geometry {
+            return geometry.ok_or(DirectReadSetupError::LogicalBlockSize(io::Error::other(
+                "test: no direct-read geometry",
+            )));
+        }
+
+        query_direct_read_geometry(&self.file)
+    }
+
+    // A reader of this FD that follows `geometry`, for ranges of up to
+    // `max_want` bytes.
+    pub(in crate::execution) fn direct_read_target(
+        &self,
+        geometry: DirectReadGeometry,
+        max_want: usize,
+    ) -> io::Result<DirectReadTarget<'_>> {
+        let buffer = AlignedBuffer::new(geometry.buffer_len(max_want)?, geometry.buffer_alignment)?;
+
+        Ok(DirectReadTarget {
+            target: self.reader_target(),
+            geometry,
+            buffer,
+        })
+    }
+}
+
+// The most one direct read asks for. With the buffer aligned to at least a
+// page, such a read covers at most 256 pages, which the kernel serves with
+// a single bio (BIO_MAX_VECS); it is also what Verify compares at a time.
+const MAX_DIRECT_READ: u64 = 1024 * 1024;
+
+// How an O_DIRECT FD must be read, as the kernel reports it for that FD:
+//
+//   - `logical_block_size` (BLKSSZGET): every read's file offset and length
+//     must be a multiple of it, or the kernel refuses the read (EINVAL);
+//   - `memory_alignment` (statx STATX_DIOALIGN, `stx_dio_mem_align`: for a
+//     block device, its DMA alignment + 1): every read's buffer position
+//     must be a multiple of it. The buffer itself is allocated aligned to
+//     that or to the page size, whichever is larger -- a power of two that
+//     is a multiple of the other -- so a read starting at the buffer (or a
+//     whole MAX_DIRECT_READ into it) also starts on a page boundary;
+//   - `capacity` (BLKGETSIZE64): a read never extends past the device's end.
+//
+// Obtained only from a successful kernel query: there is no default, so a
+// value that cannot be read ends Verify before it starts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::execution) struct DirectReadGeometry {
+    logical_block_size: u64,
+    memory_alignment: u64,
+    buffer_alignment: usize,
+    capacity: u64,
+}
+
+// Why an FD cannot be read under the direct-read rules. Fields are read
+// only via the derived Debug impl, which is how call sites report it.
+#[allow(dead_code)]
+#[derive(Debug)]
+pub enum DirectReadSetupError {
+    // The FD is not open with O_DIRECT, so its reads could come from the
+    // page cache.
+    NotDirect,
+    // BLKSSZGET failed.
+    LogicalBlockSize(io::Error),
+    // statx failed, or did not report STATX_DIOALIGN (a kernel older than
+    // 6.11 does not for block devices).
+    DirectIoAlignment(Option<io::Error>),
+    // BLKGETSIZE64 failed.
+    Capacity,
+    // The page size could not be read.
+    PageSize,
+    // The reported values cannot be used: `logical_block_size` and
+    // `offset_alignment` must agree, and every value must be a power of two
+    // that a MAX_DIRECT_READ-sized read can respect.
+    Unusable {
+        logical_block_size: u64,
+        offset_alignment: u64,
+        memory_alignment: u64,
+        page_size: u64,
+    },
+}
+
+impl DirectReadGeometry {
+    // Checks the kernel-reported values and derives the buffer alignment.
+    fn from_reported(
+        is_direct: bool,
+        logical_block_size: u64,
+        offset_alignment: u64,
+        memory_alignment: u64,
+        capacity: u64,
+        page_size: u64,
+    ) -> Result<Self, DirectReadSetupError> {
+        if !is_direct {
+            return Err(DirectReadSetupError::NotDirect);
+        }
+
+        let unusable = DirectReadSetupError::Unusable {
+            logical_block_size,
+            offset_alignment,
+            memory_alignment,
+            page_size,
+        };
+        let fits = |value: u64| value.is_power_of_two() && value <= MAX_DIRECT_READ;
+
+        if offset_alignment != logical_block_size
+            || !fits(logical_block_size)
+            || !fits(memory_alignment)
+            || !fits(page_size)
+        {
+            return Err(unusable);
+        }
+
+        let buffer_alignment =
+            usize::try_from(memory_alignment.max(page_size)).map_err(|_| unusable)?;
+
+        Ok(DirectReadGeometry {
+            logical_block_size,
+            memory_alignment,
+            buffer_alignment,
+            capacity,
+        })
+    }
+
+    // Test-only: a geometry as if reported, with a 4096-byte page.
+    #[cfg(test)]
+    pub(in crate::execution) fn for_test(
+        logical_block_size: u64,
+        memory_alignment: u64,
+        capacity: u64,
+    ) -> Self {
+        DirectReadGeometry {
+            logical_block_size,
+            memory_alignment,
+            buffer_alignment: memory_alignment.max(4096) as usize,
+            capacity,
+        }
+    }
+
+    // The buffer a range of up to `max_want` bytes needs once widened to
+    // block boundaries: at most one block on each side.
+    fn buffer_len(&self, max_want: usize) -> io::Result<usize> {
+        let block = self.logical_block_size;
+        let len = (max_want as u64)
+            .checked_next_multiple_of(block)
+            .and_then(|len| len.checked_add(block))
+            .ok_or_else(|| io::Error::other("direct read buffer size overflows"))?;
+
+        usize::try_from(len.max(1)).map_err(|_| io::Error::other("direct read buffer too large"))
+    }
+
+    // The block-aligned range to read so that it covers the `want` bytes
+    // at `offset`: [start, start + len) with start <= offset and
+    // start + len >= offset + want. Refused when it would reach past the
+    // device's end -- the rounding is never assumed to fit.
+    fn aligned_span(&self, offset: u64, want: u64) -> Result<(u64, u64), DirectReadFailure> {
+        let block = self.logical_block_size;
+        let start = offset - offset % block;
+        let end = offset
+            .checked_add(want)
+            .and_then(|end| end.checked_next_multiple_of(block))
+            .ok_or(DirectReadFailure::OutsideDevice)?;
+
+        if end > self.capacity {
+            return Err(DirectReadFailure::OutsideDevice);
+        }
+
+        Ok((start, end - start))
+    }
+}
+
+fn query_direct_read_geometry(file: &File) -> Result<DirectReadGeometry, DirectReadSetupError> {
+    let fd = file.as_raw_fd();
+
+    // SAFETY: F_GETFL takes no argument and only reads the FD's flags.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(DirectReadSetupError::NotDirect);
+    }
+    if flags & libc::O_DIRECT == 0 {
+        return Err(DirectReadSetupError::NotDirect);
+    }
+
+    let mut logical_block_size: c_int = 0;
+    // SAFETY: `fd` is open for the duration of the call, and BLKSSZGET
+    // writes one `int` into the pointed-to local. Read-only ioctl.
+    let result = unsafe { libc::ioctl(fd, libc::BLKSSZGET, &mut logical_block_size as *mut c_int) };
+    if result != 0 {
+        return Err(DirectReadSetupError::LogicalBlockSize(
+            io::Error::last_os_error(),
+        ));
+    }
+    let logical_block_size = u64::try_from(logical_block_size).unwrap_or(0);
+
+    // SAFETY: an all-zero `statx` is a valid value of this plain C struct.
+    let mut stat: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open; the empty, NUL-terminated path with AT_EMPTY_PATH
+    // makes statx describe `fd` itself; `stat` is a valid, writable struct.
+    let result = unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH,
+            libc::STATX_DIOALIGN,
+            &mut stat,
+        )
+    };
+    if result != 0 {
+        return Err(DirectReadSetupError::DirectIoAlignment(Some(
+            io::Error::last_os_error(),
+        )));
+    }
+    if stat.stx_mask & libc::STATX_DIOALIGN == 0 {
+        return Err(DirectReadSetupError::DirectIoAlignment(None));
+    }
+
+    let capacity = read_size_via_ioctl(fd).ok_or(DirectReadSetupError::Capacity)?;
+
+    // SAFETY: sysconf only reads a system value.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = u64::try_from(page_size).map_err(|_| DirectReadSetupError::PageSize)?;
+
+    DirectReadGeometry::from_reported(
+        true,
+        logical_block_size,
+        u64::from(stat.stx_dio_offset_align),
+        u64::from(stat.stx_dio_mem_align),
+        capacity,
+        page_size,
+    )
+}
+
+// A zero-filled heap buffer with a chosen alignment, freed on drop. The
+// only unsafe code is the allocation, the slice views and the matching
+// deallocation, all with the one `layout` it was allocated with.
+struct AlignedBuffer {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+impl AlignedBuffer {
+    fn new(len: usize, alignment: usize) -> io::Result<Self> {
+        let layout = Layout::from_size_align(len.max(1), alignment)
+            .map_err(|error| io::Error::other(format!("direct read buffer layout: {error}")))?;
+
+        // SAFETY: `layout` has a non-zero size.
+        let ptr = unsafe { alloc::alloc_zeroed(layout) };
+        let ptr = NonNull::new(ptr).ok_or_else(|| io::Error::from(io::ErrorKind::OutOfMemory))?;
+
+        Ok(AlignedBuffer { ptr, layout })
+    }
+
+    fn len(&self) -> usize {
+        self.layout.size()
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: `ptr` points to `layout.size()` initialised (zeroed) bytes
+        // owned by this buffer, borrowed mutably through `&mut self`.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.layout.size()) }
+    }
+}
+
+impl Drop for AlignedBuffer {
+    fn drop(&mut self) {
+        // SAFETY: `ptr` was allocated by `alloc_zeroed` with this `layout`
+        // and is freed exactly once, here.
+        unsafe { alloc::dealloc(self.ptr.as_ptr(), self.layout) }
+    }
+}
+
+// Why a direct read did not deliver the requested bytes (the payload of the
+// `io::Error` it returns, unless the kernel itself reported an error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectReadFailure {
+    // The block-aligned range would reach past the device's end.
+    OutsideDevice,
+    // A read returned fewer bytes than asked, and reading on from there
+    // would break the alignment rules: the length is not a whole number of
+    // blocks, or the buffer position after it is not memory-aligned.
+    UnalignedShortRead,
+    // The range does not fit the reader's buffer.
+    TooLarge,
+}
+
+impl fmt::Display for DirectReadFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            DirectReadFailure::OutsideDevice => {
+                "the block-aligned direct read would reach past the end of the device"
+            }
+            DirectReadFailure::UnalignedShortRead => {
+                "a direct read returned fewer bytes than asked, ending where it cannot be continued aligned"
+            }
+            DirectReadFailure::TooLarge => "the direct read range does not fit the buffer",
+        };
+        f.write_str(text)
+    }
+}
+
+impl std::error::Error for DirectReadFailure {}
+
+// Reads a Verify FD opened with O_DIRECT under its `DirectReadGeometry`.
+pub(in crate::execution) struct DirectReadTarget<'a> {
+    target: ReadTarget<'a>,
+    geometry: DirectReadGeometry,
+    buffer: AlignedBuffer,
+}
+
+impl DirectReadTarget<'_> {
+    // The `want` bytes of the device at `offset`, read directly: see
+    // `direct_read`.
+    pub(in crate::execution) fn read(&mut self, offset: u64, want: usize) -> io::Result<&[u8]> {
+        let target = &self.target;
+        direct_read(
+            |buf, at| target.read_at(at, buf),
+            &self.geometry,
+            &mut self.buffer,
+            offset,
+            want,
+        )
+    }
+}
+
+// Reads the block-aligned range covering [offset, offset + want) into
+// `buffer` through `read_at` and returns exactly the requested bytes. Every
+// read starts at a block-aligned offset, at a memory-aligned buffer
+// position, and asks for a whole number of blocks (at most
+// MAX_DIRECT_READ). A shorter read is continued from where it ended only if
+// the next read would still meet all of that; otherwise it is an error, and
+// a read of 0 bytes is an UnexpectedEof error. There is no other way to
+// read: no buffered retry.
+fn direct_read<'b>(
+    mut read_at: impl FnMut(&mut [u8], u64) -> io::Result<usize>,
+    geometry: &DirectReadGeometry,
+    buffer: &'b mut AlignedBuffer,
+    offset: u64,
+    want: usize,
+) -> io::Result<&'b [u8]> {
+    let failed = |failure: DirectReadFailure| io::Error::new(io::ErrorKind::InvalidInput, failure);
+
+    if want == 0 {
+        return Ok(&buffer.as_mut_slice()[..0]);
+    }
+
+    let (start, len) = geometry.aligned_span(offset, want as u64).map_err(failed)?;
+    let len = usize::try_from(len).map_err(|_| failed(DirectReadFailure::TooLarge))?;
+    if len > buffer.len() {
+        return Err(failed(DirectReadFailure::TooLarge));
+    }
+
+    let block = geometry.logical_block_size as usize;
+    let buf = buffer.as_mut_slice();
+    let mut filled = 0usize;
+
+    while filled < len {
+        let piece = (len - filled).min(MAX_DIRECT_READ as usize);
+        let n = match read_at(&mut buf[filled..filled + piece], start + filled as u64) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+
+        if n == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        filled += n;
+
+        if filled < len && (n % block != 0 || filled as u64 % geometry.memory_alignment != 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                DirectReadFailure::UnalignedShortRead,
+            ));
+        }
+    }
+
+    let skip = (offset - start) as usize;
+    Ok(&buf[skip..skip + want])
 }
 
 // Explicit, named close so call sites make the "no write happened" intent
@@ -693,19 +1111,27 @@ mod tests {
         assert!(matches!(&**flags, zbus::zvariant::Value::I32(_)));
         let flags = i32::try_from(flags).unwrap();
         assert_eq!(flags, libc::O_EXCL);
+        assert_eq!(flags & libc::O_DIRECT, 0);
         assert_eq!(flags & libc::O_ACCMODE, 0);
         if cfg!(target_arch = "x86_64") {
             assert_eq!(libc::O_EXCL, 0o200);
         }
     }
 
-    // The Verify FD is read-only and not exclusive: mode "r", no flags.
+    // The Verify FD is read-only, direct and not exclusive: mode "r" plus
+    // `flags` = O_DIRECT only -- no O_EXCL, no access-mode bits.
     #[test]
-    fn read_only_access_is_not_exclusive() {
-        let (mode, options) = open_device_arguments(OpenAccess::ReadOnly);
+    fn read_only_direct_access_is_direct_and_not_exclusive() {
+        let (mode, options) = open_device_arguments(OpenAccess::ReadOnlyDirect);
 
         assert_eq!(mode, "r");
-        assert!(options.is_empty(), "no flags, so no O_EXCL: {options:?}");
+        assert_eq!(options.len(), 1);
+        let flags = options.get("flags").expect("flags option present");
+        assert_eq!(flags.value_signature().to_string(), "i");
+        let flags = i32::try_from(flags).unwrap();
+        assert_eq!(flags, libc::O_DIRECT);
+        assert_eq!(flags & libc::O_EXCL, 0);
+        assert_eq!(flags & libc::O_ACCMODE, 0);
     }
 
     // Collision-avoidance identical in spirit to the temp-file helpers in
@@ -883,5 +1309,392 @@ mod tests {
 
         assert_eq!(n, 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // Direct reads (O_DIRECT Verify): the geometry the kernel reports, the
+    // aligned buffer, the block-aligned range, and the read loop -- against
+    // a fake device, since O_DIRECT on a regular file is filesystem-specific
+    // and proves nothing about block devices.
+    // ---------------------------------------------------------------------
+
+    const MIB: u64 = 1024 * 1024;
+
+    // A test geometry: block size, required memory alignment, capacity.
+    fn geometry(
+        logical_block_size: u64,
+        memory_alignment: u64,
+        capacity: u64,
+    ) -> DirectReadGeometry {
+        DirectReadGeometry::for_test(logical_block_size, memory_alignment, capacity)
+    }
+
+    // Values as the kernel reports them for a block device are accepted, and
+    // the buffer alignment is the larger of the reported memory alignment
+    // and the page size.
+    #[test]
+    fn direct_geometry_accepts_reported_values() {
+        let g = DirectReadGeometry::from_reported(true, 512, 512, 512, 8 * MIB, 4096).unwrap();
+        assert_eq!(g, geometry(512, 512, 8 * MIB));
+        assert_eq!(g.buffer_alignment, 4096);
+
+        let g = DirectReadGeometry::from_reported(true, 4096, 4096, 4, 8 * MIB, 4096).unwrap();
+        assert_eq!(g, geometry(4096, 4, 8 * MIB));
+        assert_eq!(g.buffer_alignment, 4096);
+
+        let g = DirectReadGeometry::from_reported(true, 512, 512, 65536, 8 * MIB, 4096).unwrap();
+        assert_eq!(g, geometry(512, 65536, 8 * MIB));
+        assert_eq!(g.buffer_alignment, 65536);
+    }
+
+    // An FD without O_DIRECT is refused: its reads could come from the page
+    // cache, and there is no buffered Verify to fall back to.
+    #[test]
+    fn direct_geometry_requires_o_direct() {
+        assert!(matches!(
+            DirectReadGeometry::from_reported(false, 512, 512, 512, 8 * MIB, 4096),
+            Err(DirectReadSetupError::NotDirect)
+        ));
+    }
+
+    // Values that cannot be used are refused, never replaced by defaults.
+    #[test]
+    fn direct_geometry_refuses_unusable_values() {
+        for (block, offset, memory, page) in [
+            (512, 4096, 512, 4096),  // offset alignment disagrees with the block size
+            (0, 0, 512, 4096),       // no block size
+            (1000, 1000, 512, 4096), // not a power of two
+            (512, 512, 0, 4096),     // no memory alignment
+            (512, 512, 3, 4096),     // not a power of two
+            (512, 512, 512, 0),      // no page size
+            (2 * MIB, 2 * MIB, 512, 4096), // larger than one direct read
+        ] {
+            assert!(
+                matches!(
+                    DirectReadGeometry::from_reported(true, block, offset, memory, 8 * MIB, page),
+                    Err(DirectReadSetupError::Unusable { .. })
+                ),
+                "{block} {offset} {memory} {page}"
+            );
+        }
+    }
+
+    // A regular file cannot report a block device's geometry: without
+    // O_DIRECT it is refused as such; with O_DIRECT, BLKSSZGET fails and the
+    // failure is reported -- no 512-byte default.
+    #[test]
+    fn a_regular_file_has_no_direct_read_geometry() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let path = temp_file_path("no-geometry");
+        std::fs::write(&path, vec![0u8; 4096]).unwrap();
+
+        let buffered = File::open(&path).unwrap();
+        assert!(matches!(
+            query_direct_read_geometry(&buffered),
+            Err(DirectReadSetupError::NotDirect)
+        ));
+
+        if let Ok(direct) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECT)
+            .open(&path)
+        {
+            assert!(matches!(
+                query_direct_read_geometry(&direct),
+                Err(DirectReadSetupError::LogicalBlockSize(_))
+            ));
+        }
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // The buffer has the requested alignment and length, starts zeroed, and
+    // is freed on drop.
+    #[test]
+    fn aligned_buffer_has_the_requested_alignment() {
+        for alignment in [512usize, 4096, 65536] {
+            for len in [1usize, 4096, MIB as usize + 8192] {
+                let mut buffer = AlignedBuffer::new(len, alignment).unwrap();
+                assert_eq!(buffer.as_mut_slice().as_ptr() as usize % alignment, 0);
+                assert_eq!(buffer.len(), len);
+                assert!(buffer.as_mut_slice().iter().all(|&b| b == 0));
+            }
+        }
+    }
+
+    // Block-aligned ranges: already aligned; an unaligned offset; an
+    // unaligned length; both.
+    #[test]
+    fn aligned_span_widens_to_block_boundaries() {
+        let g = geometry(512, 512, 100 * MIB);
+
+        assert_eq!(g.aligned_span(0, 4096), Ok((0, 4096)));
+        assert_eq!(g.aligned_span(1000, 24), Ok((512, 512)));
+        assert_eq!(g.aligned_span(1000, 100), Ok((512, 1024)));
+        assert_eq!(g.aligned_span(0, 1000), Ok((0, 1024)));
+        assert_eq!(g.aligned_span(MIB + 777, MIB), Ok((MIB + 512, MIB + 512)));
+
+        let g = geometry(4096, 512, 100 * MIB);
+        assert_eq!(g.aligned_span(4097, 1), Ok((4096, 4096)));
+    }
+
+    // The device's end: an image ending inside the last block is read up to
+    // that block's end only if the block lies within the device; a range
+    // whose rounding would pass the end is refused, never assumed to fit.
+    #[test]
+    fn aligned_span_never_passes_the_device_end() {
+        // Capacity on a block boundary: the image's last partial block is
+        // read in full.
+        let g = geometry(512, 512, 10 * 512);
+        assert_eq!(g.aligned_span(9 * 512, 100), Ok((9 * 512, 512)));
+        assert_eq!(g.aligned_span(0, 10 * 512), Ok((0, 10 * 512)));
+        assert_eq!(
+            g.aligned_span(0, 10 * 512 + 1),
+            Err(DirectReadFailure::OutsideDevice)
+        );
+
+        // Capacity not on a block boundary (not expected of a real device,
+        // but never assumed away): the last partial block cannot be read.
+        let g = geometry(512, 512, 10 * 512 + 100);
+        assert_eq!(
+            g.aligned_span(10 * 512, 100),
+            Err(DirectReadFailure::OutsideDevice)
+        );
+        assert_eq!(g.aligned_span(0, 10 * 512), Ok((0, 10 * 512)));
+
+        // Arithmetic overflow is refused too.
+        assert_eq!(
+            geometry(512, 512, u64::MAX).aligned_span(u64::MAX - 10, 100),
+            Err(DirectReadFailure::OutsideDevice)
+        );
+    }
+
+    fn device_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i.wrapping_mul(31) >> 3) as u8).collect()
+    }
+
+    // A fake device: serves `device` like pread, recording every read (the
+    // offset, length and buffer address the direct-read rules constrain), and
+    // lets a test shape each reply.
+    struct FakeDevice {
+        device: Vec<u8>,
+        reads: Vec<(u64, usize, usize)>,
+    }
+
+    impl FakeDevice {
+        fn new(len: usize) -> Self {
+            FakeDevice {
+                device: device_bytes(len),
+                reads: Vec::new(),
+            }
+        }
+
+        fn serve(
+            &mut self,
+            buf: &mut [u8],
+            offset: u64,
+            limit: Option<usize>,
+        ) -> io::Result<usize> {
+            self.reads.push((offset, buf.len(), buf.as_ptr() as usize));
+            let start = offset as usize;
+            let n = buf.len().min(self.device.len().saturating_sub(start));
+            let n = limit.map_or(n, |limit| n.min(limit));
+            buf[..n].copy_from_slice(&self.device[start..start + n]);
+            Ok(n)
+        }
+
+        fn assert_reads_follow(&self, g: &DirectReadGeometry) {
+            assert!(!self.reads.is_empty());
+            for &(offset, len, address) in &self.reads {
+                assert_eq!(offset % g.logical_block_size, 0, "offset {offset}");
+                assert_eq!(len as u64 % g.logical_block_size, 0, "length {len}");
+                assert!(len as u64 <= MAX_DIRECT_READ, "length {len}");
+                assert_eq!(
+                    address as u64 % g.memory_alignment,
+                    0,
+                    "buffer {address:#x}"
+                );
+            }
+            let first = self.reads[0].2;
+            assert_eq!(first % g.buffer_alignment, 0, "first buffer {first:#x}");
+        }
+    }
+
+    // Only the requested bytes come back, whatever the widened range read;
+    // every read follows the rules. Includes offsets like Quick's middle and
+    // last windows (not on block boundaries) and an image ending inside a
+    // block.
+    #[test]
+    fn direct_read_returns_exactly_the_requested_bytes() {
+        let capacity = 16 * MIB as usize;
+        let g = geometry(512, 512, capacity as u64);
+        let image_size = 9 * MIB + 777;
+        let window = 4 * MIB;
+        let middle = image_size / 2 - window / 2;
+        let last = image_size - window;
+
+        for (offset, want) in [
+            (0u64, MIB as usize),
+            (middle, MIB as usize),
+            (last + 3 * MIB, MIB as usize),
+            (image_size - 777, 777),
+            (1000, 1),
+            (4096, MIB as usize - 4096),
+        ] {
+            let mut fake = FakeDevice::new(capacity);
+            let mut buffer =
+                AlignedBuffer::new(g.buffer_len(MIB as usize).unwrap(), g.buffer_alignment)
+                    .unwrap();
+
+            let bytes = direct_read(
+                |buf, at| fake.serve(buf, at, None),
+                &g,
+                &mut buffer,
+                offset,
+                want,
+            )
+            .unwrap()
+            .to_vec();
+
+            let start = offset as usize;
+            assert_eq!(bytes, fake.device[start..start + want], "{offset} {want}");
+            fake.assert_reads_follow(&g);
+        }
+    }
+
+    // Short reads: a shorter read is continued from where it ended when the
+    // next read still meets the rules (whole blocks, memory-aligned buffer
+    // position); otherwise -- part of a block, a position the memory
+    // alignment forbids, or nothing at all -- it is an error. Every attempt
+    // is a direct read under the rules; nothing else is tried.
+    #[test]
+    fn direct_read_short_reads() {
+        let g = geometry(512, 512, 4 * MIB);
+        let mut buffer =
+            AlignedBuffer::new(g.buffer_len(MIB as usize).unwrap(), g.buffer_alignment).unwrap();
+
+        // Whole blocks, 2 at a time: continued to the end.
+        let mut fake = FakeDevice::new(4 * MIB as usize);
+        let bytes = direct_read(
+            |buf, at| fake.serve(buf, at, Some(1024)),
+            &g,
+            &mut buffer,
+            700,
+            5000,
+        )
+        .unwrap()
+        .to_vec();
+        assert_eq!(bytes, fake.device[700..5700]);
+        fake.assert_reads_follow(&g);
+        assert!(fake.reads.len() > 1);
+
+        // Part of a block: refused.
+        let mut fake = FakeDevice::new(4 * MIB as usize);
+        let error = direct_read(
+            |buf, at| fake.serve(buf, at, Some(100)),
+            &g,
+            &mut buffer,
+            0,
+            5000,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fake.reads.len(), 1);
+
+        // Whole blocks, but ending where the required memory alignment
+        // (4096 here) would be broken: refused, not continued misaligned.
+        let strict = geometry(512, 4096, 4 * MIB);
+        let mut strict_buffer = AlignedBuffer::new(
+            strict.buffer_len(MIB as usize).unwrap(),
+            strict.buffer_alignment,
+        )
+        .unwrap();
+        let mut fake = FakeDevice::new(4 * MIB as usize);
+        let error = direct_read(
+            |buf, at| fake.serve(buf, at, Some(1024)),
+            &strict,
+            &mut strict_buffer,
+            0,
+            8192,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fake.reads.len(), 1);
+
+        // Nothing: the device ended early.
+        let mut fake = FakeDevice::new(4 * MIB as usize);
+        let error = direct_read(
+            |buf, at| fake.serve(buf, at, Some(0)),
+            &g,
+            &mut buffer,
+            0,
+            5000,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(fake.reads.len(), 1);
+    }
+
+    // A failed direct read is returned as it is -- the only read attempted.
+    // An interrupted one is simply retried.
+    #[test]
+    fn direct_read_failures_are_returned_without_another_attempt() {
+        let g = geometry(512, 512, 4 * MIB);
+        let mut buffer =
+            AlignedBuffer::new(g.buffer_len(MIB as usize).unwrap(), g.buffer_alignment).unwrap();
+
+        let mut attempts = 0;
+        let error = direct_read(
+            |_, _| {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(libc::EINVAL))
+            },
+            &g,
+            &mut buffer,
+            0,
+            4096,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        assert_eq!(attempts, 1);
+
+        let mut fake = FakeDevice::new(4 * MIB as usize);
+        let mut interrupted = true;
+        let bytes = direct_read(
+            |buf, at| {
+                if std::mem::take(&mut interrupted) {
+                    return Err(io::Error::from(io::ErrorKind::Interrupted));
+                }
+                fake.serve(buf, at, None)
+            },
+            &g,
+            &mut buffer,
+            0,
+            4096,
+        )
+        .unwrap()
+        .to_vec();
+        assert_eq!(bytes, fake.device[..4096]);
+    }
+
+    // A range outside the device or larger than the buffer is refused before
+    // anything is read.
+    #[test]
+    fn direct_read_refuses_ranges_it_cannot_read_directly() {
+        let g = geometry(512, 512, 10 * 512 + 100);
+        let mut buffer =
+            AlignedBuffer::new(g.buffer_len(4096).unwrap(), g.buffer_alignment).unwrap();
+        let mut attempts = 0;
+        let mut read = |_: &mut [u8], _: u64| {
+            attempts += 1;
+            Ok(0)
+        };
+
+        let error = direct_read(&mut read, &g, &mut buffer, 10 * 512, 100).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        let error = direct_read(&mut read, &g, &mut buffer, 0, 8192).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(attempts, 0);
     }
 }

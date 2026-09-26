@@ -72,8 +72,7 @@
 // `VerifySucceeded`/`VerifyOutcome::Succeeded` (or an explicit
 // `VerifyMode::None`, which the user chose) says anything at all about
 // read-back content -- and even then, see `Verifying::run()`'s own doc
-// comment for the page-cache honesty caveat carried over from the design
-// phase.
+// comment for what the O_DIRECT read-back does and does not cover.
 //
 // The write-mode FD is retired (dropped) the moment `begin_verify()` is
 // called, for every `VerifyMode` including `None` -- Verify never reuses the
@@ -104,8 +103,8 @@
 //     `VerifyFailed`/`VerifyCancelled` nor a `VerifyStartError` exposes any
 //     way to reach a `Verifying` again -- a deliberate v0.1 simplicity
 //     choice, not an oversight (see reports/latest.md)
-//   - O_DIRECT / BLKFLSBUF / any other cache-bypassing read strategy for
-//     Verify -- a deliberate v0.1 safety/simplicity choice, see
+//   - dropping page-cache pages (POSIX_FADV_DONTNEED / BLKFLSBUF) before
+//     Verify -- O_DIRECT alone keeps Verify's reads off the page cache, see
 //     `Verifying::run()`'s doc comment
 //   - any connection from `main.rs` or any other production call site to
 //     this module -- everything here is exercised only by this module's own
@@ -139,7 +138,9 @@ use super::core::{
     ActiveWrite, AuthorizedWrite, FdBindingCheck, VerifyMode, VerifyTargetCheckError,
     VerifyTargetDiagnostics,
 };
-use super::linux_access::{FdMetadata, OpenedDeviceHandle, ReadTarget};
+use super::linux_access::{
+    DirectReadGeometry, DirectReadSetupError, DirectReadTarget, FdMetadata, OpenedDeviceHandle,
+};
 use crate::device::{DeviceSnapshot, SnapshotFetchOutcome};
 use crate::image_source::source_identity::SourceChanged;
 use crate::image_source::{ImageSourceAccess, SelectedImage};
@@ -1026,6 +1027,11 @@ pub enum VerifyStartError {
     OpenDeviceFailed,
     FdBindingMismatch,
     FdBindingInsufficient,
+    // The Verify FD cannot be read with O_DIRECT under rules the kernel
+    // reported for it (not opened with O_DIRECT, or its logical block size /
+    // direct-I/O alignment could not be read). Verify does not start; it
+    // never falls back to a buffered read.
+    DirectReadUnavailable(DirectReadSetupError),
 }
 
 // Pure relabeling, no new logic: `core::verify_target_check_from_diagnostics`
@@ -1239,8 +1245,16 @@ impl VerifyReadyToOpen {
             }
         }
 
+        let geometry = match handle.direct_read_geometry() {
+            Ok(geometry) => geometry,
+            Err(error) => {
+                return Err((self.image, VerifyStartError::DirectReadUnavailable(error)));
+            }
+        };
+
         Ok(Verifying {
             handle,
+            geometry,
             image: self.image,
             mode: self.mode,
             cancel: self.cancel,
@@ -1261,6 +1275,9 @@ impl VerifyReadyToOpen {
 // `image`/`mode` already carry.
 pub struct Verifying {
     handle: OpenedDeviceHandle,
+    // How `handle` (opened with O_DIRECT) must be read; see
+    // `linux_access::DirectReadGeometry`.
+    geometry: DirectReadGeometry,
     image: SelectedImage,
     mode: VerifyMode,
     cancel: CancelHandle,
@@ -1419,19 +1436,15 @@ impl Verifying {
     // `Cancelled`), never only on success, so a caller never loses the image
     // it supplied regardless of how Verify ends.
     //
-    // CACHE HONESTY CAVEAT (carried over from the design phase, see
-    // reports/latest.md): this reads the target via a freshly opened
-    // read-only FD, after `sync_all()` already succeeded during the Sync
-    // stage. Linux's page cache for a block device is keyed to the device
-    // itself, not to any one file descriptor, so this fresh FD does not, by
-    // itself, guarantee the bytes returned bypass all caching and come from
-    // physical media -- no `O_DIRECT`/`BLKFLSBUF` is used here, deliberately
-    // (see the module-level doc comment's "NOT implemented" list). This
-    // Verify confirms the OS reports back the same bytes that were written,
-    // via the same kernel/page-cache path an ordinary read would use --
-    // exactly the same class of evidence this project's own manual
-    // `sudo head -c <size> /dev/sdX | sha256sum` real-device tests already
-    // relied on, now automated and `sudo`-free.
+    // READ-BACK: the target is read through a freshly opened read-only FD
+    // with O_DIRECT (`OpenAccess::ReadOnlyDirect`), by block-aligned reads
+    // into an aligned buffer (`linux_access::DirectReadTarget`), so the
+    // kernel reads the device instead of answering from the page cache --
+    // which may still hold what was just written. A read the direct-read
+    // rules do not allow fails Verify; there is no buffered fallback. This
+    // does not reach past the device itself: its own internal cache, and
+    // whether the data survives power loss, are outside what a read-back can
+    // show.
     //
     // Source checkpoints: the source is revalidated (one metadata read of
     // the already-open file) immediately before Verify starts -- after the
@@ -1446,6 +1459,7 @@ impl Verifying {
     pub fn run(self, on_progress: impl FnMut(VerifyProgress)) -> (SelectedImage, VerifyOutcome) {
         let Verifying {
             handle,
+            geometry,
             image,
             mode,
             cancel,
@@ -1461,8 +1475,8 @@ impl Verifying {
         }
 
         let outcome = match mode {
-            VerifyMode::Full => run_full_verify(&handle, &image, &cancel, on_progress),
-            VerifyMode::Quick => run_quick_verify(&handle, &image, &cancel, on_progress),
+            VerifyMode::Full => run_full_verify(&handle, geometry, &image, &cancel, on_progress),
+            VerifyMode::Quick => run_quick_verify(&handle, geometry, &image, &cancel, on_progress),
             VerifyMode::None => unreachable!(
                 "VerifyMode::None never reaches Verifying -- see SyncSucceeded::begin_verify()"
             ),
@@ -1506,24 +1520,23 @@ fn read_fully<R: Read + ?Sized>(reader: &mut R, buf: &mut [u8]) -> io::Result<us
     Ok(total)
 }
 
-// The `read_at`-based counterpart to `read_fully` above, for
-// `ReadTarget::read_at`'s positional, no-shared-cursor interface: retries a
-// short read by advancing `offset` (never touching any shared file position,
-// since `read_at` has none) until `buf` is full or the target reports true
-// EOF (`Ok(0)`).
-fn read_at_fully(target: &ReadTarget<'_>, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0;
-
-    while filled < buf.len() {
-        match target.read_at(offset + filled as u64, &mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
+// The `want` target bytes at `offset`, read with O_DIRECT through `target`
+// (see `linux_access::DirectReadTarget`), or why they could not be: the
+// device ending early is `TargetUnexpectedEof`, anything else -- including a
+// read the direct-read rules refuse -- is `TargetReadError`. There is no
+// other way to read the target.
+fn read_target<'t>(
+    target: &'t mut DirectReadTarget<'_>,
+    offset: u64,
+    want: usize,
+) -> Result<&'t [u8], VerifyFailureReason> {
+    match target.read(offset, want) {
+        Ok(bytes) => Ok(bytes),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+            Err(VerifyFailureReason::TargetUnexpectedEof)
         }
+        Err(error) => Err(VerifyFailureReason::TargetReadError(error)),
     }
-
-    Ok(filled)
 }
 
 // The offset of the first byte at which `a` and `b` differ, within the
@@ -1545,6 +1558,7 @@ fn first_mismatch(a: &[u8], b: &[u8]) -> Option<usize> {
 // thereafter -- no chunk is read after a cancellation request is observed.
 fn run_full_verify(
     handle: &OpenedDeviceHandle,
+    geometry: DirectReadGeometry,
     image: &SelectedImage,
     cancel: &CancelHandle,
     mut on_progress: impl FnMut(VerifyProgress),
@@ -1569,10 +1583,18 @@ fn run_full_verify(
         }
     };
 
-    let target = handle.reader_target();
     let chunk_size = writer::DEFAULT_CHUNK_SIZE;
+    let mut target = match handle.direct_read_target(geometry, chunk_size) {
+        Ok(target) => target,
+        Err(error) => {
+            return VerifyOutcome::Failed(VerifyFailed {
+                mode: VerifyMode::Full,
+                verified_bytes: 0,
+                reason: VerifyFailureReason::TargetReadError(error),
+            });
+        }
+    };
     let mut source_buf = vec![0u8; chunk_size];
-    let mut target_buf = vec![0u8; chunk_size];
     let mut offset: u64 = 0;
 
     while offset < image_size {
@@ -1605,33 +1627,25 @@ fn run_full_verify(
             });
         }
 
-        let n_tgt = match read_at_fully(&target, offset, &mut target_buf[..want]) {
-            Ok(n) => n,
-            Err(error) => {
+        let target_bytes = match read_target(&mut target, offset, want) {
+            Ok(bytes) => bytes,
+            Err(reason) => {
                 return VerifyOutcome::Failed(VerifyFailed {
                     mode: VerifyMode::Full,
                     verified_bytes: offset,
-                    reason: VerifyFailureReason::TargetReadError(error),
+                    reason,
                 });
             }
         };
 
-        if n_tgt < want {
-            return VerifyOutcome::Failed(VerifyFailed {
-                mode: VerifyMode::Full,
-                verified_bytes: offset,
-                reason: VerifyFailureReason::TargetUnexpectedEof,
-            });
-        }
-
-        if let Some(index) = first_mismatch(&source_buf[..want], &target_buf[..want]) {
+        if let Some(index) = first_mismatch(&source_buf[..want], target_bytes) {
             return VerifyOutcome::Failed(VerifyFailed {
                 mode: VerifyMode::Full,
                 verified_bytes: offset,
                 reason: VerifyFailureReason::Mismatch {
                     offset: offset + index as u64,
                     expected: source_buf[index],
-                    actual: target_buf[index],
+                    actual: target_bytes[index],
                 },
             });
         }
@@ -1715,6 +1729,7 @@ fn quick_verify_ranges(image_size: u64) -> Vec<(u64, u64)> {
 // comment.
 fn run_quick_verify(
     handle: &OpenedDeviceHandle,
+    geometry: DirectReadGeometry,
     image: &SelectedImage,
     cancel: &CancelHandle,
     mut on_progress: impl FnMut(VerifyProgress),
@@ -1737,10 +1752,18 @@ fn run_quick_verify(
     let ranges = quick_verify_ranges(image.logical_size());
     let total_bytes: u64 = ranges.iter().map(|&(_, len)| len).sum();
 
-    let target = handle.reader_target();
     let chunk_size = writer::DEFAULT_CHUNK_SIZE;
+    let mut target = match handle.direct_read_target(geometry, chunk_size) {
+        Ok(target) => target,
+        Err(error) => {
+            return VerifyOutcome::Failed(VerifyFailed {
+                mode: VerifyMode::Quick,
+                verified_bytes: 0,
+                reason: VerifyFailureReason::TargetReadError(error),
+            });
+        }
+    };
     let mut source_buf = vec![0u8; chunk_size];
-    let mut target_buf = vec![0u8; chunk_size];
     let mut verified_bytes: u64 = 0;
 
     for (range_offset, range_len) in ranges {
@@ -1777,33 +1800,25 @@ fn run_quick_verify(
                 });
             }
 
-            let n_tgt = match read_at_fully(&target, absolute_offset, &mut target_buf[..want]) {
-                Ok(n) => n,
-                Err(error) => {
+            let target_bytes = match read_target(&mut target, absolute_offset, want) {
+                Ok(bytes) => bytes,
+                Err(reason) => {
                     return VerifyOutcome::Failed(VerifyFailed {
                         mode: VerifyMode::Quick,
                         verified_bytes,
-                        reason: VerifyFailureReason::TargetReadError(error),
+                        reason,
                     });
                 }
             };
 
-            if n_tgt < want {
-                return VerifyOutcome::Failed(VerifyFailed {
-                    mode: VerifyMode::Quick,
-                    verified_bytes,
-                    reason: VerifyFailureReason::TargetUnexpectedEof,
-                });
-            }
-
-            if let Some(index) = first_mismatch(&source_buf[..want], &target_buf[..want]) {
+            if let Some(index) = first_mismatch(&source_buf[..want], target_bytes) {
                 return VerifyOutcome::Failed(VerifyFailed {
                     mode: VerifyMode::Quick,
                     verified_bytes,
                     reason: VerifyFailureReason::Mismatch {
                         offset: absolute_offset + index as u64,
                         expected: source_buf[index],
-                        actual: target_buf[index],
+                        actual: target_bytes[index],
                     },
                 });
             }
@@ -3007,8 +3022,8 @@ mod tests {
     // the Gate's own baseline for every test that isn't specifically
     // exercising Identity/Instance/hazard rejection) and reopening
     // `target_path` read-only as the "just-opened read-only FD"
-    // `linux_access::open_device(block_path, OpenAccess::ReadOnly)` would have produced in
-    // production. Panics loudly (with the actual error) if either
+    // `linux_access::open_device(block_path, OpenAccess::ReadOnlyDirect)` would have
+    // produced in production (with a lenient test direct-read geometry). Panics loudly (with the actual error) if either
     // pre-flight phase unexpectedly rejects -- exactly what a test setup
     // helper should do, since an unexpected rejection here means the test
     // itself is broken, not the thing under test.
@@ -5693,5 +5708,252 @@ mod tests {
         );
         let _ = std::fs::remove_file(&target_path);
         let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // O_DIRECT Verify: the target is read only through the direct reader, by
+    // block-aligned ranges within the device, and only the image's bytes
+    // are compared. (The files here are regular files standing in for the
+    // device; the direct-read rules are applied through the geometry.)
+    // ---------------------------------------------------------------------
+
+    use super::super::linux_access::{DirectReadFailure, DirectReadGeometry};
+
+    // Like `verifying_from_sync_succeeded`, but with the Verify FD reporting
+    // `geometry` (None: its direct-read geometry could not be obtained), and
+    // returning the Verify start error instead of panicking.
+    fn verifying_with_direct_geometry(
+        sync_succeeded: SyncSucceeded,
+        image: SelectedImage,
+        target_snapshot: &DeviceSnapshot,
+        target_path: &std::path::Path,
+        geometry: Option<DirectReadGeometry>,
+    ) -> Result<Verifying, VerifyStartError> {
+        let pending = match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+            VerifyStart::Pending(pending) => pending,
+            VerifyStart::Skipped(..) => panic!("expected Pending"),
+        };
+        let ready = pending
+            .check_target(SnapshotFetchOutcome::Found(target_snapshot.clone()))
+            .unwrap_or_else(|(_, error, _)| panic!("check_target should succeed, got {error:?}"));
+
+        let read_file = std::fs::OpenOptions::new()
+            .read(true)
+            .open(target_path)
+            .expect("reopen target read-only");
+        let mut handle = OpenedDeviceHandle::from_file_for_test(read_file);
+        handle.set_direct_geometry_for_test(geometry);
+
+        ready
+            .finalize(Some(handle), Some(&fd_metadata_matching(target_snapshot)))
+            .map_err(|(_image, error)| error)
+    }
+
+    // The target file padded to `capacity` with bytes that differ from the
+    // image, standing in for the rest of the device after the image.
+    fn pad_target_to(target_path: &std::path::Path, capacity: u64) {
+        use std::os::unix::fs::FileExt as _;
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(target_path)
+            .unwrap();
+        let len = file.metadata().unwrap().len();
+        file.write_all_at(&vec![0xEEu8; (capacity - len) as usize], len)
+            .unwrap();
+    }
+
+    // When the Verify FD's direct-read geometry cannot be obtained (for
+    // example, BLKSSZGET fails), Verify does not start -- in Quick and Full.
+    #[test]
+    fn verify_does_not_start_without_a_direct_read_geometry() {
+        for mode in [VerifyMode::Quick, VerifyMode::Full] {
+            let data = patterned_data(64 * 1024);
+            let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+                &format!("direct-no-geometry-{mode:?}"),
+                &data,
+                data.len() as u64,
+                mode,
+            );
+
+            let result = verifying_with_direct_geometry(
+                sync_succeeded,
+                image,
+                &snapshot,
+                &target_path,
+                None,
+            );
+
+            assert!(
+                matches!(result, Err(VerifyStartError::DirectReadUnavailable(_))),
+                "{mode:?}"
+            );
+        }
+    }
+
+    // Full Verify with 512-byte blocks and an image ending inside a block:
+    // every byte of the image is compared (the last partial block is read
+    // in full, the device bytes after the image are not compared), and a
+    // wrong last byte is found.
+    #[test]
+    fn full_verify_reads_block_aligned_and_compares_only_the_image() {
+        let image_size = 2 * writer::DEFAULT_CHUNK_SIZE as u64 + 777;
+        let capacity = image_size.next_multiple_of(512) + 4096;
+        let data = patterned_data(image_size as usize);
+
+        for corrupt_last_byte in [false, true] {
+            let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+                &format!("direct-full-{corrupt_last_byte}"),
+                &data,
+                image_size,
+                VerifyMode::Full,
+            );
+            pad_target_to(&target_path, capacity);
+            if corrupt_last_byte {
+                corrupt_byte_at(&target_path, image_size - 1, !data[image_size as usize - 1]);
+            }
+
+            let verifying = verifying_with_direct_geometry(
+                sync_succeeded,
+                image,
+                &snapshot,
+                &target_path,
+                Some(DirectReadGeometry::for_test(512, 512, capacity)),
+            )
+            .unwrap();
+
+            match (corrupt_last_byte, verifying.run(|_| {}).1) {
+                (false, VerifyOutcome::Succeeded(succeeded)) => {
+                    assert_eq!(succeeded.verified_bytes, image_size);
+                }
+                (
+                    true,
+                    VerifyOutcome::Failed(VerifyFailed {
+                        reason: VerifyFailureReason::Mismatch { offset, .. },
+                        ..
+                    }),
+                ) => assert_eq!(offset, image_size - 1),
+                (_, other) => panic!("corrupt={corrupt_last_byte}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    // When the block-aligned read of the image's last bytes would pass the
+    // device's end, Verify fails there -- it does not read those bytes some
+    // other way. Everything before them was compared.
+    #[test]
+    fn full_verify_fails_where_the_tail_cannot_be_read_directly() {
+        let image_size = 2 * writer::DEFAULT_CHUNK_SIZE as u64 + 777;
+        let data = patterned_data(image_size as usize);
+        let (target_path, image, sync_succeeded, snapshot) =
+            gate_pass_sync_succeeded("direct-tail", &data, image_size, VerifyMode::Full);
+
+        let verifying = verifying_with_direct_geometry(
+            sync_succeeded,
+            image,
+            &snapshot,
+            &target_path,
+            Some(DirectReadGeometry::for_test(512, 512, image_size)),
+        )
+        .unwrap();
+
+        match verifying.run(|_| {}).1 {
+            VerifyOutcome::Failed(VerifyFailed {
+                reason: VerifyFailureReason::TargetReadError(error),
+                verified_bytes,
+                ..
+            }) => {
+                assert_eq!(verified_bytes, 2 * writer::DEFAULT_CHUNK_SIZE as u64);
+                assert_eq!(
+                    error
+                        .get_ref()
+                        .and_then(|inner| inner.downcast_ref::<DirectReadFailure>()),
+                    Some(&DirectReadFailure::OutsideDevice)
+                );
+            }
+            other => panic!("expected a target read failure, got {other:?}"),
+        }
+    }
+
+    // Quick Verify with 512-byte blocks: the middle and last windows, which
+    // do not start on block boundaries, are read directly and compared over
+    // exactly the same ranges as before -- a wrong byte in either is found,
+    // one outside every window is not.
+    #[test]
+    fn quick_verify_reads_unaligned_windows_directly() {
+        let image_size = 20 * 1024 * 1024 + 777u64;
+        let capacity = image_size.next_multiple_of(512) + 4096;
+        let data = patterned_data(image_size as usize);
+        let ranges = quick_verify_ranges(image_size);
+        assert_eq!(ranges.len(), 3);
+        let (middle, last) = (ranges[1].0, ranges[2].0);
+        assert_ne!(middle % 512, 0, "the middle window is not block-aligned");
+        assert_ne!(last % 512, 0, "the last window is not block-aligned");
+
+        for (label, corrupt_at, found) in [
+            ("clean", None, None),
+            ("middle", Some(middle + 5), Some(middle + 5)),
+            ("last", Some(image_size - 1), Some(image_size - 1)),
+            ("unsampled", Some(middle - 1), None),
+        ] {
+            let (target_path, image, sync_succeeded, snapshot) = gate_pass_sync_succeeded(
+                &format!("direct-quick-{label}"),
+                &data,
+                image_size,
+                VerifyMode::Quick,
+            );
+            pad_target_to(&target_path, capacity);
+            if let Some(offset) = corrupt_at {
+                corrupt_byte_at(&target_path, offset, !data[offset as usize]);
+            }
+
+            let verifying = verifying_with_direct_geometry(
+                sync_succeeded,
+                image,
+                &snapshot,
+                &target_path,
+                Some(DirectReadGeometry::for_test(512, 512, capacity)),
+            )
+            .unwrap();
+
+            match (found, verifying.run(|_| {}).1) {
+                (None, VerifyOutcome::Succeeded(succeeded)) => {
+                    assert_eq!(
+                        succeeded.verified_bytes,
+                        3 * QUICK_VERIFY_WINDOW_SIZE,
+                        "{label}"
+                    );
+                }
+                (
+                    Some(expected),
+                    VerifyOutcome::Failed(VerifyFailed {
+                        reason: VerifyFailureReason::Mismatch { offset, .. },
+                        ..
+                    }),
+                ) => assert_eq!(offset, expected, "{label}"),
+                (_, other) => panic!("{label}: unexpected {other:?}"),
+            }
+        }
+    }
+
+    // The verifiers read the target only through the direct reader: no
+    // buffered read of the target exists in this module's production code.
+    #[test]
+    fn verifiers_read_the_target_only_through_the_direct_reader() {
+        let source = include_str!("write_job.rs");
+        let production = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("tests module marker")];
+
+        assert_eq!(production.matches("reader_target(").count(), 0);
+        for name in ["run_full_verify", "run_quick_verify"] {
+            let start = production
+                .find(&format!("\nfn {name}("))
+                .unwrap_or_else(|| panic!("{name} definition"));
+            let end = start + production[start..].find("\n}\n").expect("end of function");
+            let body = &production[start..end];
+            assert_eq!(body.matches("direct_read_target(").count(), 1, "{name}");
+            assert_eq!(body.matches("read_target(&mut target").count(), 1, "{name}");
+        }
     }
 }

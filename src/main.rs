@@ -1538,7 +1538,7 @@ fn run_write_test(
                             }
 
                             println!(
-                                "write-test: requesting OpenDevice(mode=\"r\") on {} for verification.",
+                                "write-test: requesting OpenDevice(mode=\"r\", O_DIRECT) on {} for verification.",
                                 ready.block_path()
                             );
                             println!(
@@ -1548,18 +1548,20 @@ fn run_write_test(
 
                             let open_result = linux_access::open_device(
                                 ready.block_path(),
-                                linux_access::OpenAccess::ReadOnly,
+                                linux_access::OpenAccess::ReadOnlyDirect,
                             );
 
                             let (handle_opt, metadata) = match open_result {
                                 Ok(handle) => {
-                                    println!("write-test: OpenDevice(mode=\"r\"): success");
+                                    println!(
+                                        "write-test: OpenDevice(mode=\"r\", O_DIRECT): success"
+                                    );
                                     let metadata = handle.metadata();
                                     (Some(handle), metadata)
                                 }
                                 Err(error) => {
                                     println!(
-                                        "write-test: OpenDevice(mode=\"r\"): failed ({error:?})"
+                                        "write-test: OpenDevice(mode=\"r\", O_DIRECT): failed ({error:?})"
                                     );
                                     (None, None)
                                 }
@@ -2413,19 +2415,30 @@ mod tests {
                 1,
                 "{name}"
             );
-            assert_eq!(source.matches("OpenAccess::ReadOnly").count(), 0, "{name}");
+            assert_eq!(
+                source.matches("OpenAccess::ReadOnlyDirect").count(),
+                0,
+                "{name}"
+            );
         }
 
         // write-test: the write FD is exclusive, and the Verify FD opened
-        // after it is read-only.
+        // after it is read-only with O_DIRECT -- once, and only on the path
+        // where Verify is pending (Quick / Full), never for None.
         let write_test = production_fn_source("run_write_test");
         assert_eq!(write_test.matches("OpenAccess::WriteExclusive").count(), 1);
-        assert_eq!(write_test.matches("OpenAccess::ReadOnly").count(), 1);
+        assert_eq!(write_test.matches("OpenAccess::ReadOnlyDirect").count(), 1);
         let write = write_test.find("OpenAccess::WriteExclusive").unwrap();
-        let verify = write_test.find("OpenAccess::ReadOnly").unwrap();
+        let skipped = write_test.find("write_job::VerifyStart::Skipped").unwrap();
+        let pending = write_test.find("write_job::VerifyStart::Pending").unwrap();
+        let verify = write_test.find("OpenAccess::ReadOnlyDirect").unwrap();
         assert!(
             write < verify,
             "the write FD is opened before the Verify FD"
+        );
+        assert!(
+            skipped < pending && pending < verify,
+            "the Verify FD is opened only in the Pending arm"
         );
     }
 

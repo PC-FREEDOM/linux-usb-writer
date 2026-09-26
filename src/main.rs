@@ -1765,6 +1765,9 @@ fn format_verify_failure_reason(reason: &write_job::VerifyFailureReason) -> Stri
         write_job::VerifyFailureReason::UnsupportedAccess => {
             "quick verification requires an image source with random-access support, which this image does not provide".to_string()
         }
+        write_job::VerifyFailureReason::SourceChanged(changed) => {
+            format!("{changed}; the verification result was not accepted")
+        }
     }
 }
 
@@ -2192,6 +2195,7 @@ mod tests {
         VerifySucceeded,
     };
     use crate::identity::{IdentityComparison, InstanceComparison};
+    use crate::image_source::source_identity::SourceChanged;
     use std::cell::Cell;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -2343,6 +2347,16 @@ mod tests {
     fn format_verify_failure_reason_unsupported_access_mentions_random_access() {
         let formatted = format_verify_failure_reason(&VerifyFailureReason::UnsupportedAccess);
         assert!(formatted.to_lowercase().contains("random"));
+    }
+
+    // A source change at a Verify checkpoint says the image changed and that
+    // the verification result was not accepted, without naming a cause.
+    #[test]
+    fn format_verify_failure_reason_source_changed_rejects_the_result() {
+        let changed = SourceChanged::Unverifiable(std::io::Error::other("simulated"));
+        let formatted = format_verify_failure_reason(&VerifyFailureReason::SourceChanged(changed));
+        assert!(formatted.contains("image file"));
+        assert!(formatted.contains("not accepted"));
     }
 
     // ---------------------------------------------------------------------

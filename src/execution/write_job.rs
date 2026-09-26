@@ -254,11 +254,14 @@ pub enum WriteStage {
 pub enum WriteJobFailureCause {
     Write(WriteError),
     Sync(io::Error),
-    // The source image was no longer in the state it was selected in when
-    // the write was about to start (see `WritingExecution::write`). Nothing
-    // was written. Carries the metadata comparison; it deliberately does
-    // not guess *why* the source changed (content rewrite, rename, deletion
-    // and replacement all look alike in metadata).
+    // The source image was no longer in the state it was selected in, at
+    // one of the two write-stage checkpoints (see `WritingExecution::write`):
+    // just before the first byte (nothing was written,
+    // `target_may_be_modified == false`) or just after the writer finished
+    // (the whole image was written, `target_may_be_modified == true`, and
+    // sync was not run). Carries the metadata comparison; it deliberately
+    // does not guess *why* the source changed (content rewrite, rename,
+    // deletion and replacement all look alike in metadata).
     SourceChanged(SourceChanged),
 }
 
@@ -678,6 +681,24 @@ impl WritingExecution {
     // `WriteJobFailureCause::SourceChanged`, 0 bytes written and the target
     // untouched; being `Failed`, it cannot lead to sync or Verify, and a
     // retry needs a fresh selection and a fresh Gate pass.
+    //
+    // Post-write source checkpoint: when the writer reports success, the
+    // source is revalidated once more before `WriteSucceeded` is handed out
+    // -- i.e. before sync, and for every `VerifyMode` including `None`. The
+    // bytes just written came from a source that may have changed while it
+    // was being read, so a change here turns the success into `Failed`
+    // (`SourceChanged`, stage `Writing`, the real `bytes_written`,
+    // `target_may_be_modified == true`); sync and Verify are not reached.
+    // Only a success is checked: a writer failure or cancellation is
+    // returned exactly as the writer reported it, never replaced by
+    // `SourceChanged`.
+    //
+    // Source checkpoints always compare against the snapshot taken when the
+    // image was opened, never against the previous checkpoint, so they are
+    // cumulative: each one also covers every earlier moment. The contract
+    // runs through the last read of the source for the chosen Verify mode:
+    // this post-write check for `VerifyMode::None` (the source is never read
+    // again), the post-verify check in `Verifying::run` for Quick / Full.
     pub fn write(
         self,
         on_progress: impl FnMut(WriteProgress),
@@ -698,7 +719,24 @@ impl WritingExecution {
             return (image, WriteAttemptOutcome::Failed(failed));
         }
 
-        (image, writing.write(on_progress))
+        let outcome = match writing.write(on_progress) {
+            WriteAttemptOutcome::Succeeded(succeeded) => match image.revalidate_identity() {
+                Ok(()) => WriteAttemptOutcome::Succeeded(succeeded),
+                // `succeeded` (and the target FD inside it) is dropped here,
+                // unsynced; the write itself already happened.
+                Err(changed) => WriteAttemptOutcome::Failed(Failed {
+                    image_size: succeeded.image_size,
+                    bytes_written: succeeded.bytes_written,
+                    stage: WriteStage::Writing,
+                    target_may_be_modified: true,
+                    retry_requires_fresh_gate: true,
+                    cause: WriteJobFailureCause::SourceChanged(changed),
+                }),
+            },
+            other => other,
+        };
+
+        (image, outcome)
     }
 }
 
@@ -1326,6 +1364,16 @@ pub enum VerifyFailureReason {
     // actual performance characteristics, or silently do more work than the
     // user asked for.
     UnsupportedAccess,
+    // The source image was no longer in the state it was selected in, at
+    // one of Verify's two source checkpoints (see `Verifying::run`): before
+    // any byte was compared (`verified_bytes == 0`, no progress reported),
+    // or after every comparison matched (`verified_bytes` is how much was
+    // compared). In the second case the match is *not* accepted: the
+    // source may have changed while it was being compared. Like every Verify
+    // outcome, this is only reachable after write and sync succeeded, so
+    // the target has been modified. Carries the metadata comparison without
+    // guessing a cause.
+    SourceChanged(SourceChanged),
 }
 
 #[derive(Debug)]
@@ -1371,6 +1419,17 @@ impl Verifying {
     // exactly the same class of evidence this project's own manual
     // `sudo head -c <size> /dev/sdX | sha256sum` real-device tests already
     // relied on, now automated and `sudo`-free.
+    //
+    // Source checkpoints: the source is revalidated (one metadata read of
+    // the already-open file) immediately before Verify starts -- after the
+    // whole target pre-flight, so a change during it, including the
+    // test-only pause, is caught -- and again after a successful comparison,
+    // before that success is returned. A change before the start means no
+    // byte is read and no progress is reported; a change after it means the
+    // matching comparison is not accepted. Both become `Failed` with
+    // `VerifyFailureReason::SourceChanged`. Only a success is re-checked at
+    // the end: a Verify failure or cancellation is returned as it is, never
+    // replaced by `SourceChanged`.
     pub fn run(self, on_progress: impl FnMut(VerifyProgress)) -> (SelectedImage, VerifyOutcome) {
         let Verifying {
             handle,
@@ -1379,12 +1438,33 @@ impl Verifying {
             cancel,
         } = self;
 
+        if let Err(changed) = image.revalidate_identity() {
+            let outcome = VerifyOutcome::Failed(VerifyFailed {
+                mode,
+                verified_bytes: 0,
+                reason: VerifyFailureReason::SourceChanged(changed),
+            });
+            return (image, outcome);
+        }
+
         let outcome = match mode {
             VerifyMode::Full => run_full_verify(&handle, &image, &cancel, on_progress),
             VerifyMode::Quick => run_quick_verify(&handle, &image, &cancel, on_progress),
             VerifyMode::None => unreachable!(
                 "VerifyMode::None never reaches Verifying -- see SyncSucceeded::begin_verify()"
             ),
+        };
+
+        let outcome = match outcome {
+            VerifyOutcome::Succeeded(succeeded) => match image.revalidate_identity() {
+                Ok(()) => VerifyOutcome::Succeeded(succeeded),
+                Err(changed) => VerifyOutcome::Failed(VerifyFailed {
+                    mode: succeeded.mode,
+                    verified_bytes: succeeded.verified_bytes,
+                    reason: VerifyFailureReason::SourceChanged(changed),
+                }),
+            },
+            other => other,
         };
 
         (image, outcome)
@@ -2718,13 +2798,50 @@ mod tests {
         SyncSucceeded,
         DeviceSnapshot,
     ) {
+        let source_path = write_temp_image_file(&format!("verify-source-{tag}"), source_data);
+        let (target_path, writing_execution, snapshot) = gate_pass_writing_execution(
+            tag,
+            &source_path,
+            target_size,
+            verify_mode,
+            CancelHandle::new(),
+        );
+
+        let (selected_image, outcome) = writing_execution.write(|_| {});
+        let write_succeeded = match outcome {
+            WriteAttemptOutcome::Succeeded(s) => s,
+            other => {
+                panic!("expected write to succeed while setting up a verify test, got {other:?}")
+            }
+        };
+
+        let sync_outcome = write_succeeded.begin_sync().sync();
+        let sync_succeeded = match sync_outcome {
+            SyncAttemptOutcome::Succeeded(s) => s,
+            other => {
+                panic!("expected sync to succeed while setting up a verify test, got {other:?}")
+            }
+        };
+
+        (target_path, selected_image, sync_succeeded, snapshot)
+    }
+
+    // The part of `gate_pass_sync_succeeded` up to `begin_write()`, for
+    // tests that need to act while the write runs (the source file at
+    // `source_path` stays at a known path so it can be changed).
+    fn gate_pass_writing_execution(
+        tag: &str,
+        source_path: &std::path::Path,
+        target_size: u64,
+        verify_mode: VerifyMode,
+        cancel: CancelHandle,
+    ) -> (std::path::PathBuf, WritingExecution, DeviceSnapshot) {
         use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
 
-        let source_path = write_temp_image_file(&format!("verify-source-{tag}"), source_data);
-        let source = FileImageSource::new(&source_path).expect("open source image for verify test");
+        let source = FileImageSource::new(source_path).expect("open source image for verify test");
         let selected_image = SelectedImage::new(Box::new(source));
 
         let snapshot = base_device(target_size);
@@ -2763,26 +2880,10 @@ mod tests {
         let execution = AuthorizedExecution::bind(authorized, selected_image)
             .expect("bind should succeed for a freshly minted SelectedImage");
         let writing_execution = execution
-            .begin_write(CancelHandle::new())
+            .begin_write(cancel)
             .expect("begin_write should succeed for a freshly opened reader");
 
-        let (selected_image, outcome) = writing_execution.write(|_| {});
-        let write_succeeded = match outcome {
-            WriteAttemptOutcome::Succeeded(s) => s,
-            other => {
-                panic!("expected write to succeed while setting up a verify test, got {other:?}")
-            }
-        };
-
-        let sync_outcome = write_succeeded.begin_sync().sync();
-        let sync_succeeded = match sync_outcome {
-            SyncAttemptOutcome::Succeeded(s) => s,
-            other => {
-                panic!("expected sync to succeed while setting up a verify test, got {other:?}")
-            }
-        };
-
-        (target_path, selected_image, sync_succeeded, snapshot)
+        (target_path, writing_execution, snapshot)
     }
 
     // Drives `sync_succeeded` all the way to a `Verifying`, using
@@ -4069,6 +4170,538 @@ mod tests {
             let _ = std::fs::remove_file(&target_path);
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(path.with_extension("moved"));
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Source checkpoint lifecycle: post-write (`WritingExecution::write`),
+    // pre-verify and post-verify (`Verifying::run`). The source is changed
+    // from inside a progress callback, which runs at a known point of the
+    // write/Verify loop -- no hook exists in production code.
+    // ---------------------------------------------------------------------
+
+    type SourceMutation = fn(&std::path::Path);
+
+    // Changes that leave the first `logical_size` bytes as they were, so a
+    // Verify comparing them would still match: only the checkpoints can
+    // notice them.
+    fn content_preserving_source_mutations() -> [(&'static str, SourceMutation); 3] {
+        [
+            ("append", |path| {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+                file.write_all(b"appended").unwrap();
+            }),
+            ("rewrite-same-bytes", |path| {
+                use std::os::unix::fs::FileExt as _;
+                let file = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .unwrap();
+                let mut first = [0u8; 16];
+                file.read_exact_at(&mut first, 0).unwrap();
+                file.write_all_at(&first, 0).unwrap();
+            }),
+            ("rename", |path| {
+                std::fs::rename(path, path.with_extension("moved")).unwrap();
+            }),
+        ]
+    }
+
+    fn remove_source_files(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("moved"));
+    }
+
+    fn patterned_data(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    // More than one write/Verify chunk, so "after the first chunk" is a
+    // point in the middle of the loop.
+    fn multi_chunk_data() -> Vec<u8> {
+        patterned_data(writer::DEFAULT_CHUNK_SIZE * 2 + 4096)
+    }
+
+    // Write and sync through the production entry points, both expected to
+    // succeed (the post-write checkpoint included).
+    fn write_and_sync(
+        writing_execution: WritingExecution,
+        context: &str,
+    ) -> (SelectedImage, SyncSucceeded) {
+        let (image, outcome) = writing_execution.write(|_| {});
+        let write_succeeded = match outcome {
+            WriteAttemptOutcome::Succeeded(s) => s,
+            other => panic!("{context}: expected write success, got {other:?}"),
+        };
+        match write_succeeded.begin_sync().sync() {
+            SyncAttemptOutcome::Succeeded(s) => (image, s),
+            other => panic!("{context}: expected sync success, got {other:?}"),
+        }
+    }
+
+    fn expect_write_source_changed(outcome: WriteAttemptOutcome, context: &str) -> Failed {
+        let failed = match outcome {
+            WriteAttemptOutcome::Failed(failed) => failed,
+            other => panic!("{context}: expected Failed, got {other:?}"),
+        };
+        assert!(
+            matches!(failed.cause, WriteJobFailureCause::SourceChanged(_)),
+            "{context}: {:?}",
+            failed.cause
+        );
+        failed
+    }
+
+    fn expect_verify_source_changed(outcome: VerifyOutcome, context: &str) -> VerifyFailed {
+        let failed = match outcome {
+            VerifyOutcome::Failed(failed) => failed,
+            other => panic!("{context}: expected Failed, got {other:?}"),
+        };
+        assert!(
+            matches!(failed.reason, VerifyFailureReason::SourceChanged(_)),
+            "{context}: {:?}",
+            failed.reason
+        );
+        failed
+    }
+
+    // Post-write: the source changes after its last byte was read and
+    // written (the final progress callback), before the writer returns.
+    // The write happened, but it is not reported as a success: it is a
+    // typed `SourceChanged` with the real byte count and the target marked
+    // as modified, and without a `WriteSucceeded` there is no way to sync or
+    // verify.
+    #[test]
+    fn post_write_source_change_turns_the_write_into_a_failure() {
+        for (name, mutate) in content_preserving_source_mutations() {
+            let data = patterned_data(64 * 1024);
+            let path = write_temp_image_file(&format!("post-write-{name}"), &data);
+            let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution(
+                &format!("post-write-{name}"),
+                &path,
+                data.len() as u64,
+                VerifyMode::Full,
+                CancelHandle::new(),
+            );
+
+            let_the_clock_tick();
+            let total = data.len() as u64;
+            let (_image, outcome) = writing_execution.write(|progress| {
+                if progress.bytes_written == total {
+                    mutate(&path);
+                }
+            });
+
+            let failed = expect_write_source_changed(outcome, name);
+            assert_eq!(failed.stage, WriteStage::Writing, "{name}");
+            assert_eq!(failed.bytes_written, total, "{name}");
+            assert!(failed.target_may_be_modified, "{name}");
+            assert!(failed.retry_requires_fresh_gate, "{name}");
+            assert_eq!(
+                std::fs::read(&target_path).unwrap(),
+                data,
+                "{name}: the write itself did happen"
+            );
+
+            let _ = std::fs::remove_file(&target_path);
+            remove_source_files(&path);
+        }
+    }
+
+    // Post-write runs for `VerifyMode::None` too: not verifying does not
+    // mean not checking the source after the write.
+    #[test]
+    fn post_write_checkpoint_runs_without_verify() {
+        let data = patterned_data(64 * 1024);
+        let path = write_temp_image_file("post-write-verify-none", &data);
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution(
+            "post-write-verify-none",
+            &path,
+            data.len() as u64,
+            VerifyMode::None,
+            CancelHandle::new(),
+        );
+
+        let_the_clock_tick();
+        let total = data.len() as u64;
+        let (_image, outcome) = writing_execution.write(|progress| {
+            if progress.bytes_written == total {
+                std::fs::rename(&path, path.with_extension("moved")).unwrap();
+            }
+        });
+
+        let failed = expect_write_source_changed(outcome, "verify none");
+        assert_eq!(failed.bytes_written, total);
+        assert!(failed.target_may_be_modified);
+        assert!(failed.retry_requires_fresh_gate);
+
+        let _ = std::fs::remove_file(&target_path);
+        remove_source_files(&path);
+    }
+
+    // Pre-verify: write, post-write check and sync all succeed; the source
+    // then changes while the target pre-flight runs. Verify does not
+    // start: no byte is compared and no progress is reported.
+    #[test]
+    fn pre_verify_source_change_prevents_verify_from_starting() {
+        for mode in [VerifyMode::Quick, VerifyMode::Full] {
+            for (name, mutate) in content_preserving_source_mutations() {
+                let context = format!("{mode:?} {name}");
+                let data = patterned_data(64 * 1024);
+                let path = write_temp_image_file(&format!("pre-verify-{name}"), &data);
+                let (target_path, writing_execution, snapshot) = gate_pass_writing_execution(
+                    &format!("pre-verify-{mode:?}-{name}"),
+                    &path,
+                    data.len() as u64,
+                    mode,
+                    CancelHandle::new(),
+                );
+                let (image, sync_succeeded) = write_and_sync(writing_execution, &context);
+
+                let verifying = verifying_from_sync_succeeded(
+                    sync_succeeded,
+                    image,
+                    CancelHandle::new(),
+                    &snapshot,
+                    &target_path,
+                );
+
+                let_the_clock_tick();
+                mutate(&path);
+
+                let (_image, outcome) =
+                    verifying.run(|_| panic!("{context}: Verify must not start, so no progress"));
+
+                let failed = expect_verify_source_changed(outcome, &context);
+                assert_eq!(failed.mode, mode, "{context}");
+                assert_eq!(failed.verified_bytes, 0, "{context}");
+
+                let _ = std::fs::remove_file(&target_path);
+                remove_source_files(&path);
+            }
+        }
+    }
+
+    // Post-verify: the source changes during Verify (at its final progress
+    // callback, after every compared byte matched). The matching result is
+    // not accepted.
+    #[test]
+    fn post_verify_source_change_rejects_a_matching_verify() {
+        for mode in [VerifyMode::Quick, VerifyMode::Full] {
+            for (name, mutate) in content_preserving_source_mutations() {
+                let context = format!("{mode:?} {name}");
+                let data = patterned_data(64 * 1024);
+                let path = write_temp_image_file(&format!("post-verify-{name}"), &data);
+                let (target_path, writing_execution, snapshot) = gate_pass_writing_execution(
+                    &format!("post-verify-{mode:?}-{name}"),
+                    &path,
+                    data.len() as u64,
+                    mode,
+                    CancelHandle::new(),
+                );
+                let (image, sync_succeeded) = write_and_sync(writing_execution, &context);
+
+                let verifying = verifying_from_sync_succeeded(
+                    sync_succeeded,
+                    image,
+                    CancelHandle::new(),
+                    &snapshot,
+                    &target_path,
+                );
+
+                let_the_clock_tick();
+                let mut progress_seen = false;
+                let (_image, outcome) = verifying.run(|progress| {
+                    progress_seen = true;
+                    if progress.verified_bytes == progress.total_bytes {
+                        mutate(&path);
+                    }
+                });
+
+                assert!(progress_seen, "{context}: Verify must have run");
+                let failed = expect_verify_source_changed(outcome, &context);
+                assert_eq!(failed.mode, mode, "{context}");
+                assert_eq!(failed.verified_bytes, data.len() as u64, "{context}");
+
+                let _ = std::fs::remove_file(&target_path);
+                remove_source_files(&path);
+            }
+        }
+    }
+
+    // An unchanged source passes all four checkpoints (pre-write,
+    // post-write, pre-verify, post-verify) and every mode ends exactly as
+    // before: None skipped, Quick and Full succeeded over the whole (small)
+    // image.
+    #[test]
+    fn unchanged_source_passes_every_checkpoint_in_every_verify_mode() {
+        for mode in [VerifyMode::None, VerifyMode::Quick, VerifyMode::Full] {
+            let context = format!("{mode:?}");
+            let data = patterned_data(64 * 1024);
+            let path = write_temp_image_file(&format!("lifecycle-{mode:?}"), &data);
+            let (target_path, writing_execution, snapshot) = gate_pass_writing_execution(
+                &format!("lifecycle-{mode:?}"),
+                &path,
+                data.len() as u64,
+                mode,
+                CancelHandle::new(),
+            );
+            let (image, sync_succeeded) = write_and_sync(writing_execution, &context);
+            assert_eq!(std::fs::read(&target_path).unwrap(), data, "{context}");
+
+            let succeeded = match mode {
+                VerifyMode::None => match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+                    VerifyStart::Skipped(_, succeeded) => succeeded,
+                    VerifyStart::Pending(_) => panic!("{context}: expected Skipped"),
+                },
+                VerifyMode::Quick | VerifyMode::Full => {
+                    let verifying = verifying_from_sync_succeeded(
+                        sync_succeeded,
+                        image,
+                        CancelHandle::new(),
+                        &snapshot,
+                        &target_path,
+                    );
+                    match verifying.run(|_| {}) {
+                        (_, VerifyOutcome::Succeeded(succeeded)) => succeeded,
+                        (_, other) => panic!("{context}: expected Succeeded, got {other:?}"),
+                    }
+                }
+            };
+
+            assert_eq!(succeeded.mode, mode, "{context}");
+            assert_eq!(succeeded.skipped, mode == VerifyMode::None, "{context}");
+            let expected_verified = if mode == VerifyMode::None {
+                0
+            } else {
+                data.len() as u64
+            };
+            assert_eq!(succeeded.verified_bytes, expected_verified, "{context}");
+
+            let _ = std::fs::remove_file(&target_path);
+            remove_source_files(&path);
+        }
+    }
+
+    // The contract runs through the last read of the source for each Verify
+    // mode. The source changes after the post-write checkpoint passed,
+    // before sync. With `None` the source is never read again, so the bytes
+    // already written are unaffected and the job succeeds. Quick / Full read
+    // the source again, and since checks compare against the open-time
+    // snapshot (cumulative), Verify is refused before it starts.
+    #[test]
+    fn source_identity_contract_extends_through_last_source_read() {
+        for mode in [VerifyMode::None, VerifyMode::Quick, VerifyMode::Full] {
+            let context = format!("{mode:?}");
+            let data = patterned_data(64 * 1024);
+            let path = write_temp_image_file(&format!("contract-{mode:?}"), &data);
+            let (target_path, writing_execution, snapshot) = gate_pass_writing_execution(
+                &format!("contract-{mode:?}"),
+                &path,
+                data.len() as u64,
+                mode,
+                CancelHandle::new(),
+            );
+
+            let (image, outcome) = writing_execution.write(|_| {});
+            let write_succeeded = match outcome {
+                WriteAttemptOutcome::Succeeded(s) => s,
+                other => panic!("{context}: expected post-write to pass, got {other:?}"),
+            };
+
+            let_the_clock_tick();
+            std::fs::rename(&path, path.with_extension("moved")).unwrap();
+
+            let sync_succeeded = match write_succeeded.begin_sync().sync() {
+                SyncAttemptOutcome::Succeeded(s) => s,
+                other => panic!("{context}: expected sync success, got {other:?}"),
+            };
+
+            match mode {
+                VerifyMode::None => match sync_succeeded.begin_verify(image, CancelHandle::new()) {
+                    VerifyStart::Skipped(_, succeeded) => assert!(succeeded.skipped),
+                    VerifyStart::Pending(_) => panic!("{context}: expected Skipped"),
+                },
+                VerifyMode::Quick | VerifyMode::Full => {
+                    let verifying = verifying_from_sync_succeeded(
+                        sync_succeeded,
+                        image,
+                        CancelHandle::new(),
+                        &snapshot,
+                        &target_path,
+                    );
+                    let (_image, outcome) =
+                        verifying.run(|_| panic!("{context}: Verify must not start"));
+                    let failed = expect_verify_source_changed(outcome, &context);
+                    assert_eq!(failed.verified_bytes, 0, "{context}");
+                }
+            }
+            assert_eq!(std::fs::read(&target_path).unwrap(), data, "{context}");
+
+            let _ = std::fs::remove_file(&target_path);
+            remove_source_files(&path);
+        }
+    }
+
+    // A write cancelled partway, with the source also changed before the
+    // writer stopped, stays `Cancelled`: the post-write checkpoint only
+    // looks at a successful write.
+    #[test]
+    fn write_cancel_is_not_replaced_by_source_changed() {
+        let data = multi_chunk_data();
+        let path = write_temp_image_file("priority-write-cancel", &data);
+        let cancel = CancelHandle::new();
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution(
+            "priority-write-cancel",
+            &path,
+            data.len() as u64,
+            VerifyMode::Full,
+            cancel.clone(),
+        );
+
+        let_the_clock_tick();
+        let (_image, outcome) = writing_execution.write(|progress| {
+            if progress.bytes_written == writer::DEFAULT_CHUNK_SIZE as u64 {
+                std::fs::rename(&path, path.with_extension("moved")).unwrap();
+                cancel.request_cancel(CancelReason::UserRequested);
+            }
+        });
+
+        let cancelled = match outcome {
+            WriteAttemptOutcome::Cancelled(cancelled) => cancelled,
+            other => panic!("expected Cancelled, got {other:?}"),
+        };
+        assert_eq!(cancelled.bytes_written, writer::DEFAULT_CHUNK_SIZE as u64);
+        assert!(cancelled.target_may_be_modified);
+
+        let _ = std::fs::remove_file(&target_path);
+        remove_source_files(&path);
+    }
+
+    // A write that failed on its own (the source was truncated mid-write,
+    // so it ran short) stays that failure, not `SourceChanged`.
+    #[test]
+    fn write_failure_is_not_replaced_by_source_changed() {
+        let data = multi_chunk_data();
+        let path = write_temp_image_file("priority-write-failure", &data);
+        let (target_path, writing_execution, _snapshot) = gate_pass_writing_execution(
+            "priority-write-failure",
+            &path,
+            data.len() as u64,
+            VerifyMode::Full,
+            CancelHandle::new(),
+        );
+
+        let (_image, outcome) = writing_execution.write(|progress| {
+            if progress.bytes_written == writer::DEFAULT_CHUNK_SIZE as u64 {
+                let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                file.set_len(writer::DEFAULT_CHUNK_SIZE as u64).unwrap();
+            }
+        });
+
+        let failed = match outcome {
+            WriteAttemptOutcome::Failed(failed) => failed,
+            other => panic!("expected Failed, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                failed.cause,
+                WriteJobFailureCause::Write(WriteError::SourceTooShort { .. })
+            ),
+            "{:?}",
+            failed.cause
+        );
+
+        let _ = std::fs::remove_file(&target_path);
+        remove_source_files(&path);
+    }
+
+    // Verify outcomes that are already a failure or a cancellation stay as
+    // they are when the source also changed during Verify: the post-verify
+    // checkpoint only looks at a successful comparison.
+    #[test]
+    fn verify_failure_and_cancel_are_not_replaced_by_source_changed() {
+        enum Expect {
+            Cancelled,
+            Mismatch,
+            SourceUnexpectedEof,
+        }
+        let cases = [
+            ("cancel", Expect::Cancelled),
+            ("mismatch", Expect::Mismatch),
+            ("source-eof", Expect::SourceUnexpectedEof),
+        ];
+
+        for (name, expect) in cases {
+            let data = multi_chunk_data();
+            let path = write_temp_image_file(&format!("priority-verify-{name}"), &data);
+            let (target_path, writing_execution, snapshot) = gate_pass_writing_execution(
+                &format!("priority-verify-{name}"),
+                &path,
+                data.len() as u64,
+                VerifyMode::Full,
+                CancelHandle::new(),
+            );
+            let (image, sync_succeeded) = write_and_sync(writing_execution, name);
+            if matches!(expect, Expect::Mismatch) {
+                let last = data.len() as u64 - 1;
+                corrupt_byte_at(&target_path, last, !data[data.len() - 1]);
+            }
+
+            let cancel = CancelHandle::new();
+            let verifying = verifying_from_sync_succeeded(
+                sync_succeeded,
+                image,
+                cancel.clone(),
+                &snapshot,
+                &target_path,
+            );
+
+            let_the_clock_tick();
+            let (_image, outcome) = verifying.run(|progress| {
+                if progress.verified_bytes != writer::DEFAULT_CHUNK_SIZE as u64 {
+                    return;
+                }
+                match expect {
+                    Expect::Cancelled => {
+                        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+                        cancel.request_cancel(CancelReason::UserRequested);
+                    }
+                    Expect::Mismatch => {
+                        std::fs::rename(&path, path.with_extension("moved")).unwrap();
+                    }
+                    Expect::SourceUnexpectedEof => {
+                        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+                        file.set_len(writer::DEFAULT_CHUNK_SIZE as u64).unwrap();
+                    }
+                }
+            });
+
+            match (expect, outcome) {
+                (Expect::Cancelled, VerifyOutcome::Cancelled(cancelled)) => {
+                    assert_eq!(cancelled.verified_bytes, writer::DEFAULT_CHUNK_SIZE as u64);
+                }
+                (Expect::Mismatch, VerifyOutcome::Failed(failed)) => {
+                    assert!(
+                        matches!(failed.reason, VerifyFailureReason::Mismatch { .. }),
+                        "{name}: {:?}",
+                        failed.reason
+                    );
+                }
+                (Expect::SourceUnexpectedEof, VerifyOutcome::Failed(failed)) => {
+                    assert!(
+                        matches!(failed.reason, VerifyFailureReason::SourceUnexpectedEof),
+                        "{name}: {:?}",
+                        failed.reason
+                    );
+                }
+                (_, other) => panic!("{name}: unexpected outcome {other:?}"),
+            }
+
+            let _ = std::fs::remove_file(&target_path);
+            remove_source_files(&path);
         }
     }
 }

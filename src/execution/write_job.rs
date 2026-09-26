@@ -2787,25 +2787,35 @@ mod tests {
     // `SelectedImage` `WritingExecution::write()` handed back, the resulting
     // `SyncSucceeded`, and the `DeviceSnapshot` used as the Gate's baseline
     // (so a test can build a deliberately-modified "fresh" snapshot from it).
+    //
+    // The target path is returned as `VerifyFixtureFiles`, which also owns
+    // the temporary source file and removes both when dropped.
     fn gate_pass_sync_succeeded(
         tag: &str,
         source_data: &[u8],
         target_size: u64,
         verify_mode: VerifyMode,
     ) -> (
-        std::path::PathBuf,
+        VerifyFixtureFiles,
         SelectedImage,
         SyncSucceeded,
         DeviceSnapshot,
     ) {
-        let source_path = write_temp_image_file(&format!("verify-source-{tag}"), source_data);
+        let source = TempFile(write_temp_image_file(
+            &format!("verify-source-{tag}"),
+            source_data,
+        ));
         let (target_path, writing_execution, snapshot) = gate_pass_writing_execution(
             tag,
-            &source_path,
+            &source.0,
             target_size,
             verify_mode,
             CancelHandle::new(),
         );
+        let files = VerifyFixtureFiles {
+            target: TempFile(target_path),
+            source,
+        };
 
         let (selected_image, outcome) = writing_execution.write(|_| {});
         let write_succeeded = match outcome {
@@ -2823,7 +2833,70 @@ mod tests {
             }
         };
 
-        (target_path, selected_image, sync_succeeded, snapshot)
+        (files, selected_image, sync_succeeded, snapshot)
+    }
+
+    // A temporary file a test fixture created, removed when this is dropped
+    // -- including while unwinding from a failed assertion. A failed removal
+    // (e.g. the test already removed it) is ignored, so it can never panic
+    // during a panic.
+    struct TempFile(std::path::PathBuf);
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    // The files behind a `gate_pass_sync_succeeded` fixture. Derefs to the
+    // target path, which is what tests use it as. Callers bind it first in
+    // the returned tuple, so it is dropped after the image and handles that
+    // keep those files open.
+    struct VerifyFixtureFiles {
+        target: TempFile,
+        source: TempFile,
+    }
+
+    impl std::ops::Deref for VerifyFixtureFiles {
+        type Target = std::path::Path;
+
+        fn deref(&self) -> &std::path::Path {
+            &self.target.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for VerifyFixtureFiles {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.target.0
+        }
+    }
+
+    // The fixture's temporary source and target files are removed when the
+    // fixture is dropped, both normally and while unwinding from a panic.
+    #[test]
+    fn verify_fixture_files_are_removed_on_drop_and_on_panic() {
+        let (files, image, sync_succeeded, _snapshot) =
+            gate_pass_sync_succeeded("cleanup-drop", b"cleanup", 64, VerifyMode::None);
+        let source = files.source.0.clone();
+        let target = files.target.0.clone();
+        assert!(source.exists() && target.exists());
+        drop(sync_succeeded);
+        drop(image);
+        drop(files);
+        assert!(!source.exists(), "source left behind");
+        assert!(!target.exists(), "target left behind");
+
+        let mut created = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let (files, _image, _sync_succeeded, _snapshot) =
+                gate_pass_sync_succeeded("cleanup-panic", b"cleanup", 64, VerifyMode::None);
+            created = Some((files.source.0.clone(), files.target.0.clone()));
+            panic!("simulated test failure");
+        }));
+        assert!(result.is_err());
+        let (source, target) = created.expect("fixture was created before the panic");
+        assert!(!source.exists(), "source left behind after a panic");
+        assert!(!target.exists(), "target left behind after a panic");
     }
 
     // The part of `gate_pass_sync_succeeded` up to `begin_write()`, for

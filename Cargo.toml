@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 ctrlc = "3.5.2"
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend", "runtime_detection"] }
 zbus = { version = "5.19.0", features = ["blocking-api"] }

@@ -69,6 +69,8 @@ use std::sync::Arc;
 use crate::execution::core::ImageSelection;
 
 mod detect;
+#[cfg(test)]
+mod gzip_behavior;
 
 // Why `FileImageSource::new` refused to construct a source. Deliberately
 // small and specific to construction-time failures -- `open_reader()`

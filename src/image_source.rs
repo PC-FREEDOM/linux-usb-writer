@@ -68,6 +68,9 @@ use std::sync::Arc;
 
 use crate::execution::core::ImageSelection;
 
+// Compressed image validation (`CompressedImageFile::preflight` and its
+// types), reached as `image_source::compressed::*`.
+pub mod compressed;
 mod detect;
 #[cfg(test)]
 mod gzip_behavior;

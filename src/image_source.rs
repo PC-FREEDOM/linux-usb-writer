@@ -68,6 +68,8 @@ use std::sync::Arc;
 
 use crate::execution::core::ImageSelection;
 
+mod detect;
+
 // Why `FileImageSource::new` refused to construct a source. Deliberately
 // small and specific to construction-time failures -- `open_reader()`
 // itself still reports `io::Result` (see the trait below), so this type
@@ -88,6 +90,168 @@ pub enum ImageSourceError {
     // this only rejects what the file actually *is*, not how the path
     // reached it.
     NotRegularFile,
+    // `open_image` only: the content carries the signature of a known
+    // compressed/archive format this program cannot write. Such a file is
+    // never treated as a raw image -- writing its bytes as-is would produce
+    // a target that looks written but cannot boot.
+    UnsupportedFormat(UnsupportedCompression),
+    // `open_image` only: the file name ends in `.gz`/`.xz` but the content is
+    // not that format (raw data, or the other compression format). Refused
+    // rather than written as raw: a misnamed or damaged download is far
+    // more likely than a raw image deliberately named `.gz`.
+    ExtensionMismatch { expected: CompressionFormat },
+}
+
+// A compressed image format this crate recognizes and intends to write
+// (after decompression). Detected from the file's content, never its name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompressionFormat {
+    Gzip,
+    Xz,
+}
+
+impl CompressionFormat {
+    pub fn name(self) -> &'static str {
+        match self {
+            CompressionFormat::Gzip => "gzip",
+            CompressionFormat::Xz => "xz",
+        }
+    }
+}
+
+// Compressed/archive formats that are recognized by signature only so they
+// can be refused explicitly (see `ImageSourceError::UnsupportedFormat`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnsupportedCompression {
+    Zstd,
+    Bzip2,
+    Zip,
+    SevenZip,
+    Lz4,
+}
+
+impl UnsupportedCompression {
+    pub fn name(self) -> &'static str {
+        match self {
+            UnsupportedCompression::Zstd => "zstd",
+            UnsupportedCompression::Bzip2 => "bzip2",
+            UnsupportedCompression::Zip => "zip",
+            UnsupportedCompression::SevenZip => "7z",
+            UnsupportedCompression::Lz4 => "lz4",
+        }
+    }
+}
+
+// What `open_image` found at the path, already opened exactly once.
+//
+// `Raw` is a ready-to-use `FileImageSource` built from that same open file
+// -- identical in every respect to what `FileImageSource::new` produces.
+// `Compressed` is the same open file, identified as gzip/xz but not yet
+// validated or decoded: it deliberately does not implement `ImageSource`
+// (its logical size is unknown until the whole stream has been checked), so
+// it cannot be turned into a `SelectedImage` or written. Validating it into
+// a readable source is a separate, later step that consumes this value.
+#[derive(Debug)]
+pub enum OpenedImage {
+    Raw(FileImageSource),
+    Compressed(CompressedImageFile),
+}
+
+// A compressed image file, opened once and identified by its content. Holds
+// the open `File` so the later validation/decoding step reads exactly the
+// file that was detected here, never a re-opened path.
+#[derive(Debug)]
+pub struct CompressedImageFile {
+    file: File,
+    path: PathBuf,
+    format: CompressionFormat,
+    compressed_size: u64,
+}
+
+impl CompressedImageFile {
+    pub fn format(&self) -> CompressionFormat {
+        self.format
+    }
+
+    // For display only, like `FileImageSource::path()`.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    // The size of the compressed file itself (from `fstat` at open time) --
+    // never the size of the decompressed image.
+    pub fn compressed_size(&self) -> u64 {
+        self.compressed_size
+    }
+}
+
+// The single entry point for opening a user-selected image: opens `path`
+// exactly once, checks it is a regular file, reads its leading bytes from
+// that same open file (positional reads only -- the file's shared offset is
+// never moved), and classifies it by content:
+//
+//   - no known signature           -> `OpenedImage::Raw` (a `FileImageSource`
+//                                      built from the same `File`)
+//   - gzip / xz signature          -> `OpenedImage::Compressed`
+//   - zstd/bzip2/zip/7z/lz4        -> `Err(UnsupportedFormat)`, never raw
+//   - `.gz`/`.xz` name, other data -> `Err(ExtensionMismatch)`, never raw
+//
+// A short or empty file is simply `Raw` if no whole signature fits; its size
+// is judged later exactly as before (e.g. a 0-byte image is still rejected
+// by the Write Gate's `WritePlan` validation).
+pub fn open_image(path: impl Into<PathBuf>) -> Result<OpenedImage, ImageSourceError> {
+    let path = path.into();
+    let file = File::open(&path).map_err(ImageSourceError::Io)?;
+    let metadata = file.metadata().map_err(ImageSourceError::Io)?;
+
+    // Checked before reading any content: reading a non-regular file (a
+    // FIFO, a device) could block or consume data.
+    if !metadata.is_file() {
+        return Err(ImageSourceError::NotRegularFile);
+    }
+
+    let mut head = [0u8; detect::DETECTION_HEAD_LEN];
+    let head_len = read_head(&file, &mut head).map_err(ImageSourceError::Io)?;
+    let detected = detect::detect_format(&head[..head_len]);
+
+    if let detect::DetectedFormat::Unsupported(kind) = detected {
+        return Err(ImageSourceError::UnsupportedFormat(kind));
+    }
+
+    detect::check_name_matches_content(&path, detected)?;
+
+    match detected {
+        detect::DetectedFormat::Raw => Ok(OpenedImage::Raw(FileImageSource::from_open_file(
+            file, path,
+        )?)),
+        detect::DetectedFormat::Compressed(format) => {
+            Ok(OpenedImage::Compressed(CompressedImageFile {
+                file,
+                path,
+                format,
+                compressed_size: metadata.len(),
+            }))
+        }
+        detect::DetectedFormat::Unsupported(kind) => Err(ImageSourceError::UnsupportedFormat(kind)),
+    }
+}
+
+// Fills `buf` from offset 0 of `file` with positional reads (`pread`), so
+// the file's shared offset is untouched. Returns how many bytes were read:
+// fewer than `buf.len()` only when the file itself is shorter.
+fn read_head(file: &File, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+
+    while filled < buf.len() {
+        match file.read_at(&mut buf[filled..], filled as u64) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Ok(filled)
 }
 
 // The kind of repeated access an `ImageSource` can honestly provide,
@@ -292,6 +456,16 @@ impl FileImageSource {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self, ImageSourceError> {
         let path = path.into();
         let file = File::open(&path).map_err(ImageSourceError::Io)?;
+
+        Self::from_open_file(file, path)
+    }
+
+    // The shared initialization behind both `new()` and `open_image()`:
+    // takes ownership of an already-open `file` (so `open_image` can build
+    // the source from the very file it just inspected, without re-opening
+    // `path`) and applies exactly the checks and size capture `new()` always
+    // has. `path` is kept for diagnostics only, as before.
+    fn from_open_file(file: File, path: PathBuf) -> Result<Self, ImageSourceError> {
         let metadata = file.metadata().map_err(ImageSourceError::Io)?;
 
         if !metadata.is_file() {
@@ -1258,6 +1432,245 @@ mod tests {
 
         let read_back_again = read_all(selected.open_reader().unwrap());
         assert_eq!(read_back_again, data);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------------------------------------------------------------------
+    // open_image (format detection + same-FD raw source). Regular temp files
+    // only -- never a block device.
+    // ---------------------------------------------------------------------
+
+    // Like `write_temp_file`, but with a caller-chosen file name suffix, since
+    // `open_image` looks at the final extension.
+    fn write_named_temp_file(tag: &str, suffix: &str, contents: &[u8]) -> PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "linux-usb-writer-open-image-test-{tag}-{}-{id}{suffix}",
+            std::process::id()
+        ));
+        std::fs::write(&path, contents).expect("write temp file for open_image test");
+        path
+    }
+
+    fn open_raw(path: &Path) -> FileImageSource {
+        match open_image(path) {
+            Ok(OpenedImage::Raw(source)) => source,
+            other => panic!("expected OpenedImage::Raw for {path:?}, got {other:?}"),
+        }
+    }
+
+    fn open_compressed(path: &Path) -> CompressedImageFile {
+        match open_image(path) {
+            Ok(OpenedImage::Compressed(file)) => file,
+            other => panic!("expected OpenedImage::Compressed for {path:?}, got {other:?}"),
+        }
+    }
+
+    const GZIP_HEAD: &[u8] = &[0x1F, 0x8B, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00];
+    const XZ_HEAD: &[u8] = &[0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00, 0x00, 0x04];
+
+    // OI1. A raw image opened through `open_image` behaves exactly like one
+    // opened through `FileImageSource::new`: same logical size, same bytes
+    // via `open_reader()` and `read_at()`, same RandomAccess capability.
+    #[test]
+    fn open_image_raw_matches_file_image_source_new() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let path = write_named_temp_file("raw-same", ".img", &data);
+
+        let via_open_image = open_raw(&path);
+        let via_new = FileImageSource::new(&path).unwrap();
+
+        assert_eq!(via_open_image.logical_size(), via_new.logical_size());
+        assert_eq!(via_open_image.logical_size(), data.len() as u64);
+        assert_eq!(via_open_image.access(), ImageSourceAccess::RandomAccess);
+        assert_eq!(read_all(via_open_image.open_reader().unwrap()), data);
+
+        let mut window = [0u8; 16];
+        let n = via_open_image.read_at(5_000, &mut window).unwrap();
+        assert_eq!(&window[..n], &data[5_000..5_016]);
+        assert_eq!(via_open_image.path(), path.as_path());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // OI2. Same-FD guarantee: after `open_image`, renaming the path away,
+    // putting a different file at the original path, and then unlinking
+    // everything does not change what the source reads -- it keeps reading
+    // the file it detected, never a re-opened path.
+    #[test]
+    fn open_image_raw_keeps_reading_the_file_it_detected() {
+        let original = b"original raw image contents".to_vec();
+        let path = write_named_temp_file("raw-swap", ".iso", &original);
+        let moved = path.with_extension("moved");
+
+        let source = open_raw(&path);
+
+        std::fs::rename(&path, &moved).unwrap();
+        std::fs::write(&path, b"a completely different replacement file").unwrap();
+        std::fs::remove_file(&moved).unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        assert_eq!(source.logical_size(), original.len() as u64);
+        assert_eq!(read_all(source.open_reader().unwrap()), original);
+    }
+
+    // OI3. Detection reads with positional reads only: the shared file
+    // offset is not moved, so the first reader still starts at byte 0 (also
+    // covered by OI1's full read, asserted here explicitly on a file whose
+    // first bytes differ from later ones).
+    #[test]
+    fn open_image_raw_reader_starts_at_byte_zero_after_detection() {
+        let data = b"0123456789abcdef".to_vec();
+        let path = write_named_temp_file("raw-offset", ".raw", &data);
+
+        let source = open_raw(&path);
+        let mut first = [0u8; 4];
+        let mut reader = source.open_reader().unwrap();
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(&first, b"0123");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // OI4. Empty and short files are Raw and keep the existing size
+    // semantics (0 bytes is still accepted here; the Write Gate rejects it
+    // later, exactly as for `FileImageSource::new`).
+    #[test]
+    fn open_image_empty_and_short_files_are_raw() {
+        for (tag, contents) in [
+            ("empty", &b""[..]),
+            ("one", &[0x1F][..]),
+            ("five-xz-prefix", &[0xFD, 0x37, 0x7A, 0x58, 0x5A][..]),
+        ] {
+            let path = write_named_temp_file(tag, ".img", contents);
+            let source = open_raw(&path);
+            assert_eq!(source.logical_size(), contents.len() as u64, "{tag}");
+            assert_eq!(read_all(source.open_reader().unwrap()), contents, "{tag}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // OI5. gzip / xz content is recognized as compressed -- never Raw --
+    // whatever the name says (content decides), and the compressed file's
+    // own size is reported.
+    #[test]
+    fn open_image_recognizes_gzip_and_xz_by_content() {
+        let cases = [
+            ("gz", ".gz", GZIP_HEAD, CompressionFormat::Gzip),
+            ("GZ", ".GZ", GZIP_HEAD, CompressionFormat::Gzip),
+            ("iso-gz", ".iso.gz", GZIP_HEAD, CompressionFormat::Gzip),
+            ("noext-gz", "", GZIP_HEAD, CompressionFormat::Gzip),
+            ("xz", ".xz", XZ_HEAD, CompressionFormat::Xz),
+            ("XZ", ".XZ", XZ_HEAD, CompressionFormat::Xz),
+            ("img-xz", ".img.xz", XZ_HEAD, CompressionFormat::Xz),
+            ("iso-holding-xz", ".iso", XZ_HEAD, CompressionFormat::Xz),
+        ];
+
+        for (tag, suffix, contents, expected) in cases {
+            let path = write_named_temp_file(tag, suffix, contents);
+            let compressed = open_compressed(&path);
+            assert_eq!(compressed.format(), expected, "{tag}");
+            assert_eq!(compressed.compressed_size(), contents.len() as u64, "{tag}");
+            assert_eq!(compressed.path(), path.as_path(), "{tag}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // OI6. Known unsupported compressed/archive formats are refused, never
+    // opened as Raw -- even under a name that looks like a disk image.
+    #[test]
+    fn open_image_refuses_known_unsupported_formats() {
+        let cases: [(&str, &[u8], UnsupportedCompression); 5] = [
+            (
+                "zstd",
+                &[0x28, 0xB5, 0x2F, 0xFD, 0x00, 0x00],
+                UnsupportedCompression::Zstd,
+            ),
+            ("bzip2", b"BZh91AY&SY", UnsupportedCompression::Bzip2),
+            (
+                "zip",
+                &[0x50, 0x4B, 0x03, 0x04, 0x14, 0x00],
+                UnsupportedCompression::Zip,
+            ),
+            (
+                "7z",
+                &[0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C],
+                UnsupportedCompression::SevenZip,
+            ),
+            (
+                "lz4",
+                &[0x04, 0x22, 0x4D, 0x18, 0x64, 0x40],
+                UnsupportedCompression::Lz4,
+            ),
+        ];
+
+        for (tag, contents, expected) in cases {
+            let path = write_named_temp_file(tag, ".img", contents);
+            match open_image(&path) {
+                Err(ImageSourceError::UnsupportedFormat(kind)) => {
+                    assert_eq!(kind, expected, "{tag}")
+                }
+                other => panic!("{tag}: expected UnsupportedFormat, got {other:?}"),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // OI7. A `.gz`/`.xz` name without matching content is refused, never
+    // opened as Raw -- including raw data and the other compression format.
+    #[test]
+    fn open_image_refuses_compression_extension_without_matching_content() {
+        let raw = b"plain raw bytes".to_vec();
+        let cases: [(&str, &str, &[u8], CompressionFormat); 5] = [
+            ("gz-raw", ".gz", &raw, CompressionFormat::Gzip),
+            ("GZ-raw", ".GZ", &raw, CompressionFormat::Gzip),
+            ("xz-raw", ".img.xz", &raw, CompressionFormat::Xz),
+            ("gz-holding-xz", ".gz", XZ_HEAD, CompressionFormat::Gzip),
+            ("xz-holding-gz", ".xz", GZIP_HEAD, CompressionFormat::Xz),
+        ];
+
+        for (tag, suffix, contents, expected) in cases {
+            let path = write_named_temp_file(tag, suffix, contents);
+            match open_image(&path) {
+                Err(ImageSourceError::ExtensionMismatch { expected: got }) => {
+                    assert_eq!(got, expected, "{tag}")
+                }
+                other => panic!("{tag}: expected ExtensionMismatch, got {other:?}"),
+            }
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    // OI8. Non-regular files and missing paths keep their existing errors.
+    #[test]
+    fn open_image_keeps_existing_open_errors() {
+        let dir = std::env::temp_dir();
+        assert!(matches!(
+            open_image(&dir),
+            Err(ImageSourceError::NotRegularFile)
+        ));
+
+        let missing = dir.join(format!(
+            "linux-usb-writer-open-image-test-missing-{}.img",
+            std::process::id()
+        ));
+        assert!(matches!(open_image(&missing), Err(ImageSourceError::Io(_))));
+    }
+
+    // OI9. A raw image opened via `open_image` goes through `SelectedImage`
+    // exactly like before: the selection carries the same logical size.
+    #[test]
+    fn open_image_raw_source_builds_selected_image_as_before() {
+        let data = vec![7u8; 4096];
+        let path = write_named_temp_file("raw-selected", ".img", &data);
+
+        let selected = SelectedImage::new(Box::new(open_raw(&path)));
+        assert_eq!(selected.logical_size(), 4096);
+        assert_eq!(selected.selection().image_size(), 4096);
+        assert_eq!(selected.access(), ImageSourceAccess::RandomAccess);
+        assert_eq!(read_all(selected.open_reader().unwrap()), data);
+
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -981,12 +981,34 @@ fn run_write_test(
         return Ok(WriteTestExit::Completed);
     }
 
-    // The one and only place `image_path` is opened this invocation.
+    // The one and only place `image_path` is opened this invocation:
+    // `open_image` opens it once, classifies it by content, and (for a raw
+    // image) builds the `FileImageSource` from that same open file.
     // `selected_image` is what travels, as a single variable, all the way
     // to `AuthorizedExecution::bind()` below -- `selection()` (a cheap Copy)
     // is all that gets threaded through the Gate calls in between.
-    let source = match image_source::FileImageSource::new(&image_path) {
-        Ok(source) => source,
+    //
+    // Every refusal here happens before the target is opened, and returns
+    // `Completed` exactly like the pre-existing image-open failure path.
+    let source = match image_source::open_image(&image_path) {
+        Ok(image_source::OpenedImage::Raw(source)) => source,
+        Ok(image_source::OpenedImage::Compressed(compressed)) => {
+            // Recognized gzip/xz: never written as raw. Decompression is
+            // not implemented yet, so stop here.
+            for line in format_compressed_image_not_supported_yet(compressed.format()) {
+                println!("write-test: {line}");
+            }
+            return Ok(WriteTestExit::Completed);
+        }
+        Err(
+            error @ (image_source::ImageSourceError::UnsupportedFormat(_)
+            | image_source::ImageSourceError::ExtensionMismatch { .. }),
+        ) => {
+            for line in format_image_format_rejected(&error) {
+                println!("write-test: {line}");
+            }
+            return Ok(WriteTestExit::Completed);
+        }
         Err(error) => {
             println!("write-test: failed to open image {image_path}: {error:?}");
             return Ok(WriteTestExit::Completed);
@@ -1963,6 +1985,43 @@ fn format_cancelled_after_sync() -> Vec<String> {
     ]
 }
 
+// Shown when `open_image` recognized the image as gzip/xz. Such an image is
+// never written as raw bytes; decompressing it is not implemented yet.
+fn format_compressed_image_not_supported_yet(
+    format: image_source::CompressionFormat,
+) -> Vec<String> {
+    vec![
+        format!("detected format: {} (compressed image)", format.name()),
+        "writing compressed images is not supported yet; the image was not written.".to_string(),
+        "the target device has not been opened or modified.".to_string(),
+    ]
+}
+
+// Shown when `open_image` refused the image because of its format:
+// a recognized but unsupported compressed/archive format, or a `.gz`/`.xz`
+// name whose content is not that format. Either way the file was not treated
+// as a raw image. Any other `ImageSourceError` keeps the pre-existing
+// "failed to open image" message at the call site.
+fn format_image_format_rejected(error: &image_source::ImageSourceError) -> Vec<String> {
+    let reason = match error {
+        image_source::ImageSourceError::UnsupportedFormat(kind) => format!(
+            "the image is {} data, which is not supported; it was not treated as a raw image.",
+            kind.name()
+        ),
+        image_source::ImageSourceError::ExtensionMismatch { expected } => format!(
+            "the file name says {} but the content is not {} data; refusing to write it as a raw image.",
+            expected.name(),
+            expected.name()
+        ),
+        other => format!("the image could not be used: {other:?}"),
+    };
+
+    vec![
+        reason,
+        "the target device has not been opened or modified.".to_string(),
+    ]
+}
+
 // Shown when the sync worker thread panicked instead of returning a
 // `SyncAttemptOutcome`. Treated like a sync failure: the write had
 // completed, but sync never reported success, so durability is not
@@ -2117,8 +2176,9 @@ mod tests {
     use super::confirmation_matches;
     use super::{
         OffMainThread, PromptInput, WriteTestArgsError, WriteTestExit, exit_after_successful_sync,
-        format_cancelled_after_sync, format_cancelled_before_confirmation, format_hard_hazards,
-        format_identity_comparison, format_instance_comparison, format_sync_worker_panicked,
+        format_cancelled_after_sync, format_cancelled_before_confirmation,
+        format_compressed_image_not_supported_yet, format_hard_hazards, format_identity_comparison,
+        format_image_format_rejected, format_instance_comparison, format_sync_worker_panicked,
         format_verify_cancelled, format_verify_cancelled_before_start,
         format_verify_diagnostics_summary, format_verify_diagnostics_unavailable,
         format_verify_failure_reason, format_verify_succeeded, format_write_cancelled,
@@ -2683,6 +2743,67 @@ mod tests {
             ]
         );
         assert!(lines.iter().all(|line| !line.contains("partial")));
+    }
+
+    // ---------------------------------------------------------------------
+    // Image format refusals (XZ/GZIP Phase 1): pure formatters only.
+    // ---------------------------------------------------------------------
+
+    // F1. A recognized gzip/xz image names the detected format, says it was
+    // not written, and that the target was not touched.
+    #[test]
+    fn format_compressed_image_not_supported_yet_names_format_and_target_state() {
+        for (format, name) in [
+            (crate::image_source::CompressionFormat::Gzip, "gzip"),
+            (crate::image_source::CompressionFormat::Xz, "xz"),
+        ] {
+            let lines = format_compressed_image_not_supported_yet(format);
+            assert_eq!(
+                lines[0],
+                format!("detected format: {name} (compressed image)")
+            );
+            assert!(lines.iter().any(|line| line.contains("was not written")));
+            assert_eq!(
+                lines.last().unwrap(),
+                "the target device has not been opened or modified."
+            );
+        }
+    }
+
+    // F2. An unsupported format names the format and says it was not treated
+    // as raw; the target was not touched.
+    #[test]
+    fn format_image_format_rejected_for_unsupported_format() {
+        let error = crate::image_source::ImageSourceError::UnsupportedFormat(
+            crate::image_source::UnsupportedCompression::Zstd,
+        );
+
+        assert_eq!(
+            format_image_format_rejected(&error),
+            vec![
+                "the image is zstd data, which is not supported; it was not treated as a raw image."
+                    .to_string(),
+                "the target device has not been opened or modified.".to_string(),
+            ]
+        );
+    }
+
+    // F3. An extension mismatch names the promised format and refuses raw.
+    #[test]
+    fn format_image_format_rejected_for_extension_mismatch() {
+        let error = crate::image_source::ImageSourceError::ExtensionMismatch {
+            expected: crate::image_source::CompressionFormat::Xz,
+        };
+
+        let lines = format_image_format_rejected(&error);
+        assert_eq!(
+            lines[0],
+            "the file name says xz but the content is not xz data; refusing to write it as a raw image."
+        );
+        assert_eq!(
+            lines[1],
+            "the target device has not been opened or modified."
+        );
     }
 
     // ---------------------------------------------------------------------
